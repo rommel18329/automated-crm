@@ -277,6 +277,10 @@ def seed_sample_data(db_path: Path = DB_PATH) -> None:
         }
 
     all_records = hot_leads + [warm_or_cold_record(r, "warm") for r in warm_leads] + [warm_or_cold_record(r, "cold") for r in cold_leads]
+    for rec in all_records:
+        digits = re.sub(r"\D", "", rec["phone"])
+        if len(digits) != 10:
+            raise ValueError(f"Seed phone must contain 10 digits: {rec['name']} -> {rec['phone']}")
 
     with get_conn(db_path) as conn:
         existing = conn.execute("SELECT COUNT(*) AS c FROM leads").fetchone()["c"]
