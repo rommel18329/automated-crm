@@ -8,7 +8,6 @@ from . import db, engine
 
 def run_daily(db_path: Path = db.DB_PATH) -> dict:
     db.init_db(db_path)
-    db.seed_sample_data(db_path)
     return engine.evaluate_all_leads(db_path)
 
 

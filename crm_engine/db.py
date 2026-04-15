@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import csv
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -275,6 +277,10 @@ def seed_sample_data(db_path: Path = DB_PATH) -> None:
         }
 
     all_records = hot_leads + [warm_or_cold_record(r, "warm") for r in warm_leads] + [warm_or_cold_record(r, "cold") for r in cold_leads]
+    for rec in all_records:
+        digits = re.sub(r"\D", "", rec["phone"])
+        if len(digits) != 10:
+            raise ValueError(f"Seed phone must contain 10 digits: {rec['name']} -> {rec['phone']}")
 
     with get_conn(db_path) as conn:
         existing = conn.execute("SELECT COUNT(*) AS c FROM leads").fetchone()["c"]
@@ -332,6 +338,158 @@ def seed_sample_data(db_path: Path = DB_PATH) -> None:
             "INSERT INTO interactions (lead_id, type, content, timestamp, direction) VALUES (?,?,?,?,?)",
             interactions_data,
         )
+
+
+def _normalize_phone(phone: str) -> str | None:
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) != 10:
+        return None
+    return f"{digits[0:3]}-{digits[3:6]}-{digits[6:10]}"
+
+
+def import_leads_from_csv(file_path: str, db_path: Path = DB_PATH, clear_existing: bool = False) -> dict[str, Any]:
+    required_fields = {"name", "phone", "status", "motivation", "timeline", "stage"}
+    status_allowed = {"cold", "warm", "hot", "dead", "contract"}
+    stage_map = {
+        "initial": "initial_contact",
+        "initial_contact": "initial_contact",
+        "qualifying": "qualifying",
+        "negotiating": "negotiating",
+        "closing": "closing",
+        "not_contacted": "not_contacted",
+    }
+
+    rows_to_insert: list[tuple[Any, ...]] = []
+    rows_to_update: list[tuple[Any, ...]] = []
+    errors: list[str] = []
+
+    with open(file_path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        headers = {h.strip().lower() for h in (reader.fieldnames or [])}
+        missing_headers = required_fields - headers
+        if missing_headers:
+            raise ValueError(f"CSV missing required columns: {', '.join(sorted(missing_headers))}")
+
+        parsed_rows: list[dict[str, Any]] = []
+        for idx, raw in enumerate(reader, start=2):
+            row = {str(k).strip().lower(): (str(v).strip() if v is not None else "") for k, v in raw.items()}
+            name = row.get("name", "").strip()
+            phone_raw = row.get("phone", "").strip()
+            status = row.get("status", "").strip().lower()
+            stage_input = row.get("stage", "").strip().lower()
+            timeline = row.get("timeline", "").strip()
+            motivation_raw = row.get("motivation", "").strip()
+
+            if not name:
+                errors.append(f"Row {idx}: missing name")
+                continue
+            if not phone_raw:
+                errors.append(f"Row {idx}: missing phone")
+                continue
+            phone = _normalize_phone(phone_raw)
+            if not phone:
+                errors.append(f"Row {idx}: invalid phone format '{phone_raw}'")
+                continue
+            if status not in status_allowed:
+                errors.append(f"Row {idx}: invalid status '{status}'")
+                continue
+            if not timeline:
+                errors.append(f"Row {idx}: missing timeline")
+                continue
+            if stage_input not in stage_map:
+                errors.append(f"Row {idx}: invalid stage '{stage_input}'")
+                continue
+
+            try:
+                motivation = int(motivation_raw)
+            except ValueError:
+                errors.append(f"Row {idx}: invalid motivation '{motivation_raw}'")
+                continue
+            if not 1 <= motivation <= 10:
+                errors.append(f"Row {idx}: motivation must be 1-10")
+                continue
+
+            timeline_days_raw = row.get("timeline_days", "").strip()
+            timeline_days = int(timeline_days_raw) if timeline_days_raw.isdigit() else None
+            deal_probability_raw = row.get("deal_probability", "").strip()
+            deal_probability = int(deal_probability_raw) if deal_probability_raw.isdigit() else 0
+            deal_probability = max(0, min(100, deal_probability))
+
+            parsed_rows.append(
+                {
+                    "name": name,
+                    "phone": phone,
+                    "status": status,
+                    "motivation_score": motivation,
+                    "timeline": timeline,
+                    "timeline_days": timeline_days,
+                    "conversation_stage": stage_map[stage_input],
+                    "deal_probability": deal_probability,
+                }
+            )
+
+    with get_conn(db_path) as conn:
+        if clear_existing:
+            conn.execute("DELETE FROM interactions")
+            conn.execute("DELETE FROM performance_logs")
+            conn.execute("DELETE FROM leads")
+
+        existing_phones = {
+            r["phone"]: r["id"] for r in conn.execute("SELECT id, phone FROM leads").fetchall()
+        }
+
+        for row in parsed_rows:
+            base_values = (
+                row["name"],
+                row["phone"],
+                row["status"],
+                row["motivation_score"],
+                row["timeline"],
+                row["timeline_days"],
+                None,
+                date.today().isoformat(),
+                0,  # touch_count reset for imports
+                None,  # last_strategy_used reset for imports
+                row["conversation_stage"],
+                row["deal_probability"],
+            )
+            existing_id = existing_phones.get(row["phone"])
+            if existing_id is None:
+                rows_to_insert.append(base_values)
+            else:
+                rows_to_update.append(base_values + (existing_id,))
+
+        if rows_to_insert:
+            conn.executemany(
+                """
+                INSERT INTO leads (
+                    name, phone, status, motivation_score, timeline, timeline_days,
+                    last_contact_date, next_action_date, touch_count, last_strategy_used,
+                    conversation_stage, deal_probability
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                rows_to_insert,
+            )
+
+        if rows_to_update:
+            conn.executemany(
+                """
+                UPDATE leads
+                SET name=?, phone=?, status=?, motivation_score=?, timeline=?, timeline_days=?,
+                    last_contact_date=?, next_action_date=?, touch_count=?, last_strategy_used=?,
+                    conversation_stage=?, deal_probability=?
+                WHERE id=?
+                """,
+                rows_to_update,
+            )
+
+    return {
+        "imported": len(parsed_rows),
+        "inserted": len(rows_to_insert),
+        "updated": len(rows_to_update),
+        "errors": errors,
+    }
+
 
 def fetch_leads(db_path: Path = DB_PATH, where: str = "1=1", params: Iterable[Any] = ()) -> list[dict[str, Any]]:
     with get_conn(db_path) as conn:

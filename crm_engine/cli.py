@@ -11,8 +11,6 @@ from .daily_run import run_daily
 def _cmd_init(args: argparse.Namespace) -> None:
     path = Path(args.db)
     db.init_db(path)
-    if args.seed:
-        db.seed_sample_data(path)
     print(f"Initialized database at {path}")
 
 
@@ -70,13 +68,24 @@ def _cmd_call_list(args: argparse.Namespace) -> None:
             print(f"  - {q}")
 
 
+def _cmd_import_csv(args: argparse.Namespace) -> None:
+    path = Path(args.db)
+    db.init_db(path)
+    summary = db.import_leads_from_csv(args.file_path, path, clear_existing=args.clear_existing)
+    print(
+        f"Imported={summary['imported']} inserted={summary['inserted']} "
+        f"updated={summary['updated']} errors={len(summary['errors'])}"
+    )
+    for err in summary["errors"]:
+        print(f"ERROR: {err}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Automated CRM decision + escalation engine")
     parser.add_argument("--db", default="crm.db", help="SQLite file path")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_init = sub.add_parser("init")
-    p_init.add_argument("--seed", action="store_true")
     p_init.set_defaults(func=_cmd_init)
 
     p_daily = sub.add_parser("daily-run")
@@ -96,6 +105,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_call = sub.add_parser("call-list")
     p_call.set_defaults(func=_cmd_call_list)
+
+    p_import = sub.add_parser("import-csv")
+    p_import.add_argument("file_path")
+    p_import.add_argument("--clear-existing", action="store_true")
+    p_import.set_defaults(func=_cmd_import_csv)
     return parser
 
 

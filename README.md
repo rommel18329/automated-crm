@@ -15,14 +15,16 @@ Local-first real-estate lead operating system built with Python, SQLite, CLI, an
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-crm --db crm.db init --seed
+crm --db crm.db init
+crm --db crm.db import-csv leads.csv --clear-existing
 crm --db crm.db daily-run
 streamlit run dashboard.py
 ```
 
 ## CLI commands
 ```bash
-crm --db crm.db init --seed
+crm --db crm.db init
+crm --db crm.db import-csv leads.csv --clear-existing
 crm --db crm.db daily-run
 crm --db crm.db queue
 crm --db crm.db call-list
