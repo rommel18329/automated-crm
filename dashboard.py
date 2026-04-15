@@ -45,6 +45,7 @@ html, body, [data-testid="stAppViewContainer"] {
   color: #3c5f42;
   font-size: 0.82rem;
 }
+h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {display: none !important;}
 </style>
 """
 
@@ -82,6 +83,7 @@ def nav_to(page: str, lead_id: int | None = None) -> None:
     st.session_state["page"] = page
     if lead_id is not None:
         st.session_state["selected_lead_id"] = lead_id
+        st.session_state["scroll_to_selected"] = True
     st.rerun()
 
 
@@ -101,7 +103,12 @@ def update_status(lead_id: int, key: str) -> None:
 
 
 def render_global_search(all_leads: list[dict]) -> None:
-    search = st.text_input("Global search (name or phone)", placeholder="Start typing to find a lead...").strip().lower()
+    search = st.text_input(
+        "Quick Search",
+        placeholder="Name or phone",
+        label_visibility="collapsed",
+        key="global_quick_search",
+    ).strip().lower()
     if not search:
         return
     matches = [
@@ -113,11 +120,37 @@ def render_global_search(all_leads: list[dict]) -> None:
         st.caption("No leads found.")
         return
     st.caption("Select a lead to open in Leads page")
-    cols = st.columns(2)
-    for i, lead in enumerate(matches):
-        with cols[i % 2]:
+    with st.container(height=160):
+        for lead in matches:
             if st.button(f"{lead['name']} · {lead['phone']}", key=f"global_pick_{lead['id']}"):
                 nav_to("Leads", lead["id"])
+
+
+def mock_followups() -> list[dict]:
+    return [
+        {
+            "lead_id": -9001,
+            "lead_name": "Maria Benson",
+            "situation": "Relocating for work in 45 days",
+            "history": [
+                ("04-11", "9:49 AM", "outbound", "Hey Maria, still considering selling this spring?"),
+                ("04-11", "10:02 AM", "inbound", "Possibly. Still looking at options."),
+                ("04-13", "1:15 PM", "outbound", "Want a quick range so you can compare?"),
+            ],
+            "suggestion": "I can send a quick no-pressure range so you can compare options—want me to?",
+        },
+        {
+            "lead_id": -9002,
+            "lead_name": "Derek Hall",
+            "situation": "Needs clarity before making repairs",
+            "history": [
+                ("04-10", "11:05 AM", "outbound", "Checking in Derek—any updates on your timeline?"),
+                ("04-10", "12:27 PM", "inbound", "Not sure yet. Maybe in a month."),
+                ("04-12", "3:40 PM", "outbound", "Would a quick call help simplify next steps?"),
+            ],
+            "suggestion": "Totally fine if timing is still open—would a short 5-minute call help you decide next steps?",
+        },
+    ]
 
 
 def render_lead_detail(lead_id: int) -> None:
@@ -126,6 +159,9 @@ def render_lead_detail(lead_id: int) -> None:
     timeline_text, situation_text, notes_text = parse_timeline_parts(lead["timeline"])
 
     c1, c2, c3 = st.columns([1, 1.15, 1])
+
+    highlight_style = "style='border:2px solid #6B8F71;'" if st.session_state.get("scroll_to_selected") else ""
+    st.markdown(f"<div id='selected-lead' {highlight_style}></div>", unsafe_allow_html=True)
 
     with c1:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -169,7 +205,8 @@ def render_lead_detail(lead_id: int) -> None:
         for msg in texts:
             d, t = format_dt(msg["timestamp"])
             st.write(f"{d}")
-            st.caption(f"{t} · {msg['direction']} · {msg['content']}")
+            st.caption(f"{t}")
+            st.write(f"{msg['direction']} · {msg['content']}")
 
         st.markdown("---")
         st.markdown("**Log Call**")
@@ -230,21 +267,25 @@ all_leads = db.fetch_leads()
 if "page" not in st.session_state:
     st.session_state["page"] = "Dashboard"
 
-st.markdown("# Silverline Investment Group 🌿")
-st.caption("Approval mode only • fast operator workflow")
+left_head, right_search = st.columns([4, 1.7])
+with left_head:
+    st.markdown("# Silverline Investment Group 🌿")
+    st.caption("Dashboard")
+with right_search:
+    st.markdown("##### Quick Search")
+    render_global_search(all_leads)
 
-nav_cols = st.columns(4)
-for i, p in enumerate(PAGES):
-    if nav_cols[i].button(p, use_container_width=True, key=f"nav_{p}"):
-        nav_to(p)
-
-render_global_search(all_leads)
+with st.sidebar:
+    st.markdown("### 🌿 Navigation")
+    selected = st.radio("Sections", PAGES, index=PAGES.index(st.session_state["page"]), label_visibility="collapsed")
+    if selected != st.session_state["page"]:
+        nav_to(selected)
 st.divider()
 
 page = st.session_state["page"]
 
 if page == "Dashboard":
-    st.subheader("Silverline Investment Group")
+    st.subheader("Dashboard")
     summary = result["summary"]
     cols = st.columns(5)
     stats = [
@@ -258,10 +299,13 @@ if page == "Dashboard":
         c.markdown(f"<div class='metric'><div>{label}</div><h3>{value}</h3></div>", unsafe_allow_html=True)
 
     st.markdown("### Call List Preview")
+    if st.button("Call List", key="goto_calls_page"):
+        nav_to("Call List")
     for entry in result["call_list"][:5]:
         reason_labels = human_intent_labels(entry.get("intent_signals", []))
         reason = ", ".join(reason_labels) if reason_labels else "High urgency"
-        st.markdown(f"- **{entry['name']}** · {entry['phone']}")
+        if st.button(f"{entry['name']} · {entry['phone']}", key=f"dash_call_pick_{entry['lead_id']}"):
+            nav_to("Leads", entry["lead_id"])
         st.caption(reason)
     if st.button("View All", key="dashboard_view_calls"):
         nav_to("Call List")
@@ -303,18 +347,31 @@ elif page == "Leads":
         short_timeline, _, _ = parse_timeline_parts(lead["timeline"])
         if st.button(f"{lead['name']} · {lead['status'].upper()} · {lead['phone']} · {short_timeline}", key=f"lead_pick_{lead['id']}"):
             st.session_state["selected_lead_id"] = lead["id"]
+            st.session_state["scroll_to_selected"] = True
             st.rerun()
 
     selected_id = st.session_state.get("selected_lead_id")
     if selected_id:
         st.divider()
         render_lead_detail(selected_id)
+        if st.session_state.get("scroll_to_selected"):
+            st.markdown(
+                """
+<script>
+const el = window.parent.document.getElementById('selected-lead');
+if (el) { el.scrollIntoView({behavior:'smooth', block:'start'}); }
+</script>
+""",
+                unsafe_allow_html=True,
+            )
+            st.session_state["scroll_to_selected"] = False
 
 elif page == "Follow-ups":
     st.subheader("Follow-ups")
     queue = result["followup_queue"]
     if not queue:
-        st.info("No follow-up approvals pending.")
+        st.info("No follow-up approvals pending. Showing sample follow-ups.")
+    sample_items = mock_followups()
 
     for item in queue:
         lead = db.fetch_lead(item["lead_id"])
@@ -352,4 +409,30 @@ elif page == "Follow-ups":
         if st.session_state.get(f"editing_{item['lead_id']}"):
             st.text_area("Edit message", key=msg_key, height=80)
 
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("### Sample Follow-ups")
+    for sample in sample_items:
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown(f"**{sample['lead_name']}**")
+        st.write("Situation:", sample["situation"])
+        st.markdown("**Last messages**")
+        with st.container(height=120):
+            for d, t, direction, content in sample["history"]:
+                st.caption(f"{d}")
+                st.caption(f"{t} · {direction} · {content}")
+
+        msg_key = f"sample_msg_{sample['lead_id']}"
+        if msg_key not in st.session_state:
+            st.session_state[msg_key] = sample["suggestion"]
+        st.text_area("Suggestion", key=msg_key, height=80)
+
+        c1, c2, c3 = st.columns(3)
+        if c1.button("Approve", key=f"sample_approve_{sample['lead_id']}"):
+            st.success("Approved (sample).")
+        if c2.button("Edit", key=f"sample_edit_{sample['lead_id']}"):
+            st.info("Edit directly in suggestion box.")
+        if c3.button("Regenerate", key=f"sample_regen_{sample['lead_id']}"):
+            st.session_state[msg_key] = sample["suggestion"] + " If it helps, we can do a 5-minute call."
+            st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
