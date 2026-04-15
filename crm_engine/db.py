@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -89,16 +89,198 @@ def init_db(db_path: Path = DB_PATH) -> None:
 
 def seed_sample_data(db_path: Path = DB_PATH) -> None:
     today = date.today().isoformat()
-    sample_leads = [
-        ("Maria Benton", "555-0101", "warm", 7, "Need to move for work", 21, today, today, 3, "follow-up", "qualifying", 62),
-        ("James Howard", "555-0102", "cold", 4, "Just exploring", 120, None, today, 1, "value-based", "initial_contact", 24),
-        ("Lena Ortiz", "555-0103", "hot", 9, "Wants offer this week", 7, today, today, 5, "call", "negotiating", 82),
-        ("David Cole", "555-0104", "warm", 6, "Considering selling in spring", 45, today, today, 2, "follow-up", "initial_contact", 48),
+    now = datetime.utcnow()
+
+    hot_leads = [
+        {
+            "name": "John Carter",
+            "phone": "555-201-1001",
+            "status": "hot",
+            "motivation": 9,
+            "timeline": "Looking to close in 2 weeks",
+            "timeline_days": 14,
+            "stage": "negotiating",
+            "probability": 86,
+            "touch_count": 5,
+            "last_strategy": "call",
+            "situation": "Relocating for a job transfer",
+            "notes": "Asked for an offer number and close timeline this month.",
+            "interactions": [
+                ("text", "Hey John, are you still open to selling your property?", "outbound", 4200),
+                ("text", "Yes, what price can you offer if we move quickly?", "inbound", 4160),
+                ("call", "Reviewed property condition and timing; he said he needs to sell fast.", "outbound", 2800),
+                ("text", "I need to sell fast, can you close this month?", "inbound", 1800),
+                ("note", "Situation: relocating. Notes: comparing two buyers, wants certainty.", "outbound", 1200),
+            ],
+        },
+        {
+            "name": "Sarah Mitchell",
+            "phone": "555-201-1002",
+            "status": "hot",
+            "motivation": 8,
+            "timeline": "Wants this wrapped up in under 30 days",
+            "timeline_days": 21,
+            "stage": "qualifying",
+            "probability": 80,
+            "touch_count": 4,
+            "last_strategy": "follow-up",
+            "situation": "Inherited a property she does not want to manage",
+            "notes": "Asked if we can close this month and what range we can offer.",
+            "interactions": [
+                ("text", "Checking in Sarah—still considering a sale this month?", "outbound", 4600),
+                ("text", "I might, depends on speed. Can you close this month?", "inbound", 4500),
+                ("call", "Walked through inherited-home process and net sheet expectations.", "outbound", 2600),
+                ("text", "What price range can you offer me?", "inbound", 900),
+            ],
+        },
+        {
+            "name": "Michael Reyes",
+            "phone": "555-201-1003",
+            "status": "hot",
+            "motivation": 7,
+            "timeline": "Aiming to sell within 10-14 days",
+            "timeline_days": 10,
+            "stage": "negotiating",
+            "probability": 84,
+            "touch_count": 6,
+            "last_strategy": "call",
+            "situation": "Vacant rental is creating monthly carrying costs",
+            "notes": "Wants as-is terms and quick close before next mortgage payment.",
+            "interactions": [
+                ("text", "Hey Michael, still evaluating options for your rental?", "outbound", 5000),
+                ("text", "Yes, I need a clean as-is offer.", "inbound", 4940),
+                ("call", "Discussed fast-close options and title timeline.", "outbound", 3200),
+                ("text", "Can you close this month if I accept?", "inbound", 2100),
+                ("note", "Situation: vacant rental. Notes: urgency tied to payment due date.", "outbound", 1300),
+            ],
+        },
+        {
+            "name": "Alicia Gomez",
+            "phone": "555-201-1004",
+            "status": "hot",
+            "motivation": 8,
+            "timeline": "Needs a buyer in 3 weeks",
+            "timeline_days": 20,
+            "stage": "qualifying",
+            "probability": 78,
+            "touch_count": 4,
+            "last_strategy": "call",
+            "situation": "Divorce settlement requires property decision soon",
+            "notes": "Asked directly about proceeds and certainty of closing date.",
+            "interactions": [
+                ("text", "Alicia, are you still open to a direct sale option?", "outbound", 4300),
+                ("text", "Yes, I need a clear number soon.", "inbound", 4250),
+                ("call", "Discussed timeline pressure from legal deadlines.", "outbound", 2400),
+                ("text", "If we agree, can you close this month?", "inbound", 700),
+            ],
+        },
+        {
+            "name": "David Nguyen",
+            "phone": "555-201-1005",
+            "status": "hot",
+            "motivation": 6,
+            "timeline": "Trying to sell in under 30 days",
+            "timeline_days": 28,
+            "stage": "negotiating",
+            "probability": 75,
+            "touch_count": 5,
+            "last_strategy": "follow-up",
+            "situation": "Behind on payments and wants a fast resolution",
+            "notes": "Repeated urgency and asked for quickest path to close.",
+            "interactions": [
+                ("text", "David, are you still looking for a fast sale?", "outbound", 4700),
+                ("text", "Yes, I need to move quickly.", "inbound", 4650),
+                ("text", "Would a same-month close help solve timing?", "outbound", 3000),
+                ("text", "Yes, what can you offer?", "inbound", 2900),
+                ("call", "Reviewed as-is process and close timeline.", "outbound", 900),
+            ],
+        },
     ]
+
+    warm_leads = [
+        ("Emily Brooks", "555-202-2001", 6, "Likely decision in 2-3 months", 75, "qualifying", 56, 3, "value-based", "Downsizing after kids moved out", "Engaged but comparing options and timing."),
+        ("Daniel Foster", "555-202-2002", 5, "Possibly later this year", 120, "initial_contact", 47, 2, "follow-up", "Needs repairs before listing", "Responds slowly after contractor updates."),
+        ("Olivia Price", "555-202-2003", 4, "Maybe after school year", 90, "initial_contact", 43, 3, "casual follow-up", "Family considering relocation", "Interested but timeline still unclear."),
+        ("Ryan Bennett", "555-202-2004", 6, "Could move forward in 60-90 days", 80, "qualifying", 58, 4, "value-based", "Household transition in progress", "Asks occasional pricing questions."),
+        ("Megan Walsh", "555-202-2005", 5, "After tenant lease ends", 110, "initial_contact", 45, 2, "follow-up", "Managing tenant turnover", "Open to follow-up, no clear commitment."),
+        ("Brian Coleman", "555-202-2006", 4, "Unclear, maybe this fall", 100, "initial_contact", 42, 3, "casual follow-up", "Unsure whether to sell or rent", "One reply then delayed response."),
+        ("Jasmine Patel", "555-202-2007", 5, "Could revisit in 2 months", 70, "qualifying", 52, 3, "value-based", "Considering move for work", "Wants numbers before deciding."),
+        ("Trevor Hall", "555-202-2008", 6, "Maybe by end of quarter", 85, "qualifying", 55, 4, "follow-up", "Planning around business schedule", "Inconsistent but responsive to calls."),
+        ("Nina Lawson", "555-202-2009", 4, "Possibly in 3-4 months", 105, "initial_contact", 44, 2, "casual follow-up", "Exploring neighborhood comps", "Curious, but low urgency today."),
+        ("Marcus Reed", "555-202-2010", 5, "Could sell in about 90 days", 90, "qualifying", 50, 3, "value-based", "Potential move to another state", "Needs confidence in net proceeds."),
+    ]
+
+    cold_leads = [
+        ("Laura Jenkins", "555-203-3001", 2, "No plans this year", 365, "initial_contact", 17, 1, "value-based", "Staying put for now", "Asked for rough value then went silent."),
+        ("Kevin Simmons", "555-203-3002", 4, "Maybe next year", 210, "initial_contact", 28, 2, "follow-up", "Exploring refinance first", "Vague interest only."),
+        ("Natalie Reed", "555-203-3003", 3, "No clear timeline", 240, "initial_contact", 19, 1, "casual follow-up", "Family plans undecided", "Hard to reach."),
+        ("Brandon Hayes", "555-203-3004", 2, "After major renovations", 300, "initial_contact", 15, 1, "value-based", "Property not market-ready", "No urgency expressed."),
+        ("Alyssa Grant", "555-203-3005", 4, "Maybe in 6+ months", 200, "initial_contact", 30, 2, "follow-up", "Waiting for job clarity", "Short replies then silence."),
+        ("Tyler Morgan", "555-203-3006", 3, "Unknown until paperwork clears", 270, "initial_contact", 22, 1, "casual follow-up", "Probate process still open", "No near-term decision."),
+        ("Rachel Stone", "555-203-3007", 2, "Not this year", 365, "initial_contact", 14, 1, "follow-up", "Prefers keeping as rental", "Did not respond to last outreach."),
+        ("Ethan Parker", "555-203-3008", 4, "Maybe next spring", 190, "initial_contact", 29, 2, "value-based", "Watching market conditions", "Interested in comps only."),
+        ("Hannah Collins", "555-203-3009", 1, "No intent to sell now", 420, "initial_contact", 11, 1, "casual follow-up", "Information gathering only", "Requested later check-in."),
+        ("Noah Bryant", "555-203-3010", 3, "Could revisit in a year", 400, "initial_contact", 18, 1, "value-based", "Holding as long-term rental", "No urgency and minimal engagement."),
+        ("Grace Kim", "555-203-3011", 2, "Maybe after retirement", 500, "initial_contact", 12, 1, "casual follow-up", "No immediate life event", "One brief response only."),
+        ("Owen Lewis", "555-203-3012", 4, "Possibly in 8-10 months", 280, "initial_contact", 26, 2, "follow-up", "Considering relocation eventually", "Not ready for concrete steps."),
+        ("Chloe Sanders", "555-203-3013", 3, "Undecided timeline", 260, "initial_contact", 20, 1, "casual follow-up", "Comparing refinance and sale", "Paused communication."),
+        ("Evan Harper", "555-203-3014", 2, "Not before next year", 330, "initial_contact", 16, 1, "value-based", "Focused on other priorities", "Very low response rate."),
+        ("Sophie Bennett", "555-203-3015", 4, "Could consider in 6-9 months", 220, "initial_contact", 27, 2, "follow-up", "Might move if job changes", "No urgency signals yet."),
+    ]
+
+    def lead_tuple(record: dict) -> tuple:
+        timeline = f"{record['timeline']}. Situation: {record['situation']}. Notes: {record['notes']}"
+        return (
+            record["name"],
+            record["phone"],
+            record["status"],
+            record["motivation"],
+            timeline,
+            record["timeline_days"],
+            today,
+            today,
+            record["touch_count"],
+            record["last_strategy"],
+            record["stage"],
+            record["probability"],
+        )
+
+    def warm_or_cold_record(row: tuple, status: str) -> dict:
+        (
+            name,
+            phone,
+            motivation,
+            timeline,
+            timeline_days,
+            stage,
+            probability,
+            touch_count,
+            last_strategy,
+            situation,
+            notes,
+        ) = row
+        return {
+            "name": name,
+            "phone": phone,
+            "status": status,
+            "motivation": motivation,
+            "timeline": timeline,
+            "timeline_days": timeline_days,
+            "stage": stage,
+            "probability": probability,
+            "touch_count": touch_count,
+            "last_strategy": last_strategy,
+            "situation": situation,
+            "notes": notes,
+        }
+
+    all_records = hot_leads + [warm_or_cold_record(r, "warm") for r in warm_leads] + [warm_or_cold_record(r, "cold") for r in cold_leads]
+
     with get_conn(db_path) as conn:
         existing = conn.execute("SELECT COUNT(*) AS c FROM leads").fetchone()["c"]
         if existing:
             return
+
         conn.executemany(
             """
             INSERT INTO leads (
@@ -107,9 +289,49 @@ def seed_sample_data(db_path: Path = DB_PATH) -> None:
                 conversation_stage, deal_probability
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            sample_leads,
+            [lead_tuple(record) for record in all_records],
         )
 
+        leads_by_name = {row["name"]: row["id"] for row in conn.execute("SELECT id, name FROM leads").fetchall()}
+
+        interactions_data: list[tuple[int, str, str, str, str]] = []
+
+        # Hot interactions: 4-6 each with strong intent language.
+        for record in hot_leads:
+            for type_, content, direction, minutes_ago in record["interactions"]:
+                ts = (now - timedelta(minutes=minutes_ago)).isoformat(timespec="seconds")
+                interactions_data.append((leads_by_name[record["name"]], type_, content, ts, direction))
+
+        # Warm interactions: 3-5 each with mixed signals.
+        for idx, row in enumerate(warm_leads):
+            rec = warm_or_cold_record(row, "warm")
+            lead_id = leads_by_name[rec["name"]]
+            base = 6500 + (idx * 120)
+            interactions_data.extend(
+                [
+                    (lead_id, "text", f"Hi {rec['name'].split()[0]}, are you still considering selling?", (now - timedelta(minutes=base)).isoformat(timespec="seconds"), "outbound"),
+                    (lead_id, "text", "I might sell soon, still exploring options.", (now - timedelta(minutes=base - 80)).isoformat(timespec="seconds"), "inbound"),
+                    (lead_id, "text", "No rush—want me to share a simple value range?", (now - timedelta(minutes=base - 600)).isoformat(timespec="seconds"), "outbound"),
+                ]
+            )
+            if idx % 2 == 0:
+                interactions_data.append((lead_id, "text", "Maybe. I need a little more time to decide.", (now - timedelta(minutes=base - 760)).isoformat(timespec="seconds"), "inbound"))
+
+        # Cold interactions: 1-3 each with weak engagement/ghosting patterns.
+        for idx, row in enumerate(cold_leads):
+            rec = warm_or_cold_record(row, "cold")
+            lead_id = leads_by_name[rec["name"]]
+            base = 8200 + (idx * 90)
+            interactions_data.append((lead_id, "text", f"Hey {rec['name'].split()[0]}, still open to discussing your property options?", (now - timedelta(minutes=base)).isoformat(timespec="seconds"), "outbound"))
+            if idx % 3 != 1:
+                interactions_data.append((lead_id, "text", "Just exploring, nothing urgent right now.", (now - timedelta(minutes=base - 70)).isoformat(timespec="seconds"), "inbound"))
+            if idx % 4 == 0:
+                interactions_data.append((lead_id, "text", "Totally fine—I can check back later in the year.", (now - timedelta(minutes=base - 500)).isoformat(timespec="seconds"), "outbound"))
+
+        conn.executemany(
+            "INSERT INTO interactions (lead_id, type, content, timestamp, direction) VALUES (?,?,?,?,?)",
+            interactions_data,
+        )
 
 def fetch_leads(db_path: Path = DB_PATH, where: str = "1=1", params: Iterable[Any] = ()) -> list[dict[str, Any]]:
     with get_conn(db_path) as conn:
