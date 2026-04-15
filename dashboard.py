@@ -96,6 +96,10 @@ def format_dt(iso_value: str) -> tuple[str, str]:
     return dt.strftime("%m-%d"), dt.strftime("%I:%M %p").lstrip("0")
 
 
+def human_stage(stage: str) -> str:
+    return stage.replace("_", " ").title()
+
+
 def update_status(lead_id: int, key: str) -> None:
     status = st.session_state.get(key)
     if status:
@@ -167,7 +171,7 @@ def render_lead_detail(lead_id: int) -> None:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.subheader(lead["name"])
         st.write("Phone:", lead["phone"])
-        st.write("Stage:", lead["conversation_stage"])
+        st.write("Stage:", human_stage(lead["conversation_stage"]))
         st.write("Touch count:", lead["touch_count"])
         st.write("Situation:", situation_text or "Not recorded")
 
@@ -198,15 +202,20 @@ def render_lead_detail(lead_id: int) -> None:
 
     with c2:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("**Conversation (Texts only)**")
-        texts = [i for i in interactions if i["type"] == "text"][:10]
-        if not texts:
-            st.write("No text messages logged")
-        for msg in texts:
+        st.markdown("**Conversation Log**")
+        logs = interactions[:10]
+        if not logs:
+            st.write("No conversation activity logged")
+        for msg in logs:
             d, t = format_dt(msg["timestamp"])
-            st.write(f"{d}")
-            st.caption(f"{t}")
-            st.write(f"{msg['direction']} · {msg['content']}")
+            st.caption(f"{d} • {t}")
+            if msg["type"] == "call":
+                st.write("Outbound Call" if msg["direction"] == "outbound" else "Inbound Call")
+                st.write(msg["content"])
+            else:
+                label = "Text Sent" if msg["direction"] == "outbound" else "Text Received"
+                st.write(f"{label}: {msg['content']}")
+            st.divider()
 
         st.markdown("---")
         st.markdown("**Log Call**")
@@ -215,10 +224,13 @@ def render_lead_detail(lead_id: int) -> None:
 
         manual_ts = None
         if mode == "Select date + time":
-            dt_col, tm_col = st.columns(2)
-            call_date = dt_col.date_input("Date", key=f"call_date_{lead_id}", value=date.today())
-            call_time = tm_col.time_input("Time", key=f"call_time_{lead_id}")
-            manual_ts = datetime.combine(call_date, call_time)
+            c_date, c_hour, c_min, c_ampm = st.columns([1.3, 1, 1, 1])
+            call_date = c_date.date_input("Date", key=f"call_date_{lead_id}", value=date.today())
+            hour = c_hour.selectbox("Hour", list(range(1, 13)), key=f"call_hour_{lead_id}")
+            minute = c_min.selectbox("Min", [f"{m:02d}" for m in range(0, 60, 5)], key=f"call_min_{lead_id}")
+            ampm = c_ampm.selectbox("AM/PM", ["AM", "PM"], key=f"call_ampm_{lead_id}")
+            hour_24 = hour % 12 + (12 if ampm == "PM" else 0)
+            manual_ts = datetime.combine(call_date, datetime.min.time()).replace(hour=hour_24, minute=int(minute))
 
         add_text_log = st.checkbox("Also add as text note", key=f"call_text_{lead_id}", value=False)
         if st.button("Log Call", key=f"call_btn_{lead_id}"):
@@ -270,22 +282,23 @@ if "page" not in st.session_state:
 left_head, right_search = st.columns([4, 1.7])
 with left_head:
     st.markdown("# Silverline Investment Group 🌿")
-    st.caption("Dashboard")
+    st.caption("")
 with right_search:
     st.markdown("##### Quick Search")
     render_global_search(all_leads)
 
 with st.sidebar:
     st.markdown("### 🌿 Navigation")
-    selected = st.radio("Sections", PAGES, index=PAGES.index(st.session_state["page"]), label_visibility="collapsed")
-    if selected != st.session_state["page"]:
-        nav_to(selected)
+    for section in PAGES:
+        active = st.session_state["page"] == section
+        prefix = "• " if active else ""
+        if st.button(f"{prefix}{section}", use_container_width=True, type="tertiary", key=f"nav_{section}"):
+            nav_to(section)
 st.divider()
 
 page = st.session_state["page"]
 
 if page == "Dashboard":
-    st.subheader("Dashboard")
     summary = result["summary"]
     cols = st.columns(5)
     stats = [
@@ -299,7 +312,9 @@ if page == "Dashboard":
         c.markdown(f"<div class='metric'><div>{label}</div><h3>{value}</h3></div>", unsafe_allow_html=True)
 
     st.markdown("### Call List Preview")
-    if st.button("Call List", key="goto_calls_page"):
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    call_total = len(result["call_list"])
+    if st.button(f"Call List ({call_total} calls today)", key="goto_calls_page"):
         nav_to("Call List")
     for entry in result["call_list"][:5]:
         reason_labels = human_intent_labels(entry.get("intent_signals", []))
@@ -307,15 +322,20 @@ if page == "Dashboard":
         if st.button(f"{entry['name']} · {entry['phone']}", key=f"dash_call_pick_{entry['lead_id']}"):
             nav_to("Leads", entry["lead_id"])
         st.caption(reason)
-    if st.button("View All", key="dashboard_view_calls"):
-        nav_to("Call List")
+    st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("### Follow-up Preview")
-    for item in result["followup_queue"][:5]:
-        st.markdown(f"- **{item['lead_name']}** · {item['objective']}")
-        st.caption(item["new_message"])
-    if st.button("View All", key="dashboard_view_followups"):
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    pending = len(result["followup_queue"])
+    if st.button(f"Follow-ups ({pending} pending)", key="dashboard_view_followups"):
         nav_to("Follow-ups")
+    if result["followup_queue"]:
+        sample = result["followup_queue"][0]
+        st.markdown(f"**{sample['lead_name']}** · {sample['objective']}")
+        st.caption(sample["new_message"])
+    else:
+        st.caption("No pending follow-ups.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 elif page == "Call List":
     st.subheader("Call List")
@@ -342,29 +362,38 @@ elif page == "Leads":
             continue
         matches.append(lead)
 
-    st.caption(f"{len(matches)} results")
-    for lead in matches:
-        short_timeline, _, _ = parse_timeline_parts(lead["timeline"])
-        if st.button(f"{lead['name']} · {lead['status'].upper()} · {lead['phone']} · {short_timeline}", key=f"lead_pick_{lead['id']}"):
-            st.session_state["selected_lead_id"] = lead["id"]
-            st.session_state["scroll_to_selected"] = True
-            st.rerun()
+    left, right = st.columns([1, 1.7])
+    with left:
+        st.caption(f"{len(matches)} results")
+        with st.container(height=620):
+            for lead in matches:
+                short_timeline, _, _ = parse_timeline_parts(lead["timeline"])
+                if st.button(
+                    f"{lead['name']} · {lead['status'].upper()} · {lead['phone']} · {short_timeline}",
+                    key=f"lead_pick_{lead['id']}",
+                ):
+                    st.session_state["selected_lead_id"] = lead["id"]
+                    st.session_state["scroll_to_selected"] = True
+                    st.rerun()
+    with right:
+        selected_id = st.session_state.get("selected_lead_id")
+        if selected_id:
+            render_lead_detail(selected_id)
+        else:
+            st.info("Select a lead from the list.")
 
     selected_id = st.session_state.get("selected_lead_id")
-    if selected_id:
-        st.divider()
-        render_lead_detail(selected_id)
-        if st.session_state.get("scroll_to_selected"):
-            st.markdown(
-                """
+    if selected_id and st.session_state.get("scroll_to_selected"):
+        st.markdown(
+            """
 <script>
 const el = window.parent.document.getElementById('selected-lead');
 if (el) { el.scrollIntoView({behavior:'smooth', block:'start'}); }
 </script>
 """,
-                unsafe_allow_html=True,
-            )
-            st.session_state["scroll_to_selected"] = False
+            unsafe_allow_html=True,
+        )
+        st.session_state["scroll_to_selected"] = False
 
 elif page == "Follow-ups":
     st.subheader("Follow-ups")
