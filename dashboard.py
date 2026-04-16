@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import time
 
 import streamlit as st
 
@@ -57,10 +58,14 @@ h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {display:none !important;}
 .tooltip-tip{visibility:hidden;opacity:0;transition:opacity .15s;position:absolute;z-index:20;left:20px;top:-6px;background:#222;color:#fff;padding:6px 8px;border-radius:6px;font-size:12px;white-space:nowrap;}
 .tooltip-wrap:hover .tooltip-tip{visibility:visible;opacity:1;}
 .big-title {font-size: 36px !important; font-weight: 800 !important; margin-bottom: 10px;}
-.nav-item button{color:#333 !important;text-decoration:none !important;background:transparent !important;border:none !important;justify-content:flex-start !important;padding:4px 0 !important;}
-.nav-item.active button{color:#3c5f42 !important;font-weight:600 !important;border-left:2px solid #6B8F71 !important;padding-left:8px !important;border-radius:0 !important;}
+.big-title-wrap {margin-bottom: 2px !important;}
+.quick-search-wrap {margin-top: -34px;}
+.nav-item button{color:#2e2e2e !important;text-decoration:none !important;background:transparent !important;border:none !important;justify-content:flex-start !important;padding:6px 8px !important;cursor:pointer !important;border-radius:8px !important;}
+.nav-item button:hover{background:#ece7df !important;}
+.nav-item.active button{color:#2f4f35 !important;font-weight:600 !important;background:#e7f0e8 !important;border-left:2px solid #6B8F71 !important;padding-left:10px !important;border-radius:8px !important;}
 [data-testid="stSidebar"] .stButton > button{color:#333 !important;text-decoration:none !important;}
 .note-actions button{border:none !important;background:transparent !important;padding:0 !important;min-height:20px !important;font-size:0.85rem !important;}
+.note-bubble{background:#f4f1ec;border:1px solid #e7e2d9;border-radius:12px;padding:8px 10px;}
 </style>
 """
 
@@ -323,7 +328,7 @@ def render_notes(lead_id: int, interactions: list[dict]) -> None:
                 st.rerun()
         else:
             row_left, row_edit, row_del = st.columns([14, 1, 1])
-            row_left.markdown(note["content"])
+            row_left.markdown(f"<div class='note-bubble'>{note['content']}</div>", unsafe_allow_html=True)
             row_edit.markdown("<div class='note-actions'>", unsafe_allow_html=True)
             if row_edit.button("✏️", key=f"note_edit_{nid}", help="Edit", type="tertiary"):
                 st.session_state[edit_key] = True
@@ -342,9 +347,13 @@ def render_notes(lead_id: int, interactions: list[dict]) -> None:
                 if n.button("Cancel", key=f"note_cancel_{nid}"):
                     st.session_state[f"confirm_del_{nid}"] = False
 
-    new_note = st.text_input("Add note", key=f"new_note_{lead_id}")
-    if st.button("Save Note", key=f"save_note_{lead_id}") and new_note.strip():
-        db.add_interaction(lead_id, "note", f"{fmt_stamp(datetime.utcnow())} — {new_note.strip()}", "outbound")
+    with st.form(key=f"note_form_{lead_id}", clear_on_submit=True):
+        new_note = st.text_input("Add note", key=f"new_note_{lead_id}")
+        submitted = st.form_submit_button("Add Note")
+    if submitted and new_note.strip():
+        user_initials = st.session_state.get("current_user_initials", "RJ")
+        db.add_interaction(lead_id, "note", f"{fmt_stamp(datetime.utcnow())} — {user_initials} {new_note.strip()}", "outbound")
+        st.toast("Note added")
         st.rerun()
 
 
@@ -443,7 +452,7 @@ st.markdown("""
     margin-bottom: 10px;
 }
 </style>
-<h1 class="big-title">Silverline Investment Group 🌿</h1>
+<div class="big-title-wrap"><h1 class="big-title">Silverline Investment Group 🌿</h1></div>
 """, unsafe_allow_html=True)
 db.init_db()
 result = engine.evaluate_all_leads()
@@ -466,8 +475,12 @@ head_left, head_right = st.columns([4, 1.7])
 with head_left:
     st.empty()
 with head_right:
+    st.markdown("<div class='quick-search-wrap'>", unsafe_allow_html=True)
+    user_choice = st.selectbox("User", ["Rommel (RJ)", "Gabby (GL)"], key="user_picker")
+    st.session_state["current_user_initials"] = "RJ" if user_choice.startswith("Rommel") else "GL"
     st.markdown("##### Quick Search")
     render_global_search(all_leads)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown("### 🌿 Navigation")
@@ -564,7 +577,7 @@ elif page == "Leads":
             with st.container(height=620):
                 for lead in matches:
                     _, address_text, _, _ = parse_timeline_parts(lead["timeline"])
-                    if st.button(f"{lead['name']} · {address_text}", key=f"lead_{lead['id']}"):
+                    if st.button(f"{lead['name']}\n{address_text}", key=f"lead_{lead['id']}"):
                         st.session_state["selected_lead_id"] = lead["id"]
                         st.session_state["lead_list_collapsed"] = True
                         st.rerun()
@@ -652,15 +665,38 @@ elif page == "Follow-ups":
             key = f"f_msg_{item['lead_id']}"
             if key not in st.session_state:
                 st.session_state[key] = item["new_message"]
+            sent_key = f"sent_preview_{item['lead_id']}"
+            if sent_key not in st.session_state:
+                st.session_state[sent_key] = []
             st.text_area("Suggestion", key=key, height=80)
+            for sent_msg in st.session_state[sent_key]:
+                ts = datetime.utcnow().isoformat(timespec="seconds")
+                render_imessage([{"timestamp": ts, "direction": "outbound", "type": "text", "content": sent_msg}], max_items=1)
 
             c1, c2, c3 = st.columns(3)
             if c1.button("Approve", key=f"f_app_{item['lead_id']}"):
                 if item["lead_id"] > 0:
+                    typing_box = st.empty()
+                    ts_now = datetime.utcnow().isoformat(timespec="seconds")
+                    typing_box.markdown(
+                        f"<div class='msg-row msg-left'><div><div class='msg-time'>{fmt_date_time(ts_now)[0]} • {fmt_date_time(ts_now)[1]}</div><div class='msg-bubble-in'>...</div></div></div>",
+                        unsafe_allow_html=True,
+                    )
+                    time.sleep(0.25)
+                    typing_box.empty()
                     ts = datetime.utcnow()
                     send_sms(item["lead_id"], st.session_state[key])
-                    db.add_interaction(item["lead_id"], "text", f"Suggested message approved: {st.session_state[key]}", "outbound", ts=ts)
-                    db.add_interaction(item["lead_id"], "note", f"[User] approved message: {st.session_state[key]}", "outbound", ts=ts)
+                    approved_text = st.session_state[key]
+                    st.session_state[sent_key].append(approved_text)
+                    user_initials = st.session_state.get("current_user_initials", "RJ")
+                    db.add_interaction(item["lead_id"], "text", f"Suggested message approved: {user_initials} approved message: {approved_text}", "outbound", ts=ts)
+                    db.add_interaction(item["lead_id"], "note", f"{user_initials} approved message: {approved_text}", "outbound", ts=ts)
+                    st.session_state[key] = ""
+                    st.markdown(
+                        "<audio autoplay><source src='https://notificationsounds.com/storage/sounds/file-sounds-1152-pristine.mp3' type='audio/mpeg'></audio>",
+                        unsafe_allow_html=True,
+                    )
+                    st.success("Message sent.")
                 st.rerun()
             if c2.button("Edit", key=f"f_edit_{item['lead_id']}"):
                 st.info("Edit in suggestion box.")
