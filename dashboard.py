@@ -51,9 +51,13 @@ html, body, [data-testid="stAppViewContainer"] {
 .msg-time{font-size:.73rem;color:#808080;margin-bottom:2px;}
 h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {display:none !important;}
 .st-key-home_title button {font-size: 2.0rem !important; font-weight: 700 !important; border: none !important; background: transparent !important; padding-left: 0 !important;}
-.info-wrap{position:relative;display:inline-block;margin-left:6px;color:#666;cursor:help;}
-.info-tip{visibility:hidden;opacity:0;transition:opacity .15s;position:absolute;z-index:20;left:14px;top:-6px;background:#222;color:#fff;padding:6px 8px;border-radius:6px;font-size:12px;white-space:nowrap;}
-.info-wrap:hover .info-tip{visibility:visible;opacity:1;}
+.st-key-home_title button {font-size: 2.3rem !important; font-weight: 800 !important; border: none !important; background: transparent !important; padding-left: 0 !important; width: 100% !important; text-align: left !important;}
+.tooltip-wrap{position:relative;display:inline-flex;align-items:center;gap:6px;}
+.tooltip-icon{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border:1px solid #8b8b8b;border-radius:50%;font-size:11px;line-height:1;color:#5d5d5d;cursor:default;}
+.tooltip-tip{visibility:hidden;opacity:0;transition:opacity .15s;position:absolute;z-index:20;left:20px;top:-6px;background:#222;color:#fff;padding:6px 8px;border-radius:6px;font-size:12px;white-space:nowrap;}
+.tooltip-wrap:hover .tooltip-tip{visibility:visible;opacity:1;}
+.nav-link{display:block;text-decoration:none !important;color:#2E2E2E;padding:5px 0;font-size:0.97rem;}
+.nav-link.active{color:#3c5f42;font-weight:600;border-left:2px solid #6B8F71;padding-left:8px;}
 </style>
 """
 
@@ -61,7 +65,12 @@ PAGES = ["Dashboard", "Leads", "Call List", "Follow-ups"]
 
 
 def info_icon(text: str, tip: str) -> str:
-    return f"{text} <span class='info-wrap'>ⓘ<span class='info-tip'>{tip}</span></span>"
+    return (
+        f"<span class='tooltip-wrap'>{text}"
+        f"<span class='tooltip-icon'>i</span>"
+        f"<span class='tooltip-tip'>{tip}</span>"
+        "</span>"
+    )
 
 
 def parse_timeline_parts(timeline_text: str) -> tuple[str, str, str, str]:
@@ -150,21 +159,21 @@ def seed_followup_examples() -> tuple[list[tuple[dict, dict]], list[tuple[dict, 
     warm = [
         (
             {"lead_id": -1001, "lead_name": "Maya Porter", "new_message": "Would a quick value range help you decide next steps?"},
-            {"timeline": "Considering options this quarter. Address: 214 Willow Brook Dr. Situation: Downsizing soon. Notes: Responsive but cautious.", "status": "warm", "phone": "555-240-1101"},
+            {"timeline": "Considering options this quarter. Address: 214 Willow Brook Dr, Dallas, TX 75201. Situation: Downsizing soon. Notes: Responsive but cautious.", "status": "warm", "phone": "555-240-1101"},
         ),
         (
             {"lead_id": -1002, "lead_name": "Brent Lawson", "new_message": "No pressure—want me to text a simple path so you can compare?"}, 
-            {"timeline": "Could move in 60 days. Address: 88 Maple Crest Ln. Situation: Job relocation possible. Notes: Asked about speed.", "status": "warm", "phone": "555-240-1102"},
+            {"timeline": "Could move in 60 days. Address: 88 Maple Crest Ln, Dallas, TX 75202. Situation: Job relocation possible. Notes: Asked about speed.", "status": "warm", "phone": "555-240-1102"},
         ),
     ]
     cold = [
         (
             {"lead_id": -2001, "lead_name": "Tina Ramirez", "new_message": "Happy to check back later—still okay if I circle back next month?"},
-            {"timeline": "No urgent timeline. Address: 17 Cedar Point Way. Situation: Monitoring market. Notes: Low urgency.", "status": "cold", "phone": "555-240-2101"},
+            {"timeline": "No urgent timeline. Address: 17 Cedar Point Way, Dallas, TX 75203. Situation: Monitoring market. Notes: Low urgency.", "status": "cold", "phone": "555-240-2101"},
         ),
         (
             {"lead_id": -2002, "lead_name": "Paul Everett", "new_message": "If timing changed, I can keep this simple with one quick option."},
-            {"timeline": "Maybe next year. Address: 502 Garden Row St. Situation: Renovation planning. Notes: Minimal replies.", "status": "cold", "phone": "555-240-2102"},
+            {"timeline": "Maybe next year. Address: 502 Garden Row St, Dallas, TX 75204. Situation: Renovation planning. Notes: Minimal replies.", "status": "cold", "phone": "555-240-2102"},
         ),
     ]
     return warm, cold
@@ -274,7 +283,11 @@ def render_imessage(items: list[dict], max_items: int = 10) -> None:
         outgoing = msg["direction"] == "outbound"
         bubble = "msg-bubble-out" if outgoing else "msg-bubble-in"
         row = "msg-right" if outgoing else "msg-left"
-        label = "Outbound Call" if msg["type"] == "call" and outgoing else "Inbound Call" if msg["type"] == "call" else msg["content"]
+        if msg["type"] == "call":
+            prefix = "Outbound Call" if outgoing else "Inbound Call"
+            label = f"{prefix} — {msg['content']}"
+        else:
+            label = msg["content"]
         st.markdown(
             f"<div class='msg-row {row}'><div><div class='msg-time'>{ts}</div><div class='{bubble}'>{label}</div></div></div>",
             unsafe_allow_html=True,
@@ -306,11 +319,11 @@ def render_notes(lead_id: int, interactions: list[dict]) -> None:
                 st.session_state[edit_key] = False
                 st.rerun()
         else:
-            st.write(note["content"])
-            c1, c2 = st.columns([1, 1])
-            if c1.button("✏️", key=f"note_edit_{nid}"):
+            row_left, row_edit, row_del = st.columns([14, 1, 1])
+            row_left.markdown(note["content"])
+            if row_edit.button("✏", key=f"note_edit_{nid}", help="Edit"):
                 st.session_state[edit_key] = True
-            if c2.button("✖", key=f"note_del_{nid}"):
+            if row_del.button("✕", key=f"note_del_{nid}", help="Delete"):
                 st.session_state[f"confirm_del_{nid}"] = True
             if st.session_state.get(f"confirm_del_{nid}"):
                 st.warning("Delete this note?")
@@ -334,13 +347,17 @@ def render_lead_detail(lead_id: int) -> None:
         st.warning("Selected lead could not be found.")
         return
     interactions = db.fetch_interactions(lead_id)
+    conversation = [
+        i for i in interactions
+        if i["type"] == "call" or (i["type"] == "text" and "suggested message approved" in i["content"].lower())
+    ]
     timeline_text, address_text, situation_text, _ = parse_timeline_parts(lead["timeline"])
 
     st.markdown(f"### {lead['name']}")
     c_top1, c_top2, c_top3 = st.columns(3)
     c_top1.markdown(f"**Phone:** {lead['phone']}")
     c_top2.markdown(f"**Stage:** {human_stage(lead['conversation_stage'])}")
-    c_top3.markdown(f"**Address:** {address_text or 'Not provided'}")
+    c_top3.markdown(f"**Address:** {address_text or 'Address unavailable'}")
 
     c_edit1, c_edit2, c_edit3 = st.columns(3)
     c_edit1.selectbox(
@@ -372,7 +389,7 @@ def render_lead_detail(lead_id: int) -> None:
     with left:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown("**Conversation**")
-        render_imessage(interactions, max_items=10)
+        render_imessage(conversation, max_items=10)
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -415,6 +432,7 @@ st.markdown(THEME_CSS, unsafe_allow_html=True)
 db.init_db()
 result = engine.evaluate_all_leads()
 all_leads = db.fetch_leads()
+lead_lookup = {lead["id"]: lead for lead in all_leads}
 all_interactions = []
 for ld in all_leads:
     all_interactions.extend(db.fetch_interactions(ld["id"]))
@@ -425,6 +443,9 @@ if "lead_list_collapsed" not in st.session_state:
     st.session_state["lead_list_collapsed"] = False
 if "call_completed" not in st.session_state:
     st.session_state["call_completed"] = {}
+if "page" in st.query_params and st.query_params["page"] in PAGES:
+    st.session_state["page"] = st.query_params["page"]
+st.query_params["page"] = st.session_state["page"]
 
 head_left, head_right = st.columns([4, 1.7])
 with head_left:
@@ -436,9 +457,13 @@ with head_right:
 
 with st.sidebar:
     st.markdown("### 🌿 Navigation")
-    selected = st.radio("", PAGES, index=PAGES.index(st.session_state["page"]), label_visibility="collapsed")
-    if selected != st.session_state["page"]:
-        nav_to(selected)
+    for item in PAGES:
+        active = "active" if st.session_state["page"] == item else ""
+        page_token = item.replace(" ", "%20")
+        st.markdown(
+            f"<a class='nav-link {active}' href='?page={page_token}'>{item}</a>",
+            unsafe_allow_html=True,
+        )
 
 st.divider()
 page = st.session_state["page"]
@@ -491,8 +516,10 @@ if page == "Dashboard":
     prog = progression_metrics(all_leads, all_interactions)
     pc = st.columns(4)
     for c, (k, v) in zip(pc, prog.items()):
-        label = info_icon(k, "How effectively warm leads are escalated.") if k == "Warm→Hot" else k
-        c.metric(label, f"{v:.1f}%")
+        c.markdown(
+            f"<div class='card'><b>{info_icon(k, 'How effectively warm leads are escalated.')}</b><br>{v:.1f}%</div>",
+            unsafe_allow_html=True,
+        )
 
     with st.expander("Advanced Metrics"):
         adv = advanced_metrics(all_leads, all_interactions)
@@ -513,7 +540,7 @@ elif page == "Leads":
     if not st.session_state.get("lead_list_collapsed"):
         left, right = st.columns([1, 1.8])
     else:
-        left, right = st.columns([0.01, 2.99])
+        left, right = st.columns([0.14, 2.86])
 
     with left:
         if not st.session_state.get("lead_list_collapsed"):
@@ -523,7 +550,7 @@ elif page == "Leads":
             with st.container(height=620):
                 for lead in matches:
                     _, address_text, _, _ = parse_timeline_parts(lead["timeline"])
-                    if st.button(f"{lead['name']} · {address_text or 'Address not provided'}", key=f"lead_{lead['id']}"):
+                    if st.button(f"{lead['name']} · {address_text or 'Address unavailable'}", key=f"lead_{lead['id']}"):
                         st.session_state["selected_lead_id"] = lead["id"]
                         st.session_state["lead_list_collapsed"] = True
                         st.rerun()
@@ -549,11 +576,11 @@ elif page == "Call List":
         for entry in call_list:
             lid = entry["lead_id"]
             done_key = f"done_{lid}"
-            lead = db.fetch_lead(lid)
+            lead = lead_lookup.get(lid)
             _, address_text, situation, _ = parse_timeline_parts(lead["timeline"] if lead else "")
-            checked = st.checkbox(f"{entry['name']} · {address_text or 'Address not provided'}", key=done_key)
+            checked = st.checkbox(f"{entry['name']} · {address_text or 'Address unavailable'}", key=done_key)
             completed, remaining = completion_counts(call_list)
-            st.caption(f"Address: {address_text or 'Not provided'}")
+            st.caption(f"Address: {address_text or 'Address unavailable'}")
             st.caption(situation)
             labels = human_intent_labels(entry.get("intent_signals", []))
             st.markdown("".join([f"<span class='pill'>{x}</span>" for x in labels]), unsafe_allow_html=True)
@@ -574,7 +601,7 @@ elif page == "Follow-ups":
 
     warm_items, cold_items = [], []
     for item in queue:
-        lead = db.fetch_lead(item["lead_id"])
+        lead = lead_lookup.get(item["lead_id"])
         if not lead:
             continue
         if overdue_only and lead.get("next_action_date") and lead["next_action_date"] >= date.today().isoformat():
@@ -603,7 +630,7 @@ elif page == "Follow-ups":
             if item["lead_id"] <= 0:
                 st.markdown(f"**{item['lead_name']}**")
             st.caption(f"Phone: {lead.get('phone', 'N/A')}")
-            st.caption(f"Address: {address or 'Not provided'}")
+            st.caption(f"Address: {address or 'Address unavailable'}")
             st.write("Situation:", situation or "Not recorded")
             with st.container(height=120):
                 render_imessage(history, max_items=6)
