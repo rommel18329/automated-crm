@@ -24,11 +24,9 @@ html, body, [data-testid="stAppViewContainer"] {
 }
 .block-container {padding-top: 2.4rem;}
 .card {
-  background: var(--card);
-  border-radius: 16px;
-  padding: 14px 16px;
-  margin-bottom: 12px;
-  box-shadow: 0 8px 22px rgba(46,46,46,0.06);
+  border-top: 1px solid #1f1f1f;
+  padding-top: 12px;
+  margin-top: 12px;
 }
 .metric {
   background: var(--highlight);
@@ -100,6 +98,8 @@ def fmt_date_time(iso_value: str) -> tuple[str, str]:
 
 def nav_to(page: str, lead_id: int | None = None) -> None:
     st.session_state["page"] = page
+    if page == "Leads" and lead_id is None:
+        st.session_state["lead_list_collapsed"] = False
     if lead_id is not None:
         st.session_state["selected_lead_id"] = lead_id
         st.session_state["lead_list_collapsed"] = True
@@ -107,7 +107,14 @@ def nav_to(page: str, lead_id: int | None = None) -> None:
 
 
 def render_global_search(leads: list[dict]) -> None:
-    q = st.text_input("Quick Search", placeholder="Name or phone", label_visibility="collapsed", key="quick_search").strip().lower()
+    if "quick_search_value" not in st.session_state:
+        st.session_state["quick_search_value"] = ""
+    q = st.text_input(
+        "Quick Search",
+        placeholder="Name or phone",
+        label_visibility="collapsed",
+        key="quick_search_value",
+    ).strip().lower()
     if not q:
         return
     matches = [l for l in leads if q in l["name"].lower() or q in l["phone"].lower()][:8]
@@ -271,6 +278,9 @@ def render_notes(lead_id: int, interactions: list[dict]) -> None:
 
 def render_lead_detail(lead_id: int) -> None:
     lead = db.fetch_lead(lead_id)
+    if not lead:
+        st.warning("Selected lead could not be found.")
+        return
     interactions = db.fetch_interactions(lead_id)
     timeline_text, situation_text, _ = parse_timeline_parts(lead["timeline"])
 
@@ -374,9 +384,9 @@ with head_right:
 
 with st.sidebar:
     st.markdown("### 🌿 Navigation")
-    selected = st.radio("", PAGES, index=PAGES.index(st.session_state["page"]))
-    if selected != st.session_state["page"]:
-        nav_to(selected)
+    for section in PAGES:
+        if st.button(section, type="tertiary", use_container_width=True, key=f"nav_{section}"):
+            nav_to(section)
 
 st.divider()
 page = st.session_state["page"]
@@ -387,14 +397,15 @@ if page == "Dashboard":
     for c, (label, value) in zip(
         cols,
         [
-            ("Hot", summary["hot"]),
-            ("Warm", summary["warm"]),
-            ("Cold", summary["cold"]),
-            ("Follow-ups (Today)", len(result["followup_queue"])),
-            ("Risk leads", summary["risk_leads"]),
+            ("Hot ℹ", summary["hot"]),
+            ("Warm ℹ", summary["warm"]),
+            ("Cold ℹ", summary["cold"]),
+            ("Follow-ups (Today) ℹ", len(result["followup_queue"])),
+            ("Risk leads ℹ", summary["risk_leads"]),
         ],
     ):
         c.markdown(f"<div class='metric'><div>{label}</div><h3>{value}</h3></div>", unsafe_allow_html=True)
+    st.caption("ℹ Hot/Warm/Cold = current pipeline mix. Follow-ups today = pending actions due now. Risk leads = likely ghosting/at-risk.")
 
     activity = activity_counts(all_interactions)
     st.markdown("### Activity")
@@ -423,15 +434,10 @@ if page == "Dashboard":
         for k, v in adv.items():
             st.write(f"**{k}:** {v}")
 
-    st.markdown("### Call List Preview")
+    st.markdown("### Call List")
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     if st.button(f"Call List ({len(result['call_list'])} calls today)", key="call_list_nav"):
         nav_to("Call List")
-    for entry in result["call_list"][:5]:
-        if st.button(f"{entry['name']} · {entry['phone']}", key=f"dash_call_{entry['lead_id']}"):
-            nav_to("Leads", entry["lead_id"])
-        labels = human_intent_labels(entry.get("intent_signals", []))
-        st.markdown("".join([f"<span class='pill'>{x}</span>" for x in labels]), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 elif page == "Leads":
@@ -445,18 +451,15 @@ elif page == "Leads":
     ]
 
     if not st.session_state.get("lead_list_collapsed"):
-        left, right = st.columns([1, 1.7])
+        left, right = st.columns([1, 1.8])
     else:
-        left, right = st.columns([0.15, 2.55])
+        left, right = st.columns([0.01, 2.99])
 
     with left:
-        if st.button("Toggle List", key="toggle_list"):
-            st.session_state["lead_list_collapsed"] = not st.session_state["lead_list_collapsed"]
-            st.rerun()
         if not st.session_state.get("lead_list_collapsed"):
             with st.container(height=620):
                 for lead in matches:
-                    if st.button(f"{lead['name']} · {lead['phone']}", key=f"lead_{lead['id']}"):
+                    if st.button(f"{lead['name']} · Address: Not provided", key=f"lead_{lead['id']}"):
                         st.session_state["selected_lead_id"] = lead["id"]
                         st.session_state["lead_list_collapsed"] = True
                         st.rerun()
@@ -478,7 +481,7 @@ elif page == "Call List":
         for entry in call_list:
             lid = entry["lead_id"]
             done_key = f"done_{lid}"
-            checked = st.checkbox(f"Completed · {entry['name']} ({entry['phone']})", key=done_key)
+            checked = st.checkbox(f"{entry['name']} · Address: Not provided", key=done_key, value=False)
             if checked:
                 completed += 1
             lead = db.fetch_lead(lid)
@@ -535,6 +538,7 @@ elif page == "Follow-ups":
                 st.rerun()
             if c2.button("Edit", key=f"f_edit_{item['lead_id']}"):
                 st.info("Edit in suggestion box.")
-            if c3.button("Skip", key=f"f_skip_{item['lead_id']}"):
-                st.info("Skipped")
+            if c3.button("Regenerate", key=f"f_regen_{item['lead_id']}"):
+                st.session_state[key] = st.session_state[key] + " Just checking if a quick call would be easier."
+                st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
