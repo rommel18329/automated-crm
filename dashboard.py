@@ -60,12 +60,19 @@ h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {display:none !important;}
 .big-title {font-size: 36px !important; font-weight: 800 !important; margin-bottom: 10px;}
 .big-title-wrap {margin-bottom: 2px !important;}
 .quick-search-wrap {margin-top: -34px;}
-.nav-item button{color:#2e2e2e !important;text-decoration:none !important;background:transparent !important;border:none !important;justify-content:flex-start !important;padding:6px 8px !important;cursor:pointer !important;border-radius:8px !important;}
-.nav-item button:hover{background:#ece7df !important;}
-.nav-item.active button{color:#2f4f35 !important;font-weight:600 !important;background:#e7f0e8 !important;border-left:2px solid #6B8F71 !important;padding-left:10px !important;border-radius:8px !important;}
-[data-testid="stSidebar"] .stButton > button{color:#333 !important;text-decoration:none !important;}
+[data-testid="stSidebar"] [data-baseweb="tab-list"]{gap:4px;display:flex;flex-direction:column;}
+[data-testid="stSidebar"] [data-baseweb="tab"]{justify-content:flex-start !important;color:#2f2f2f !important;background:transparent !important;border-radius:8px !important;padding:6px 8px !important;}
+[data-testid="stSidebar"] [data-baseweb="tab"]:hover{background:#ece7df !important;cursor:pointer !important;}
+[data-testid="stSidebar"] [aria-selected="true"]{background:#e7f0e8 !important;color:#2f4f35 !important;font-weight:600 !important;border-left:2px solid #6B8F71 !important;}
+[data-testid="stToggle"] label{font-weight:600;}
+[data-testid="stToggle"] [data-baseweb="switch"] > div{background:#d64b4b !important;}
+[data-testid="stToggle"] input:checked + div{background:#54a96a !important;}
 .note-actions button{border:none !important;background:transparent !important;padding:0 !important;min-height:20px !important;font-size:0.85rem !important;}
 .note-bubble{background:#f4f1ec;border:1px solid #e7e2d9;border-radius:12px;padding:8px 10px;}
+.typing-dot{display:inline-block;animation:blink 1.2s infinite;}
+.typing-dot:nth-child(2){animation-delay:.2s;}
+.typing-dot:nth-child(3){animation-delay:.4s;}
+@keyframes blink{0%,80%,100%{opacity:.3;}40%{opacity:1;}}
 </style>
 """
 
@@ -351,8 +358,8 @@ def render_notes(lead_id: int, interactions: list[dict]) -> None:
         new_note = st.text_input("Add note", key=f"new_note_{lead_id}")
         submitted = st.form_submit_button("Add Note")
     if submitted and new_note.strip():
-        user_initials = st.session_state.get("current_user_initials", "RJ")
-        db.add_interaction(lead_id, "note", f"{fmt_stamp(datetime.utcnow())} — {user_initials} {new_note.strip()}", "outbound")
+        user_dot = "🔴" if st.session_state.get("user", "RJ") == "RJ" else "🟢"
+        db.add_interaction(lead_id, "note", f"{fmt_stamp(datetime.utcnow())} — {user_dot} {new_note.strip()}", "outbound")
         st.toast("Note added")
         st.rerun()
 
@@ -423,7 +430,8 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
             ts = datetime.combine(d, datetime.min.time()).replace(hour=h24, minute=int(m))
 
         if st.button("Log Call", key=f"log_call_{lead_id}"):
-            content = f"{fmt_stamp(ts)} — {note.strip() or 'Call completed'}"
+            user_dot = "🔴" if st.session_state.get("user", "RJ") == "RJ" else "🟢"
+            content = f"{fmt_stamp(ts)} — {user_dot} {note.strip() or 'Call completed'}"
             db.add_interaction(lead_id, "call", content, "outbound", ts=ts)
             if offer_made:
                 db.add_interaction(lead_id, "note", f"{fmt_stamp(ts)} — Offer made", "outbound", ts=ts)
@@ -473,24 +481,23 @@ if "call_completed" not in st.session_state:
     st.session_state["call_completed"] = {}
 head_left, head_right = st.columns([4, 1.7])
 with head_left:
-    st.empty()
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 with head_right:
     st.markdown("<div class='quick-search-wrap'>", unsafe_allow_html=True)
-    user_choice = st.selectbox("User", ["Rommel (RJ)", "Gabby (GL)"], key="user_picker")
-    st.session_state["current_user_initials"] = "RJ" if user_choice.startswith("Rommel") else "GL"
+    if "user" not in st.session_state:
+        st.session_state["user"] = "RJ"
+    is_gl = st.toggle("RJ  ⟷  GL", value=st.session_state["user"] == "GL", key="user_toggle")
+    st.session_state["user"] = "GL" if is_gl else "RJ"
     st.markdown("##### Quick Search")
     render_global_search(all_leads)
     st.markdown("</div>", unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown("### 🌿 Navigation")
-    for item in PAGES:
-        active = "active" if st.session_state["page"] == item else ""
-        st.markdown(f"<div class='nav-item {active}'>", unsafe_allow_html=True)
-        if st.button(item, key=f"nav_{item}", type="tertiary", use_container_width=True):
-            st.session_state["page"] = item
-            st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
+    selected = st.pills("Navigate", PAGES, selection_mode="single", default=st.session_state["page"], label_visibility="collapsed")
+    if selected and selected != st.session_state["page"]:
+        st.session_state["page"] = selected
+        st.rerun()
 
 st.divider()
 page = st.session_state["page"]
@@ -605,14 +612,15 @@ elif page == "Call List":
             done_key = f"done_{lid}"
             lead = lead_lookup.get(lid)
             _, address_text, situation, _ = parse_timeline_parts(lead["timeline"] if lead else "")
-            checked = st.checkbox(f"{entry['name']} · {address_text}", key=done_key)
+            row_left, row_right = st.columns([5, 1])
+            if row_left.button(f"{entry['name']}\n{address_text}", key=f"open_name_{lid}", type="tertiary", use_container_width=True):
+                nav_to("Leads", lid)
+            checked = row_right.checkbox("", key=done_key, label_visibility="collapsed")
             completed, remaining = completion_counts(call_list)
             st.caption(f"Address: {address_text}")
             st.caption(situation)
             labels = human_intent_labels(entry.get("intent_signals", []))
             st.markdown("".join([f"<span class='pill'>{x}</span>" for x in labels]), unsafe_allow_html=True)
-            if st.button(f"Open {entry['name']}", key=f"open_{lid}"):
-                nav_to("Leads", lid)
             st.divider()
 
     completed, remaining = completion_counts(call_list)
@@ -679,7 +687,7 @@ elif page == "Follow-ups":
                     typing_box = st.empty()
                     ts_now = datetime.utcnow().isoformat(timespec="seconds")
                     typing_box.markdown(
-                        f"<div class='msg-row msg-left'><div><div class='msg-time'>{fmt_date_time(ts_now)[0]} • {fmt_date_time(ts_now)[1]}</div><div class='msg-bubble-in'>...</div></div></div>",
+                        f"<div class='msg-row msg-left'><div><div class='msg-time'>{fmt_date_time(ts_now)[0]} • {fmt_date_time(ts_now)[1]}</div><div class='msg-bubble-in'><span class='typing-dot'>.</span><span class='typing-dot'>.</span><span class='typing-dot'>.</span></div></div></div>",
                         unsafe_allow_html=True,
                     )
                     time.sleep(0.25)
@@ -688,9 +696,10 @@ elif page == "Follow-ups":
                     send_sms(item["lead_id"], st.session_state[key])
                     approved_text = st.session_state[key]
                     st.session_state[sent_key].append(approved_text)
-                    user_initials = st.session_state.get("current_user_initials", "RJ")
-                    db.add_interaction(item["lead_id"], "text", f"Suggested message approved: {user_initials} approved message: {approved_text}", "outbound", ts=ts)
-                    db.add_interaction(item["lead_id"], "note", f"{user_initials} approved message: {approved_text}", "outbound", ts=ts)
+                    user_value = st.session_state.get("user", "RJ")
+                    user_dot = "🔴" if user_value == "RJ" else "🟢"
+                    db.add_interaction(item["lead_id"], "text", f"Suggested message approved: {user_dot} {user_value}: approved message \"{approved_text}\"", "outbound", ts=ts)
+                    db.add_interaction(item["lead_id"], "note", f"{user_value}: approved message \"{approved_text}\"", "outbound", ts=ts)
                     st.session_state[key] = ""
                     st.markdown(
                         "<audio autoplay><source src='https://notificationsounds.com/storage/sounds/file-sounds-1152-pristine.mp3' type='audio/mpeg'></audio>",
