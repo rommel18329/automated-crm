@@ -22,7 +22,7 @@ html, body, [data-testid="stAppViewContainer"] {
   background-color: var(--bg);
   color: var(--text);
 }
-.block-container {padding-top: 2.7rem;}
+.block-container {padding-top: 2.4rem;}
 .card {
   background: var(--card);
   border-radius: 16px;
@@ -45,7 +45,13 @@ html, body, [data-testid="stAppViewContainer"] {
   color: #3c5f42;
   font-size: 0.82rem;
 }
-h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {display: none !important;}
+.msg-row{display:flex;margin:8px 0;}
+.msg-left{justify-content:flex-start;}
+.msg-right{justify-content:flex-end;}
+.msg-bubble-in{background:#fff;border:1px solid #eee;padding:8px 10px;border-radius:14px;max-width:78%;}
+.msg-bubble-out{background:#dff0ff;padding:8px 10px;border-radius:14px;max-width:78%;}
+.msg-time{font-size:.73rem;color:#808080;margin-bottom:2px;}
+h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {display:none !important;}
 </style>
 """
 
@@ -68,6 +74,10 @@ def parse_timeline_parts(timeline_text: str) -> tuple[str, str, str]:
     return timeline, situation, notes
 
 
+def human_stage(stage: str) -> str:
+    return stage.replace("_", " ").title()
+
+
 def human_intent_labels(signals: list[str]) -> list[str]:
     label_map = {
         "timeline<=30_and_motivation>=6": "Timeline < 30 days + High motivation",
@@ -79,195 +89,263 @@ def human_intent_labels(signals: list[str]) -> list[str]:
     return [label_map.get(s, s.replace("_", " ").title()) for s in signals]
 
 
-def nav_to(page: str, lead_id: int | None = None) -> None:
-    st.session_state["page"] = page
-    if lead_id is not None:
-        st.session_state["selected_lead_id"] = lead_id
-        st.session_state["scroll_to_selected"] = True
-    st.rerun()
+def fmt_stamp(dt: datetime) -> str:
+    return dt.strftime("%m-%d • %I:%M %p").replace(" 0", " ")
 
 
-def note_stamp() -> str:
-    return datetime.utcnow().strftime("%m-%d • %I:%M %p").replace(" 0", " ")
-
-
-def format_dt(iso_value: str) -> tuple[str, str]:
+def fmt_date_time(iso_value: str) -> tuple[str, str]:
     dt = datetime.fromisoformat(iso_value)
     return dt.strftime("%m-%d"), dt.strftime("%I:%M %p").lstrip("0")
 
 
-def human_stage(stage: str) -> str:
-    return stage.replace("_", " ").title()
+def nav_to(page: str, lead_id: int | None = None) -> None:
+    st.session_state["page"] = page
+    if lead_id is not None:
+        st.session_state["selected_lead_id"] = lead_id
+        st.session_state["lead_list_collapsed"] = True
+    st.rerun()
 
 
-def update_status(lead_id: int, key: str) -> None:
-    status = st.session_state.get(key)
-    if status:
-        db.update_lead(lead_id, {"status": status})
-
-
-def render_global_search(all_leads: list[dict]) -> None:
-    search = st.text_input(
-        "Quick Search",
-        placeholder="Name or phone",
-        label_visibility="collapsed",
-        key="global_quick_search",
-    ).strip().lower()
-    if not search:
+def render_global_search(leads: list[dict]) -> None:
+    q = st.text_input("Quick Search", placeholder="Name or phone", label_visibility="collapsed", key="quick_search").strip().lower()
+    if not q:
         return
-    matches = [
-        lead
-        for lead in all_leads
-        if search in lead["name"].lower() or search in lead["phone"].lower()
-    ][:8]
-    if not matches:
-        st.caption("No leads found.")
-        return
-    st.caption("Select a lead to open in Leads page")
-    with st.container(height=160):
+    matches = [l for l in leads if q in l["name"].lower() or q in l["phone"].lower()][:8]
+    with st.container(height=150):
         for lead in matches:
-            if st.button(f"{lead['name']} · {lead['phone']}", key=f"global_pick_{lead['id']}"):
+            if st.button(f"{lead['name']} · {lead['phone']}", key=f"quick_pick_{lead['id']}"):
                 nav_to("Leads", lead["id"])
 
 
-def mock_followups() -> list[dict]:
+def interaction_windows(interactions: list[dict]) -> dict[str, list[dict]]:
+    now = datetime.utcnow()
+    start_day = datetime.combine(date.today(), datetime.min.time())
+    start_week = start_day.replace(hour=0)  # same day base
+    start_week = start_week.replace(day=start_week.day - start_week.weekday())
+    start_month = start_day.replace(day=1)
+
+    def in_window(item: dict, start: datetime) -> bool:
+        return datetime.fromisoformat(item["timestamp"]) >= start
+
+    return {
+        "daily": [i for i in interactions if in_window(i, start_day)],
+        "weekly": [i for i in interactions if in_window(i, start_week)],
+        "monthly": [i for i in interactions if in_window(i, start_month)],
+    }
+
+
+def activity_counts(interactions: list[dict]) -> dict[str, dict[str, int]]:
+    windows = interaction_windows(interactions)
+
+    def count_set(items: list[dict]) -> dict[str, int]:
+        calls = sum(1 for i in items if i["type"] == "call")
+        texts = sum(1 for i in items if i["type"] == "text" and i["direction"] == "outbound")
+        followups = sum(1 for i in items if i["type"] == "text" and "suggested message approved" in i["content"].lower())
+        offers = sum(1 for i in items if "offer made" in i["content"].lower())
+        return {"calls": calls, "texts": texts, "followups": followups, "offers": offers}
+
+    return {k: count_set(v) for k, v in windows.items()}
+
+
+def overdue_followups(leads: list[dict]) -> list[dict]:
+    today = date.today().isoformat()
     return [
-        {
-            "lead_id": -9001,
-            "lead_name": "Maria Benson",
-            "situation": "Relocating for work in 45 days",
-            "history": [
-                ("04-11", "9:49 AM", "outbound", "Hey Maria, still considering selling this spring?"),
-                ("04-11", "10:02 AM", "inbound", "Possibly. Still looking at options."),
-                ("04-13", "1:15 PM", "outbound", "Want a quick range so you can compare?"),
-            ],
-            "suggestion": "I can send a quick no-pressure range so you can compare options—want me to?",
-        },
-        {
-            "lead_id": -9002,
-            "lead_name": "Derek Hall",
-            "situation": "Needs clarity before making repairs",
-            "history": [
-                ("04-10", "11:05 AM", "outbound", "Checking in Derek—any updates on your timeline?"),
-                ("04-10", "12:27 PM", "inbound", "Not sure yet. Maybe in a month."),
-                ("04-12", "3:40 PM", "outbound", "Would a quick call help simplify next steps?"),
-            ],
-            "suggestion": "Totally fine if timing is still open—would a short 5-minute call help you decide next steps?",
-        },
+        l for l in leads
+        if l["status"] in {"warm", "cold"}
+        and l.get("next_action_date")
+        and l["next_action_date"] < today
     ]
+
+
+def progression_metrics(leads: list[dict], interactions: list[dict]) -> dict[str, float]:
+    warm = [l for l in leads if l["status"] == "warm"]
+    hot = [l for l in leads if l["status"] == "hot"]
+    contract = [l for l in leads if l["status"] == "contract"]
+
+    offer_lead_ids = {i["lead_id"] for i in interactions if "offer made" in i["content"].lower()}
+    hot_ids = {l["id"] for l in hot}
+    contract_ids = {l["id"] for l in contract}
+
+    warm_hot = (len(hot) / max(1, len(warm) + len(hot))) * 100
+    hot_offer = (len(hot_ids & offer_lead_ids) / max(1, len(hot_ids))) * 100
+    offer_contract = (len(contract_ids & offer_lead_ids) / max(1, len(offer_lead_ids))) * 100
+    contract_deal = 100.0 if contract else 0.0
+    return {
+        "Warm→Hot": warm_hot,
+        "Hot→Offer": hot_offer,
+        "Offer→Contract": offer_contract,
+        "Contract→Deal": contract_deal,
+    }
+
+
+def advanced_metrics(leads: list[dict], interactions: list[dict]) -> dict[str, str]:
+    warm_to_hot_count = max(1, len([l for l in leads if l["status"] == "hot"]))
+    warm_followups = sum(1 for i in interactions if i["type"] == "text" and i["direction"] == "outbound")
+    fup_per_conv = warm_followups / warm_to_hot_count
+
+    calls = sum(1 for i in interactions if i["type"] == "call")
+    deals = max(1, len([l for l in leads if l["status"] == "contract"]))
+    calls_per_deal = calls / deals
+
+    lead_first_ts: dict[int, datetime] = {}
+    lead_offer_ts: dict[int, datetime] = {}
+    for i in sorted(interactions, key=lambda x: x["timestamp"]):
+        ts = datetime.fromisoformat(i["timestamp"])
+        lead_first_ts.setdefault(i["lead_id"], ts)
+        if "offer made" in i["content"].lower() and i["lead_id"] not in lead_offer_ts:
+            lead_offer_ts[i["lead_id"]] = ts
+
+    deltas = []
+    for lid, offer_ts in lead_offer_ts.items():
+        if lid in lead_first_ts:
+            deltas.append((offer_ts - lead_first_ts[lid]).days)
+    avg_days = sum(deltas) / len(deltas) if deltas else 0
+
+    return {
+        "Follow-ups per Warm→Hot conversion": f"{fup_per_conv:.1f} (target: < 6)",
+        "Calls per Deal": f"{calls_per_deal:.1f} (target: < 12)",
+        "Time first contact→offer": f"{avg_days:.1f} days (target: < 14 days)",
+    }
+
+
+def render_imessage(items: list[dict], max_items: int = 10) -> None:
+    for msg in items[:max_items]:
+        d, t = fmt_date_time(msg["timestamp"])
+        ts = f"{d} • {t}"
+        outgoing = msg["direction"] == "outbound"
+        bubble = "msg-bubble-out" if outgoing else "msg-bubble-in"
+        row = "msg-right" if outgoing else "msg-left"
+        label = "Outbound Call" if msg["type"] == "call" and outgoing else "Inbound Call" if msg["type"] == "call" else msg["content"]
+        st.markdown(
+            f"<div class='msg-row {row}'><div><div class='msg-time'>{ts}</div><div class='{bubble}'>{label}</div></div></div>",
+            unsafe_allow_html=True,
+        )
+
+
+def update_status(lead_id: int, key: str) -> None:
+    db.update_lead(lead_id, {"status": st.session_state[key]})
+
+
+def auto_save_field(lead_id: int, field: str, key: str) -> None:
+    db.update_lead(lead_id, {field: st.session_state[key]})
+
+
+def render_notes(lead_id: int, interactions: list[dict]) -> None:
+    st.markdown("**Notes**")
+    notes = [i for i in interactions if i["type"] == "note"]
+    if not notes:
+        st.caption("No notes yet")
+
+    for note in notes[:12]:
+        nid = note["id"]
+        edit_key = f"edit_note_{nid}"
+        if st.session_state.get(edit_key):
+            new_val = st.text_input("", value=note["content"], key=f"note_input_{nid}")
+            if st.button("Save", key=f"note_save_{nid}"):
+                with db.get_conn() as conn:
+                    conn.execute("UPDATE interactions SET content=? WHERE id=?", (new_val, nid))
+                st.session_state[edit_key] = False
+                st.rerun()
+        else:
+            st.write(note["content"])
+            c1, c2 = st.columns([1, 1])
+            if c1.button("✏️", key=f"note_edit_{nid}"):
+                st.session_state[edit_key] = True
+            if c2.button("✖", key=f"note_del_{nid}"):
+                st.session_state[f"confirm_del_{nid}"] = True
+            if st.session_state.get(f"confirm_del_{nid}"):
+                st.warning("Delete this note?")
+                y, n = st.columns(2)
+                if y.button("Confirm", key=f"note_confirm_{nid}"):
+                    with db.get_conn() as conn:
+                        conn.execute("DELETE FROM interactions WHERE id=?", (nid,))
+                    st.rerun()
+                if n.button("Cancel", key=f"note_cancel_{nid}"):
+                    st.session_state[f"confirm_del_{nid}"] = False
+
+    new_note = st.text_input("Add note", key=f"new_note_{lead_id}")
+    if st.button("Save Note", key=f"save_note_{lead_id}") and new_note.strip():
+        db.add_interaction(lead_id, "note", f"{fmt_stamp(datetime.utcnow())} — {new_note.strip()}", "outbound")
+        st.rerun()
 
 
 def render_lead_detail(lead_id: int) -> None:
     lead = db.fetch_lead(lead_id)
     interactions = db.fetch_interactions(lead_id)
-    timeline_text, situation_text, notes_text = parse_timeline_parts(lead["timeline"])
+    timeline_text, situation_text, _ = parse_timeline_parts(lead["timeline"])
 
-    c1, c2, c3 = st.columns([1, 1.15, 1])
+    st.markdown(f"### {lead['name']}")
+    c_top1, c_top2, c_top3 = st.columns(3)
+    c_top1.write("Phone:", lead["phone"])
+    c_top2.write("Stage:", human_stage(lead["conversation_stage"]))
+    c_top3.write("Address:", "Not provided")
 
-    highlight_style = "style='border:2px solid #6B8F71;'" if st.session_state.get("scroll_to_selected") else ""
-    st.markdown(f"<div id='selected-lead' {highlight_style}></div>", unsafe_allow_html=True)
+    c_edit1, c_edit2, c_edit3 = st.columns(3)
+    c_edit1.selectbox(
+        "Status",
+        ["hot", "warm", "cold"],
+        index=["hot", "warm", "cold"].index(lead["status"]),
+        key=f"status_{lead_id}",
+        on_change=update_status,
+        args=(lead_id, f"status_{lead_id}"),
+    )
+    c_edit2.slider(
+        "Motivation",
+        1,
+        10,
+        int(lead["motivation_score"]),
+        key=f"mot_{lead_id}",
+        on_change=auto_save_field,
+        args=(lead_id, "motivation_score", f"mot_{lead_id}"),
+    )
+    c_edit3.text_input(
+        "Timeline",
+        value=timeline_text,
+        key=f"timeline_{lead_id}",
+        on_change=auto_save_field,
+        args=(lead_id, "timeline", f"timeline_{lead_id}"),
+    )
 
-    with c1:
+    left, right = st.columns([1.2, 1])
+    with left:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.subheader(lead["name"])
-        st.write("Phone:", lead["phone"])
-        st.write("Stage:", human_stage(lead["conversation_stage"]))
-        st.write("Touch count:", lead["touch_count"])
-        st.write("Situation:", situation_text or "Not recorded")
-
-        skey = f"status_{lead_id}"
-        st.selectbox(
-            "Status",
-            ["hot", "warm", "cold"],
-            index=["hot", "warm", "cold"].index(lead["status"]),
-            key=skey,
-            on_change=update_status,
-            args=(lead_id, skey),
-        )
-        st.caption("Status saves immediately.")
-
-        motivation = st.slider("Motivation", 1, 10, int(lead["motivation_score"]), key=f"mot_{lead_id}")
-        timeline = st.text_input("Timeline", value=timeline_text, key=f"timeline_{lead_id}")
-        if st.button("Save lead fields", key=f"save_fields_{lead_id}"):
-            merged = timeline.strip()
-            if situation_text:
-                merged += f". Situation: {situation_text}"
-            if notes_text:
-                merged += f". Notes: {notes_text}"
-            db.update_lead(lead_id, {"motivation_score": motivation, "timeline": merged})
-            st.success("Lead fields saved.")
-            st.rerun()
-
+        st.markdown("**Conversation**")
+        render_imessage(interactions, max_items=10)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    with c2:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("**Conversation Log**")
-        logs = interactions[:10]
-        if not logs:
-            st.write("No conversation activity logged")
-        for msg in logs:
-            d, t = format_dt(msg["timestamp"])
-            st.caption(f"{d} • {t}")
-            if msg["type"] == "call":
-                st.write("Outbound Call" if msg["direction"] == "outbound" else "Inbound Call")
-                st.write(msg["content"])
-            else:
-                label = "Text Sent" if msg["direction"] == "outbound" else "Text Received"
-                st.write(f"{label}: {msg['content']}")
-            st.divider()
-
-        st.markdown("---")
         st.markdown("**Log Call**")
-        mode = st.radio("When?", ["Now", "Select date + time"], horizontal=True, key=f"call_mode_{lead_id}")
-        call_note = st.text_input("Call note", key=f"call_note_{lead_id}", placeholder="Spoke, wants callback tomorrow")
+        mode = st.radio("When?", ["Now", "Select date/time"], horizontal=True, key=f"call_mode_{lead_id}")
+        note = st.text_input("Call note", key=f"call_note_{lead_id}")
+        offer_made = st.checkbox("Offer Made", key=f"offer_{lead_id}")
+        ts = datetime.utcnow()
+        if mode == "Select date/time":
+            c1, c2, c3, c4 = st.columns(4)
+            d = c1.date_input("Date", value=date.today(), key=f"date_{lead_id}")
+            h = c2.selectbox("Hour", list(range(1, 13)), key=f"hour_{lead_id}")
+            m = c3.selectbox("Min", [f"{i:02d}" for i in range(0, 60, 5)], key=f"min_{lead_id}")
+            ap = c4.selectbox("AM/PM", ["AM", "PM"], key=f"ap_{lead_id}")
+            h24 = h % 12 + (12 if ap == "PM" else 0)
+            ts = datetime.combine(d, datetime.min.time()).replace(hour=h24, minute=int(m))
 
-        manual_ts = None
-        if mode == "Select date + time":
-            c_date, c_hour, c_min, c_ampm = st.columns([1.3, 1, 1, 1])
-            call_date = c_date.date_input("Date", key=f"call_date_{lead_id}", value=date.today())
-            hour = c_hour.selectbox("Hour", list(range(1, 13)), key=f"call_hour_{lead_id}")
-            minute = c_min.selectbox("Min", [f"{m:02d}" for m in range(0, 60, 5)], key=f"call_min_{lead_id}")
-            ampm = c_ampm.selectbox("AM/PM", ["AM", "PM"], key=f"call_ampm_{lead_id}")
-            hour_24 = hour % 12 + (12 if ampm == "PM" else 0)
-            manual_ts = datetime.combine(call_date, datetime.min.time()).replace(hour=hour_24, minute=int(minute))
-
-        add_text_log = st.checkbox("Also add as text note", key=f"call_text_{lead_id}", value=False)
-        if st.button("Log Call", key=f"call_btn_{lead_id}"):
-            ts = manual_ts or datetime.utcnow()
-            content = f"{note_stamp()} — {call_note.strip() or 'Call completed'}"
+        if st.button("Log Call", key=f"log_call_{lead_id}"):
+            content = f"{fmt_stamp(ts)} — {note.strip() or 'Call completed'}"
             db.add_interaction(lead_id, "call", content, "outbound", ts=ts)
-            if add_text_log:
-                db.add_interaction(lead_id, "text", f"Call logged: {call_note.strip() or 'Completed'}", "outbound", ts=ts)
+            if offer_made:
+                db.add_interaction(lead_id, "note", f"{fmt_stamp(ts)} — Offer made", "outbound", ts=ts)
             db.update_lead(lead_id, {"touch_count": lead["touch_count"] + 1, "last_contact_date": ts.date().isoformat()})
-            st.success("Call logged.")
             st.rerun()
-
         st.markdown("</div>", unsafe_allow_html=True)
 
-    with c3:
+    with right:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("**Notes History**")
-        note_items = [i for i in interactions if i["type"] == "note"]
-        if note_items:
-            for n in note_items[:12]:
-                st.write(n["content"])
-        else:
-            st.caption("No notes yet")
+        st.write("Situation:", situation_text or "Not recorded")
+        labels = human_intent_labels(engine.evaluate_lead(lead, interactions).intent_signals)
+        st.markdown("".join([f"<span class='pill'>{x}</span>" for x in labels]), unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        new_note = st.text_input("Add note", key=f"new_note_{lead_id}")
-        if st.button("Save Note", key=f"save_note_{lead_id}") and new_note.strip():
-            db.add_interaction(lead_id, "note", f"{note_stamp()} — {new_note.strip()}", "outbound")
-            st.success("Note saved.")
-            st.rerun()
-
-        ev = engine.evaluate_lead(lead, interactions)
-        labels = human_intent_labels(ev.intent_signals)
-        st.markdown("**Intent Signals**")
-        if labels:
-            st.markdown("".join([f"<span class='pill'>{x}</span>" for x in labels]), unsafe_allow_html=True)
-        else:
-            st.caption("No intent signals")
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        render_notes(lead_id, interactions)
         st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -275,193 +353,188 @@ st.markdown(THEME_CSS, unsafe_allow_html=True)
 db.init_db()
 result = engine.evaluate_all_leads()
 all_leads = db.fetch_leads()
+all_interactions = []
+for ld in all_leads:
+    all_interactions.extend(db.fetch_interactions(ld["id"]))
 
 if "page" not in st.session_state:
     st.session_state["page"] = "Dashboard"
+if "lead_list_collapsed" not in st.session_state:
+    st.session_state["lead_list_collapsed"] = False
+if "call_completed" not in st.session_state:
+    st.session_state["call_completed"] = {}
 
-left_head, right_search = st.columns([4, 1.7])
-with left_head:
-    st.markdown("# Silverline Investment Group 🌿")
-    st.caption("")
-with right_search:
+head_left, head_right = st.columns([4, 1.7])
+with head_left:
+    if st.button("Silverline Investment Group 🌿", key="home_title", type="tertiary"):
+        nav_to("Dashboard")
+with head_right:
     st.markdown("##### Quick Search")
     render_global_search(all_leads)
 
 with st.sidebar:
     st.markdown("### 🌿 Navigation")
-    for section in PAGES:
-        active = st.session_state["page"] == section
-        prefix = "• " if active else ""
-        if st.button(f"{prefix}{section}", use_container_width=True, type="tertiary", key=f"nav_{section}"):
-            nav_to(section)
-st.divider()
+    selected = st.radio("", PAGES, index=PAGES.index(st.session_state["page"]))
+    if selected != st.session_state["page"]:
+        nav_to(selected)
 
+st.divider()
 page = st.session_state["page"]
 
 if page == "Dashboard":
     summary = result["summary"]
     cols = st.columns(5)
-    stats = [
-        ("Hot", summary["hot"]),
-        ("Warm", summary["warm"]),
-        ("Cold", summary["cold"]),
-        ("Follow-ups (Today)", len(result["followup_queue"])),
-        ("Risk leads", summary["risk_leads"]),
-    ]
-    for c, (label, value) in zip(cols, stats):
+    for c, (label, value) in zip(
+        cols,
+        [
+            ("Hot", summary["hot"]),
+            ("Warm", summary["warm"]),
+            ("Cold", summary["cold"]),
+            ("Follow-ups (Today)", len(result["followup_queue"])),
+            ("Risk leads", summary["risk_leads"]),
+        ],
+    ):
         c.markdown(f"<div class='metric'><div>{label}</div><h3>{value}</h3></div>", unsafe_allow_html=True)
+
+    activity = activity_counts(all_interactions)
+    st.markdown("### Activity")
+    ac = st.columns(3)
+    for idx, key in enumerate(["daily", "weekly", "monthly"]):
+        m = activity[key]
+        ac[idx].markdown(
+            f"<div class='card'><b>{key.title()}</b><br>Calls: {m['calls']}<br>Texts: {m['texts']}<br>Follow-ups: {m['followups']}<br>Offers: {m['offers']}</div>",
+            unsafe_allow_html=True,
+        )
+
+    overdue = overdue_followups(all_leads)
+    st.markdown("### Overdue Follow-ups")
+    if st.button(f"🔴 {len(overdue)} overdue", key="overdue_btn"):
+        st.session_state["followup_overdue_only"] = True
+        nav_to("Follow-ups")
+
+    st.markdown("### Lead Progression")
+    prog = progression_metrics(all_leads, all_interactions)
+    pc = st.columns(4)
+    for c, (k, v) in zip(pc, prog.items()):
+        c.metric(k, f"{v:.1f}%")
+
+    with st.expander("Advanced Metrics"):
+        adv = advanced_metrics(all_leads, all_interactions)
+        for k, v in adv.items():
+            st.write(f"**{k}:** {v}")
 
     st.markdown("### Call List Preview")
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    call_total = len(result["call_list"])
-    if st.button(f"Call List ({call_total} calls today)", key="goto_calls_page"):
+    if st.button(f"Call List ({len(result['call_list'])} calls today)", key="call_list_nav"):
         nav_to("Call List")
     for entry in result["call_list"][:5]:
-        reason_labels = human_intent_labels(entry.get("intent_signals", []))
-        reason = ", ".join(reason_labels) if reason_labels else "High urgency"
-        if st.button(f"{entry['name']} · {entry['phone']}", key=f"dash_call_pick_{entry['lead_id']}"):
+        if st.button(f"{entry['name']} · {entry['phone']}", key=f"dash_call_{entry['lead_id']}"):
             nav_to("Leads", entry["lead_id"])
-        st.caption(reason)
+        labels = human_intent_labels(entry.get("intent_signals", []))
+        st.markdown("".join([f"<span class='pill'>{x}</span>" for x in labels]), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("### Follow-up Preview")
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    pending = len(result["followup_queue"])
-    if st.button(f"Follow-ups ({pending} pending)", key="dashboard_view_followups"):
-        nav_to("Follow-ups")
-    if result["followup_queue"]:
-        sample = result["followup_queue"][0]
-        st.markdown(f"**{sample['lead_name']}** · {sample['objective']}")
-        st.caption(sample["new_message"])
+elif page == "Leads":
+    st.subheader("Leads")
+    q = st.text_input("Search", placeholder="Type name or phone...").strip().lower()
+    status_filter = st.multiselect("Optional filters", ["hot", "warm", "cold"], default=[])
+    matches = [
+        l for l in all_leads
+        if (not status_filter or l["status"] in status_filter)
+        and (not q or q in l["name"].lower() or q in l["phone"].lower())
+    ]
+
+    if not st.session_state.get("lead_list_collapsed"):
+        left, right = st.columns([1, 1.7])
     else:
-        st.caption("No pending follow-ups.")
-    st.markdown("</div>", unsafe_allow_html=True)
+        left, right = st.columns([0.15, 2.55])
+
+    with left:
+        if st.button("Toggle List", key="toggle_list"):
+            st.session_state["lead_list_collapsed"] = not st.session_state["lead_list_collapsed"]
+            st.rerun()
+        if not st.session_state.get("lead_list_collapsed"):
+            with st.container(height=620):
+                for lead in matches:
+                    if st.button(f"{lead['name']} · {lead['phone']}", key=f"lead_{lead['id']}"):
+                        st.session_state["selected_lead_id"] = lead["id"]
+                        st.session_state["lead_list_collapsed"] = True
+                        st.rerun()
+
+    with right:
+        if st.session_state.get("selected_lead_id"):
+            render_lead_detail(st.session_state["selected_lead_id"])
+        else:
+            st.info("Select a lead to begin.")
 
 elif page == "Call List":
     st.subheader("Call List")
     call_list = result["call_list"]
-    if not call_list:
-        st.info("No hot leads right now.")
-    with st.container(height=560):
+    calls_today = sum(1 for i in all_interactions if i["type"] == "call" and datetime.fromisoformat(i["timestamp"]).date() == date.today())
+    st.caption(f"Total calls today: {calls_today}")
+
+    completed = 0
+    with st.container(height=640):
         for entry in call_list:
-            labels = human_intent_labels(entry.get("intent_signals", [])) or ["High intent"]
-            if st.button(f"{entry['name']} · {entry['phone']}", key=f"call_pick_{entry['lead_id']}"):
-                nav_to("Leads", entry["lead_id"])
+            lid = entry["lead_id"]
+            done_key = f"done_{lid}"
+            checked = st.checkbox(f"Completed · {entry['name']} ({entry['phone']})", key=done_key)
+            if checked:
+                completed += 1
+            lead = db.fetch_lead(lid)
+            _, situation, _ = parse_timeline_parts(lead["timeline"] if lead else "")
+            st.caption("Address: Not provided")
+            st.caption(situation)
+            labels = human_intent_labels(entry.get("intent_signals", []))
             st.markdown("".join([f"<span class='pill'>{x}</span>" for x in labels]), unsafe_allow_html=True)
+            if st.button(f"Open {entry['name']}", key=f"open_{lid}"):
+                nav_to("Leads", lid)
+            st.divider()
 
-elif page == "Leads":
-    st.subheader("Leads")
-    search = st.text_input("Search name or phone", placeholder="Type to filter instantly...").strip().lower()
-    status_filter = st.multiselect("Optional filters", ["hot", "warm", "cold"], default=[])
-
-    matches = []
-    for lead in all_leads:
-        if status_filter and lead["status"] not in status_filter:
-            continue
-        if search and search not in lead["name"].lower() and search not in lead["phone"].lower():
-            continue
-        matches.append(lead)
-
-    left, right = st.columns([1, 1.7])
-    with left:
-        st.caption(f"{len(matches)} results")
-        with st.container(height=620):
-            for lead in matches:
-                short_timeline, _, _ = parse_timeline_parts(lead["timeline"])
-                if st.button(
-                    f"{lead['name']} · {lead['status'].upper()} · {lead['phone']} · {short_timeline}",
-                    key=f"lead_pick_{lead['id']}",
-                ):
-                    st.session_state["selected_lead_id"] = lead["id"]
-                    st.session_state["scroll_to_selected"] = True
-                    st.rerun()
-    with right:
-        selected_id = st.session_state.get("selected_lead_id")
-        if selected_id:
-            render_lead_detail(selected_id)
-        else:
-            st.info("Select a lead from the list.")
-
-    selected_id = st.session_state.get("selected_lead_id")
-    if selected_id and st.session_state.get("scroll_to_selected"):
-        st.markdown(
-            """
-<script>
-const el = window.parent.document.getElementById('selected-lead');
-if (el) { el.scrollIntoView({behavior:'smooth', block:'start'}); }
-</script>
-""",
-            unsafe_allow_html=True,
-        )
-        st.session_state["scroll_to_selected"] = False
+    st.write(f"Completed: {completed} / {len(call_list)}")
+    if call_list and completed == len(call_list):
+        st.balloons()
 
 elif page == "Follow-ups":
     st.subheader("Follow-ups")
+    overdue_only = st.session_state.get("followup_overdue_only", False)
     queue = result["followup_queue"]
-    if not queue:
-        st.info("No follow-up approvals pending. Showing sample follow-ups.")
-    sample_items = mock_followups()
 
+    warm_items, cold_items = [], []
     for item in queue:
         lead = db.fetch_lead(item["lead_id"])
-        history = [i for i in db.fetch_interactions(item["lead_id"]) if i["type"] == "text"][:5]
-        _, situation, _ = parse_timeline_parts(lead["timeline"] if lead else "")
+        if not lead:
+            continue
+        if overdue_only and lead.get("next_action_date") and lead["next_action_date"] >= date.today().isoformat():
+            continue
+        (warm_items if lead["status"] == "warm" else cold_items).append((item, lead))
 
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown(f"**{item['lead_name']}**")
-        st.write("Situation:", situation or "Not recorded")
-        st.markdown("**Last messages**")
-        if history:
-            for h in history:
-                d, t = format_dt(h["timestamp"])
-                st.caption(f"{d} {t} · {h['direction']} · {h['content']}")
-        else:
-            st.caption("No prior messages")
+    for section_name, items in [("Warm", warm_items), ("Cold", cold_items)]:
+        st.markdown(f"### {section_name}")
+        if not items:
+            st.caption("No items")
+        for item, lead in items:
+            history = [i for i in db.fetch_interactions(item["lead_id"]) if i["type"] == "text"][:6]
+            _, situation, _ = parse_timeline_parts(lead["timeline"])
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            if st.button(f"{item['lead_name']}", key=f"f_name_{item['lead_id']}"):
+                nav_to("Leads", item["lead_id"])
+            st.write("Situation:", situation or "Not recorded")
+            with st.container(height=120):
+                render_imessage(history, max_items=6)
 
-        msg_key = f"msg_{item['lead_id']}"
-        if msg_key not in st.session_state:
-            st.session_state[msg_key] = item["new_message"]
+            key = f"f_msg_{item['lead_id']}"
+            if key not in st.session_state:
+                st.session_state[key] = item["new_message"]
+            st.text_area("Suggestion", key=key, height=80)
 
-        st.write("Suggested message:")
-        st.write(st.session_state[msg_key])
-
-        c1, c2, c3 = st.columns(3)
-        if c1.button("Approve", key=f"approve_{item['lead_id']}"):
-            send_sms(item["lead_id"], st.session_state[msg_key])
-            st.success("Sent via send_sms() placeholder.")
-            st.rerun()
-        if c2.button("Edit", key=f"edit_{item['lead_id']}"):
-            st.session_state[f"editing_{item['lead_id']}"] = True
-        if c3.button("Skip", key=f"skip_{item['lead_id']}"):
-            st.info("Skipped")
-
-        if st.session_state.get(f"editing_{item['lead_id']}"):
-            st.text_area("Edit message", key=msg_key, height=80)
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("### Sample Follow-ups")
-    for sample in sample_items:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown(f"**{sample['lead_name']}**")
-        st.write("Situation:", sample["situation"])
-        st.markdown("**Last messages**")
-        with st.container(height=120):
-            for d, t, direction, content in sample["history"]:
-                st.caption(f"{d}")
-                st.caption(f"{t} · {direction} · {content}")
-
-        msg_key = f"sample_msg_{sample['lead_id']}"
-        if msg_key not in st.session_state:
-            st.session_state[msg_key] = sample["suggestion"]
-        st.text_area("Suggestion", key=msg_key, height=80)
-
-        c1, c2, c3 = st.columns(3)
-        if c1.button("Approve", key=f"sample_approve_{sample['lead_id']}"):
-            st.success("Approved (sample).")
-        if c2.button("Edit", key=f"sample_edit_{sample['lead_id']}"):
-            st.info("Edit directly in suggestion box.")
-        if c3.button("Regenerate", key=f"sample_regen_{sample['lead_id']}"):
-            st.session_state[msg_key] = sample["suggestion"] + " If it helps, we can do a 5-minute call."
-            st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
+            c1, c2, c3 = st.columns(3)
+            if c1.button("Approve", key=f"f_app_{item['lead_id']}"):
+                send_sms(item["lead_id"], st.session_state[key])
+                db.add_interaction(item["lead_id"], "text", f"Suggested message approved: {st.session_state[key]}", "outbound")
+                st.rerun()
+            if c2.button("Edit", key=f"f_edit_{item['lead_id']}"):
+                st.info("Edit in suggestion box.")
+            if c3.button("Skip", key=f"f_skip_{item['lead_id']}"):
+                st.info("Skipped")
+            st.markdown("</div>", unsafe_allow_html=True)
