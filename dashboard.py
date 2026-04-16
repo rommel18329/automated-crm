@@ -56,8 +56,11 @@ h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {display:none !important;}
 .tooltip-icon{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border:1px solid #8b8b8b;border-radius:50%;font-size:11px;line-height:1;color:#5d5d5d;cursor:default;}
 .tooltip-tip{visibility:hidden;opacity:0;transition:opacity .15s;position:absolute;z-index:20;left:20px;top:-6px;background:#222;color:#fff;padding:6px 8px;border-radius:6px;font-size:12px;white-space:nowrap;}
 .tooltip-wrap:hover .tooltip-tip{visibility:visible;opacity:1;}
-.nav-link{display:block;text-decoration:none !important;color:#2E2E2E;padding:5px 0;font-size:0.97rem;}
-.nav-link.active{color:#3c5f42;font-weight:600;border-left:2px solid #6B8F71;padding-left:8px;}
+.big-title {font-size: 36px !important; font-weight: 800 !important; margin-bottom: 10px;}
+.nav-item button{color:#333 !important;text-decoration:none !important;background:transparent !important;border:none !important;justify-content:flex-start !important;padding:4px 0 !important;}
+.nav-item.active button{color:#3c5f42 !important;font-weight:600 !important;border-left:2px solid #6B8F71 !important;padding-left:8px !important;border-radius:0 !important;}
+[data-testid="stSidebar"] .stButton > button{color:#333 !important;text-decoration:none !important;}
+.note-actions button{border:none !important;background:transparent !important;padding:0 !important;min-height:20px !important;font-size:0.85rem !important;}
 </style>
 """
 
@@ -321,10 +324,14 @@ def render_notes(lead_id: int, interactions: list[dict]) -> None:
         else:
             row_left, row_edit, row_del = st.columns([14, 1, 1])
             row_left.markdown(note["content"])
-            if row_edit.button("✏", key=f"note_edit_{nid}", help="Edit"):
+            row_edit.markdown("<div class='note-actions'>", unsafe_allow_html=True)
+            if row_edit.button("✏️", key=f"note_edit_{nid}", help="Edit", type="tertiary"):
                 st.session_state[edit_key] = True
-            if row_del.button("✕", key=f"note_del_{nid}", help="Delete"):
+            row_edit.markdown("</div>", unsafe_allow_html=True)
+            row_del.markdown("<div class='note-actions'>", unsafe_allow_html=True)
+            if row_del.button("❌", key=f"note_del_{nid}", help="Delete", type="tertiary"):
                 st.session_state[f"confirm_del_{nid}"] = True
+            row_del.markdown("</div>", unsafe_allow_html=True)
             if st.session_state.get(f"confirm_del_{nid}"):
                 st.warning("Delete this note?")
                 y, n = st.columns(2)
@@ -341,10 +348,9 @@ def render_notes(lead_id: int, interactions: list[dict]) -> None:
         st.rerun()
 
 
-def render_lead_detail(lead_id: int) -> None:
-    lead = db.fetch_lead(lead_id)
+def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
+    lead = lead_lookup.get(lead_id)
     if not lead:
-        st.warning("Selected lead could not be found.")
         return
     interactions = db.fetch_interactions(lead_id)
     conversation = [
@@ -357,7 +363,7 @@ def render_lead_detail(lead_id: int) -> None:
     c_top1, c_top2, c_top3 = st.columns(3)
     c_top1.markdown(f"**Phone:** {lead['phone']}")
     c_top2.markdown(f"**Stage:** {human_stage(lead['conversation_stage'])}")
-    c_top3.markdown(f"**Address:** {address_text or 'Address unavailable'}")
+    c_top3.markdown(f"**Address:** {address_text}")
 
     c_edit1, c_edit2, c_edit3 = st.columns(3)
     c_edit1.selectbox(
@@ -429,10 +435,23 @@ def render_lead_detail(lead_id: int) -> None:
 
 
 st.markdown(THEME_CSS, unsafe_allow_html=True)
+st.markdown("""
+<style>
+.big-title {
+    font-size: 36px !important;
+    font-weight: 800 !important;
+    margin-bottom: 10px;
+}
+</style>
+<h1 class="big-title">Silverline Investment Group 🌿</h1>
+""", unsafe_allow_html=True)
 db.init_db()
 result = engine.evaluate_all_leads()
 all_leads = db.fetch_leads()
 lead_lookup = {lead["id"]: lead for lead in all_leads}
+selected_id = st.session_state.get("selected_lead_id")
+if selected_id is not None and selected_id not in lead_lookup:
+    st.session_state["selected_lead_id"] = None
 all_interactions = []
 for ld in all_leads:
     all_interactions.extend(db.fetch_interactions(ld["id"]))
@@ -443,14 +462,9 @@ if "lead_list_collapsed" not in st.session_state:
     st.session_state["lead_list_collapsed"] = False
 if "call_completed" not in st.session_state:
     st.session_state["call_completed"] = {}
-if "page" in st.query_params and st.query_params["page"] in PAGES:
-    st.session_state["page"] = st.query_params["page"]
-st.query_params["page"] = st.session_state["page"]
-
 head_left, head_right = st.columns([4, 1.7])
 with head_left:
-    if st.button("Silverline Investment Group 🌿", key="home_title", type="tertiary", use_container_width=True):
-        nav_to("Dashboard")
+    st.empty()
 with head_right:
     st.markdown("##### Quick Search")
     render_global_search(all_leads)
@@ -459,11 +473,11 @@ with st.sidebar:
     st.markdown("### 🌿 Navigation")
     for item in PAGES:
         active = "active" if st.session_state["page"] == item else ""
-        page_token = item.replace(" ", "%20")
-        st.markdown(
-            f"<a class='nav-link {active}' href='?page={page_token}'>{item}</a>",
-            unsafe_allow_html=True,
-        )
+        st.markdown(f"<div class='nav-item {active}'>", unsafe_allow_html=True)
+        if st.button(item, key=f"nav_{item}", type="tertiary", use_container_width=True):
+            st.session_state["page"] = item
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
 st.divider()
 page = st.session_state["page"]
@@ -550,7 +564,7 @@ elif page == "Leads":
             with st.container(height=620):
                 for lead in matches:
                     _, address_text, _, _ = parse_timeline_parts(lead["timeline"])
-                    if st.button(f"{lead['name']} · {address_text or 'Address unavailable'}", key=f"lead_{lead['id']}"):
+                    if st.button(f"{lead['name']} · {address_text}", key=f"lead_{lead['id']}"):
                         st.session_state["selected_lead_id"] = lead["id"]
                         st.session_state["lead_list_collapsed"] = True
                         st.rerun()
@@ -561,7 +575,7 @@ elif page == "Leads":
 
     with right:
         if st.session_state.get("selected_lead_id"):
-            render_lead_detail(st.session_state["selected_lead_id"])
+            render_lead_detail(st.session_state["selected_lead_id"], lead_lookup)
         else:
             st.info("Select a lead to begin.")
 
@@ -578,9 +592,9 @@ elif page == "Call List":
             done_key = f"done_{lid}"
             lead = lead_lookup.get(lid)
             _, address_text, situation, _ = parse_timeline_parts(lead["timeline"] if lead else "")
-            checked = st.checkbox(f"{entry['name']} · {address_text or 'Address unavailable'}", key=done_key)
+            checked = st.checkbox(f"{entry['name']} · {address_text}", key=done_key)
             completed, remaining = completion_counts(call_list)
-            st.caption(f"Address: {address_text or 'Address unavailable'}")
+            st.caption(f"Address: {address_text}")
             st.caption(situation)
             labels = human_intent_labels(entry.get("intent_signals", []))
             st.markdown("".join([f"<span class='pill'>{x}</span>" for x in labels]), unsafe_allow_html=True)
@@ -625,12 +639,12 @@ elif page == "Follow-ups":
                 ]
             _, address, situation, _ = parse_timeline_parts(lead["timeline"])
             st.markdown("<div class='card'>", unsafe_allow_html=True)
-            if item["lead_id"] > 0 and st.button(f"{item['lead_name']}", key=f"f_name_{item['lead_id']}"):
+            if item["lead_id"] > 0 and st.button(f"{item['lead_name']}", key=f"f_name_{item['lead_id']}", type="tertiary"):
                 nav_to("Leads", item["lead_id"])
             if item["lead_id"] <= 0:
                 st.markdown(f"**{item['lead_name']}**")
             st.caption(f"Phone: {lead.get('phone', 'N/A')}")
-            st.caption(f"Address: {address or 'Address unavailable'}")
+            st.caption(f"Address: {address}")
             st.write("Situation:", situation or "Not recorded")
             with st.container(height=120):
                 render_imessage(history, max_items=6)
@@ -643,8 +657,10 @@ elif page == "Follow-ups":
             c1, c2, c3 = st.columns(3)
             if c1.button("Approve", key=f"f_app_{item['lead_id']}"):
                 if item["lead_id"] > 0:
+                    ts = datetime.utcnow()
                     send_sms(item["lead_id"], st.session_state[key])
-                    db.add_interaction(item["lead_id"], "text", f"Suggested message approved: {st.session_state[key]}", "outbound")
+                    db.add_interaction(item["lead_id"], "text", f"Suggested message approved: {st.session_state[key]}", "outbound", ts=ts)
+                    db.add_interaction(item["lead_id"], "note", f"[User] approved message: {st.session_state[key]}", "outbound", ts=ts)
                 st.rerun()
             if c2.button("Edit", key=f"f_edit_{item['lead_id']}"):
                 st.info("Edit in suggestion box.")
