@@ -51,6 +51,9 @@ html, body, [data-testid="stAppViewContainer"] {
 .msg-time{font-size:.73rem;color:#808080;margin-bottom:2px;}
 h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {display:none !important;}
 .st-key-home_title button {font-size: 2.0rem !important; font-weight: 700 !important; border: none !important; background: transparent !important; padding-left: 0 !important;}
+.info-wrap{position:relative;display:inline-block;margin-left:6px;color:#666;cursor:help;}
+.info-tip{visibility:hidden;opacity:0;transition:opacity .15s;position:absolute;z-index:20;left:14px;top:-6px;background:#222;color:#fff;padding:6px 8px;border-radius:6px;font-size:12px;white-space:nowrap;}
+.info-wrap:hover .info-tip{visibility:visible;opacity:1;}
 </style>
 """
 
@@ -58,7 +61,7 @@ PAGES = ["Dashboard", "Leads", "Call List", "Follow-ups"]
 
 
 def info_icon(text: str, tip: str) -> str:
-    return f"{text} <span title=\"{tip}\" style=\"color:#666;\">ⓘ</span>"
+    return f"{text} <span class='info-wrap'>ⓘ<span class='info-tip'>{tip}</span></span>"
 
 
 def parse_timeline_parts(timeline_text: str) -> tuple[str, str, str, str]:
@@ -425,7 +428,7 @@ if "call_completed" not in st.session_state:
 
 head_left, head_right = st.columns([4, 1.7])
 with head_left:
-    if st.button("Silverline Investment Group 🌿", key="home_title", type="tertiary"):
+    if st.button("Silverline Investment Group 🌿", key="home_title", type="tertiary", use_container_width=True):
         nav_to("Dashboard")
 with head_right:
     st.markdown("##### Quick Search")
@@ -433,9 +436,9 @@ with head_right:
 
 with st.sidebar:
     st.markdown("### 🌿 Navigation")
-    for section in PAGES:
-        if st.button(section, type="tertiary", use_container_width=True, key=f"nav_{section}"):
-            nav_to(section)
+    selected = st.radio("", PAGES, index=PAGES.index(st.session_state["page"]), label_visibility="collapsed")
+    if selected != st.session_state["page"]:
+        nav_to(selected)
 
 st.divider()
 page = st.session_state["page"]
@@ -446,14 +449,21 @@ if page == "Dashboard":
     for c, (label, value) in zip(
         cols,
         [
-            (info_icon("Hot", "High-intent leads requiring immediate human action"), summary["hot"]),
-            (info_icon("Warm", "Leads that should be actively nurtured"), summary["warm"]),
-            (info_icon("Cold", "Long-cycle or low-engagement leads"), summary["cold"]),
-            (info_icon("Follow-ups (Today)", "Follow-up suggestions due today"), len(result["followup_queue"])),
-            (info_icon("Risk leads", "Leads showing ghosting or delay risk"), summary["risk_leads"]),
+            ("Hot", summary["hot"]),
+            ("Warm", summary["warm"]),
+            ("Cold", summary["cold"]),
+            ("Follow-ups (Today)", len(result["followup_queue"])),
+            ("Risk leads", summary["risk_leads"]),
         ],
     ):
         c.markdown(f"<div class='metric'><div>{label}</div><h3>{value}</h3></div>", unsafe_allow_html=True)
+
+    st.markdown("### Call List")
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    done_count, remaining_count = completion_counts(result["call_list"])
+    if st.button(f"Call List (Done: {done_count} | Remaining: {remaining_count})", key="call_list_nav"):
+        nav_to("Call List")
+    st.markdown("</div>", unsafe_allow_html=True)
 
     activity = activity_counts(all_interactions)
     st.markdown("### Activity")
@@ -463,10 +473,10 @@ if page == "Dashboard":
         ac[idx].markdown(
             "<div class='card'>"
             f"<b>{key.title()}</b><br>"
-            f"{info_icon('Calls', 'Outbound/inbound calls logged in selected period')}: {m['calls']}<br>"
-            f"{info_icon('Texts', 'Outbound text activity in selected period')}: {m['texts']}<br>"
-            f"{info_icon('Follow-ups', 'Approved follow-up messages completed')}: {m['followups']}<br>"
-            f"{info_icon('Offers', 'Calls/notes where offer made was logged')}: {m['offers']}"
+            f"Calls: {m['calls']}<br>"
+            f"Texts: {m['texts']}<br>"
+            f"Follow-ups: {m['followups']}<br>"
+            f"Offers: {m['offers']}"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -480,26 +490,15 @@ if page == "Dashboard":
     st.markdown("### Lead Progression")
     prog = progression_metrics(all_leads, all_interactions)
     pc = st.columns(4)
-    tips = {
-        "Warm→Hot": "How effectively warm conversations are being escalated.",
-        "Hot→Offer": "How many hot leads reach an offer stage.",
-        "Offer→Contract": "Offer quality and conversion effectiveness.",
-        "Contract→Deal": "How reliably contracts close.",
-    }
     for c, (k, v) in zip(pc, prog.items()):
-        c.metric(info_icon(k, tips.get(k, "")), f"{v:.1f}%")
+        label = info_icon(k, "How effectively warm leads are escalated.") if k == "Warm→Hot" else k
+        c.metric(label, f"{v:.1f}%")
 
     with st.expander("Advanced Metrics"):
         adv = advanced_metrics(all_leads, all_interactions)
         for k, v in adv.items():
-            st.write(f"**{k}:** {v}")
+            st.markdown(f"**{info_icon(k, 'Operational efficiency benchmark for consistent pipeline progress')}:** {v}", unsafe_allow_html=True)
 
-    st.markdown("### Call List")
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    done_count, remaining_count = completion_counts(result["call_list"])
-    if st.button(f"Call List (Done: {done_count} | Remaining: {remaining_count})", key="call_list_nav"):
-        nav_to("Call List")
-    st.markdown("</div>", unsafe_allow_html=True)
 
 elif page == "Leads":
     st.subheader("Leads")
@@ -518,6 +517,9 @@ elif page == "Leads":
 
     with left:
         if not st.session_state.get("lead_list_collapsed"):
+            if st.button("◀", key="collapse_list_arrow", help="Collapse lead list"):
+                st.session_state["lead_list_collapsed"] = True
+                st.rerun()
             with st.container(height=620):
                 for lead in matches:
                     _, address_text, _, _ = parse_timeline_parts(lead["timeline"])
@@ -525,6 +527,10 @@ elif page == "Leads":
                         st.session_state["selected_lead_id"] = lead["id"]
                         st.session_state["lead_list_collapsed"] = True
                         st.rerun()
+        else:
+            if st.button("▶", key="expand_list_arrow", help="Expand lead list"):
+                st.session_state["lead_list_collapsed"] = False
+                st.rerun()
 
     with right:
         if st.session_state.get("selected_lead_id"):
@@ -543,10 +549,10 @@ elif page == "Call List":
         for entry in call_list:
             lid = entry["lead_id"]
             done_key = f"done_{lid}"
-            checked = st.checkbox(f"{entry['name']} · Address: Not provided", key=done_key, value=False)
-            completed, remaining = completion_counts(call_list)
             lead = db.fetch_lead(lid)
             _, address_text, situation, _ = parse_timeline_parts(lead["timeline"] if lead else "")
+            checked = st.checkbox(f"{entry['name']} · {address_text or 'Address not provided'}", key=done_key)
+            completed, remaining = completion_counts(call_list)
             st.caption(f"Address: {address_text or 'Not provided'}")
             st.caption(situation)
             labels = human_intent_labels(entry.get("intent_signals", []))
@@ -592,8 +598,10 @@ elif page == "Follow-ups":
                 ]
             _, address, situation, _ = parse_timeline_parts(lead["timeline"])
             st.markdown("<div class='card'>", unsafe_allow_html=True)
-            if st.button(f"{item['lead_name']}", key=f"f_name_{item['lead_id']}"):
+            if item["lead_id"] > 0 and st.button(f"{item['lead_name']}", key=f"f_name_{item['lead_id']}"):
                 nav_to("Leads", item["lead_id"])
+            if item["lead_id"] <= 0:
+                st.markdown(f"**{item['lead_name']}**")
             st.caption(f"Phone: {lead.get('phone', 'N/A')}")
             st.caption(f"Address: {address or 'Not provided'}")
             st.write("Situation:", situation or "Not recorded")
