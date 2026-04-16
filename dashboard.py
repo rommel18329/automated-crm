@@ -50,26 +50,45 @@ html, body, [data-testid="stAppViewContainer"] {
 .msg-bubble-out{background:#dff0ff;padding:8px 10px;border-radius:14px;max-width:78%;}
 .msg-time{font-size:.73rem;color:#808080;margin-bottom:2px;}
 h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {display:none !important;}
+.st-key-home_title button {font-size: 2.0rem !important; font-weight: 700 !important; border: none !important; background: transparent !important; padding-left: 0 !important;}
 </style>
 """
 
 PAGES = ["Dashboard", "Leads", "Call List", "Follow-ups"]
 
 
-def parse_timeline_parts(timeline_text: str) -> tuple[str, str, str]:
+def info_icon(text: str, tip: str) -> str:
+    return f"{text} <span title=\"{tip}\" style=\"color:#666;\">ⓘ</span>"
+
+
+def parse_timeline_parts(timeline_text: str) -> tuple[str, str, str, str]:
     timeline = timeline_text or ""
+    address = ""
     situation = ""
     notes = ""
-    if "Situation:" in timeline:
-        before, after = timeline.split("Situation:", 1)
-        timeline = before.strip().rstrip(".")
+    if "Address:" in timeline:
+        before_addr, after_addr = timeline.split("Address:", 1)
+        timeline = before_addr.strip().rstrip(".")
+        if "Situation:" in after_addr:
+            addr_part, after_situation = after_addr.split("Situation:", 1)
+            address = addr_part.strip().rstrip(".")
+            after = f"Situation:{after_situation}"
+        else:
+            address = after_addr.strip()
+            after = ""
+    else:
+        after = timeline
+
+    if "Situation:" in after:
+        _, tail = after.split("Situation:", 1)
+        after = tail
         if "Notes:" in after:
             situation_part, notes_part = after.split("Notes:", 1)
             situation = situation_part.strip().rstrip(".")
             notes = notes_part.strip()
         else:
             situation = after.strip()
-    return timeline, situation, notes
+    return timeline, address, situation, notes
 
 
 def human_stage(stage: str) -> str:
@@ -122,6 +141,30 @@ def render_global_search(leads: list[dict]) -> None:
         for lead in matches:
             if st.button(f"{lead['name']} · {lead['phone']}", key=f"quick_pick_{lead['id']}"):
                 nav_to("Leads", lead["id"])
+
+
+def seed_followup_examples() -> tuple[list[tuple[dict, dict]], list[tuple[dict, dict]]]:
+    warm = [
+        (
+            {"lead_id": -1001, "lead_name": "Maya Porter", "new_message": "Would a quick value range help you decide next steps?"},
+            {"timeline": "Considering options this quarter. Address: 214 Willow Brook Dr. Situation: Downsizing soon. Notes: Responsive but cautious.", "status": "warm", "phone": "555-240-1101"},
+        ),
+        (
+            {"lead_id": -1002, "lead_name": "Brent Lawson", "new_message": "No pressure—want me to text a simple path so you can compare?"}, 
+            {"timeline": "Could move in 60 days. Address: 88 Maple Crest Ln. Situation: Job relocation possible. Notes: Asked about speed.", "status": "warm", "phone": "555-240-1102"},
+        ),
+    ]
+    cold = [
+        (
+            {"lead_id": -2001, "lead_name": "Tina Ramirez", "new_message": "Happy to check back later—still okay if I circle back next month?"},
+            {"timeline": "No urgent timeline. Address: 17 Cedar Point Way. Situation: Monitoring market. Notes: Low urgency.", "status": "cold", "phone": "555-240-2101"},
+        ),
+        (
+            {"lead_id": -2002, "lead_name": "Paul Everett", "new_message": "If timing changed, I can keep this simple with one quick option."},
+            {"timeline": "Maybe next year. Address: 502 Garden Row St. Situation: Renovation planning. Notes: Minimal replies.", "status": "cold", "phone": "555-240-2102"},
+        ),
+    ]
+    return warm, cold
 
 
 def interaction_windows(interactions: list[dict]) -> dict[str, list[dict]]:
@@ -215,6 +258,12 @@ def advanced_metrics(leads: list[dict], interactions: list[dict]) -> dict[str, s
     }
 
 
+def completion_counts(call_list: list[dict]) -> tuple[int, int]:
+    completed = sum(1 for entry in call_list if st.session_state.get(f"done_{entry['lead_id']}", False))
+    remaining = max(0, len(call_list) - completed)
+    return completed, remaining
+
+
 def render_imessage(items: list[dict], max_items: int = 10) -> None:
     for msg in items[:max_items]:
         d, t = fmt_date_time(msg["timestamp"])
@@ -282,13 +331,13 @@ def render_lead_detail(lead_id: int) -> None:
         st.warning("Selected lead could not be found.")
         return
     interactions = db.fetch_interactions(lead_id)
-    timeline_text, situation_text, _ = parse_timeline_parts(lead["timeline"])
+    timeline_text, address_text, situation_text, _ = parse_timeline_parts(lead["timeline"])
 
     st.markdown(f"### {lead['name']}")
     c_top1, c_top2, c_top3 = st.columns(3)
-    c_top1.write("Phone:", lead["phone"])
-    c_top2.write("Stage:", human_stage(lead["conversation_stage"]))
-    c_top3.write("Address:", "Not provided")
+    c_top1.markdown(f"**Phone:** {lead['phone']}")
+    c_top2.markdown(f"**Stage:** {human_stage(lead['conversation_stage'])}")
+    c_top3.markdown(f"**Address:** {address_text or 'Not provided'}")
 
     c_edit1, c_edit2, c_edit3 = st.columns(3)
     c_edit1.selectbox(
@@ -397,15 +446,14 @@ if page == "Dashboard":
     for c, (label, value) in zip(
         cols,
         [
-            ("Hot ℹ", summary["hot"]),
-            ("Warm ℹ", summary["warm"]),
-            ("Cold ℹ", summary["cold"]),
-            ("Follow-ups (Today) ℹ", len(result["followup_queue"])),
-            ("Risk leads ℹ", summary["risk_leads"]),
+            (info_icon("Hot", "High-intent leads requiring immediate human action"), summary["hot"]),
+            (info_icon("Warm", "Leads that should be actively nurtured"), summary["warm"]),
+            (info_icon("Cold", "Long-cycle or low-engagement leads"), summary["cold"]),
+            (info_icon("Follow-ups (Today)", "Follow-up suggestions due today"), len(result["followup_queue"])),
+            (info_icon("Risk leads", "Leads showing ghosting or delay risk"), summary["risk_leads"]),
         ],
     ):
         c.markdown(f"<div class='metric'><div>{label}</div><h3>{value}</h3></div>", unsafe_allow_html=True)
-    st.caption("ℹ Hot/Warm/Cold = current pipeline mix. Follow-ups today = pending actions due now. Risk leads = likely ghosting/at-risk.")
 
     activity = activity_counts(all_interactions)
     st.markdown("### Activity")
@@ -413,7 +461,13 @@ if page == "Dashboard":
     for idx, key in enumerate(["daily", "weekly", "monthly"]):
         m = activity[key]
         ac[idx].markdown(
-            f"<div class='card'><b>{key.title()}</b><br>Calls: {m['calls']}<br>Texts: {m['texts']}<br>Follow-ups: {m['followups']}<br>Offers: {m['offers']}</div>",
+            "<div class='card'>"
+            f"<b>{key.title()}</b><br>"
+            f"{info_icon('Calls', 'Outbound/inbound calls logged in selected period')}: {m['calls']}<br>"
+            f"{info_icon('Texts', 'Outbound text activity in selected period')}: {m['texts']}<br>"
+            f"{info_icon('Follow-ups', 'Approved follow-up messages completed')}: {m['followups']}<br>"
+            f"{info_icon('Offers', 'Calls/notes where offer made was logged')}: {m['offers']}"
+            "</div>",
             unsafe_allow_html=True,
         )
 
@@ -426,8 +480,14 @@ if page == "Dashboard":
     st.markdown("### Lead Progression")
     prog = progression_metrics(all_leads, all_interactions)
     pc = st.columns(4)
+    tips = {
+        "Warm→Hot": "How effectively warm conversations are being escalated.",
+        "Hot→Offer": "How many hot leads reach an offer stage.",
+        "Offer→Contract": "Offer quality and conversion effectiveness.",
+        "Contract→Deal": "How reliably contracts close.",
+    }
     for c, (k, v) in zip(pc, prog.items()):
-        c.metric(k, f"{v:.1f}%")
+        c.metric(info_icon(k, tips.get(k, "")), f"{v:.1f}%")
 
     with st.expander("Advanced Metrics"):
         adv = advanced_metrics(all_leads, all_interactions)
@@ -436,7 +496,8 @@ if page == "Dashboard":
 
     st.markdown("### Call List")
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    if st.button(f"Call List ({len(result['call_list'])} calls today)", key="call_list_nav"):
+    done_count, remaining_count = completion_counts(result["call_list"])
+    if st.button(f"Call List (Done: {done_count} | Remaining: {remaining_count})", key="call_list_nav"):
         nav_to("Call List")
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -459,7 +520,8 @@ elif page == "Leads":
         if not st.session_state.get("lead_list_collapsed"):
             with st.container(height=620):
                 for lead in matches:
-                    if st.button(f"{lead['name']} · Address: Not provided", key=f"lead_{lead['id']}"):
+                    _, address_text, _, _ = parse_timeline_parts(lead["timeline"])
+                    if st.button(f"{lead['name']} · {address_text or 'Address not provided'}", key=f"lead_{lead['id']}"):
                         st.session_state["selected_lead_id"] = lead["id"]
                         st.session_state["lead_list_collapsed"] = True
                         st.rerun()
@@ -476,17 +538,16 @@ elif page == "Call List":
     calls_today = sum(1 for i in all_interactions if i["type"] == "call" and datetime.fromisoformat(i["timestamp"]).date() == date.today())
     st.caption(f"Total calls today: {calls_today}")
 
-    completed = 0
+    completed, remaining = completion_counts(call_list)
     with st.container(height=640):
         for entry in call_list:
             lid = entry["lead_id"]
             done_key = f"done_{lid}"
             checked = st.checkbox(f"{entry['name']} · Address: Not provided", key=done_key, value=False)
-            if checked:
-                completed += 1
+            completed, remaining = completion_counts(call_list)
             lead = db.fetch_lead(lid)
-            _, situation, _ = parse_timeline_parts(lead["timeline"] if lead else "")
-            st.caption("Address: Not provided")
+            _, address_text, situation, _ = parse_timeline_parts(lead["timeline"] if lead else "")
+            st.caption(f"Address: {address_text or 'Not provided'}")
             st.caption(situation)
             labels = human_intent_labels(entry.get("intent_signals", []))
             st.markdown("".join([f"<span class='pill'>{x}</span>" for x in labels]), unsafe_allow_html=True)
@@ -494,12 +555,14 @@ elif page == "Call List":
                 nav_to("Leads", lid)
             st.divider()
 
+    completed, remaining = completion_counts(call_list)
     st.write(f"Completed: {completed} / {len(call_list)}")
+    st.write(f"Remaining: {remaining}")
     if call_list and completed == len(call_list):
         st.balloons()
 
 elif page == "Follow-ups":
-    st.subheader("Follow-ups")
+    st.subheader("Follow-up Suggestions")
     overdue_only = st.session_state.get("followup_overdue_only", False)
     queue = result["followup_queue"]
 
@@ -512,16 +575,27 @@ elif page == "Follow-ups":
             continue
         (warm_items if lead["status"] == "warm" else cold_items).append((item, lead))
 
+    if not warm_items and not cold_items:
+        warm_items, cold_items = seed_followup_examples()
+
     for section_name, items in [("Warm", warm_items), ("Cold", cold_items)]:
         st.markdown(f"### {section_name}")
         if not items:
             st.caption("No items")
         for item, lead in items:
-            history = [i for i in db.fetch_interactions(item["lead_id"]) if i["type"] == "text"][:6]
-            _, situation, _ = parse_timeline_parts(lead["timeline"])
+            if item["lead_id"] > 0:
+                history = [i for i in db.fetch_interactions(item["lead_id"]) if i["type"] == "text"][:6]
+            else:
+                history = [
+                    {"timestamp": datetime.utcnow().isoformat(timespec="seconds"), "direction": "outbound", "type": "text", "content": "Quick check-in on your timeline."},
+                    {"timestamp": datetime.utcnow().isoformat(timespec="seconds"), "direction": "inbound", "type": "text", "content": "Still deciding, open to options."},
+                ]
+            _, address, situation, _ = parse_timeline_parts(lead["timeline"])
             st.markdown("<div class='card'>", unsafe_allow_html=True)
             if st.button(f"{item['lead_name']}", key=f"f_name_{item['lead_id']}"):
                 nav_to("Leads", item["lead_id"])
+            st.caption(f"Phone: {lead.get('phone', 'N/A')}")
+            st.caption(f"Address: {address or 'Not provided'}")
             st.write("Situation:", situation or "Not recorded")
             with st.container(height=120):
                 render_imessage(history, max_items=6)
@@ -533,8 +607,9 @@ elif page == "Follow-ups":
 
             c1, c2, c3 = st.columns(3)
             if c1.button("Approve", key=f"f_app_{item['lead_id']}"):
-                send_sms(item["lead_id"], st.session_state[key])
-                db.add_interaction(item["lead_id"], "text", f"Suggested message approved: {st.session_state[key]}", "outbound")
+                if item["lead_id"] > 0:
+                    send_sms(item["lead_id"], st.session_state[key])
+                    db.add_interaction(item["lead_id"], "text", f"Suggested message approved: {st.session_state[key]}", "outbound")
                 st.rerun()
             if c2.button("Edit", key=f"f_edit_{item['lead_id']}"):
                 st.info("Edit in suggestion box.")

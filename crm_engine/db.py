@@ -231,7 +231,12 @@ def seed_sample_data(db_path: Path = DB_PATH) -> None:
     ]
 
     def lead_tuple(record: dict) -> tuple:
-        timeline = f"{record['timeline']}. Situation: {record['situation']}. Notes: {record['notes']}"
+        phone_digits = "".join(ch for ch in record["phone"] if ch.isdigit())
+        address = record.get("address") or f"{100 + int(phone_digits[-3:])} Oakridge Ave"
+        timeline = (
+            f"{record['timeline']}. Address: {address}. "
+            f"Situation: {record['situation']}. Notes: {record['notes']}"
+        )
         return (
             record["name"],
             record["phone"],
