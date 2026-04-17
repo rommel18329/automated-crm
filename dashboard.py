@@ -625,14 +625,11 @@ with head_right:
 with st.sidebar:
     st.markdown("""
     <style>
-    .nav-container {
-        margin-top: 10px;
-    }
     .nav-item {
         font-size: 16px;
         padding: 6px 0px;
         cursor: pointer;
-        color: #333;
+        color: #444;
     }
     .nav-item:hover {
         color: black;
@@ -645,9 +642,8 @@ with st.sidebar:
     </style>
     """, unsafe_allow_html=True)
     st.markdown("### 🌿 Navigation")
-    st.markdown('<div class="nav-container">', unsafe_allow_html=True)
 
-    def nav_item(label: str, key: str) -> None:
+    def nav_click(label: str, key: str) -> None:
         is_active = st.session_state["page"] == key
         class_name = "nav-item nav-active" if is_active else "nav-item"
         st.markdown(
@@ -658,15 +654,20 @@ with st.sidebar:
             """,
             unsafe_allow_html=True
         )
-        if st.button(label, key=f"hidden_nav_{key}"):
+        if st.session_state.get(f"click_{key}", False):
             st.session_state["page"] = key
+            st.session_state[f"click_{key}"] = False
             st.rerun()
 
-    nav_item("Dashboard", "dashboard")
-    nav_item("Leads", "leads")
-    nav_item("Call List", "call_list")
-    nav_item("Follow-ups", "followups")
-    st.markdown('</div>', unsafe_allow_html=True)
+    for label, key in [
+        ("Dashboard", "dashboard"),
+        ("Leads", "leads"),
+        ("Call List", "call_list"),
+        ("Follow-ups", "followups"),
+    ]:
+        if st.button("", key=f"hidden_{key}"):
+            st.session_state[f"click_{key}"] = True
+        nav_click(label, key)
 
 st.divider()
 page = st.session_state["page"]
