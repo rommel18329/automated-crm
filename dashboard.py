@@ -437,6 +437,14 @@ def render_imessage(items: list[dict], max_items: int = 10) -> None:
         )
 
 
+def lead_conversation_items(lead_id: int) -> list[dict]:
+    interactions = db.fetch_interactions(lead_id)
+    return [
+        i for i in interactions
+        if i["type"] == "call" or (i["type"] == "text" and "suggested message approved" in i["content"].lower())
+    ]
+
+
 def update_status(lead_id: int, key: str) -> None:
     db.update_lead(lead_id, {"status": st.session_state[key]})
 
@@ -497,10 +505,7 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
     if not lead:
         return
     interactions = db.fetch_interactions(lead_id)
-    conversation = [
-        i for i in interactions
-        if i["type"] == "call" or (i["type"] == "text" and "suggested message approved" in i["content"].lower())
-    ]
+    conversation = lead_conversation_items(lead_id)
     timeline_text, address_text, situation_text, _ = parse_timeline_parts(lead["timeline"])
 
     st.markdown(f"### {lead['name']}")
@@ -826,10 +831,8 @@ elif page == "Follow-ups":
             st.caption("No items")
         for item, lead in items:
             if item["lead_id"] > 0:
-                history = [
-                    i for i in db.fetch_interactions(item["lead_id"])
-                    if i["type"] == "call" or (i["type"] == "text" and "suggested message approved" in i["content"].lower())
-                ][:6]
+                conversation = lead_conversation_items(item["lead_id"])
+                history = conversation[-10:]
             else:
                 history = []
             _, address, situation, _ = parse_timeline_parts(lead["timeline"])
@@ -842,7 +845,10 @@ elif page == "Follow-ups":
             st.caption(f"Address: {address}")
             st.write("Situation:", situation or "Not recorded")
             with st.container(height=120):
-                render_imessage(history, max_items=6)
+                if history:
+                    render_imessage(history, max_items=10)
+                else:
+                    st.caption("No messages yet")
 
             key = f"f_msg_{item['lead_id']}"
             if key not in st.session_state:
