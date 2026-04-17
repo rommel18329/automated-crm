@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import base64
 import time
 
 import streamlit as st
@@ -89,6 +90,25 @@ def info_icon(text: str, tip: str) -> str:
         f"<span class='tooltip-icon'>i</span>"
         f"<span class='tooltip-tip'>{tip}</span>"
         "</span>"
+    )
+
+
+def autoplay_audio() -> None:
+    # tiny embedded mp3 to avoid binary asset files in repo/PR
+    b64 = (
+        "/+MYxAAEaAIEeUAQAgBgNgP/////KQQ/////Lvrg+lcWYHgtjadzsbTq+yREu495tq9c6v/7vt/of7mna9v6/"
+        "btUnU17Jun9/+MYxCkT26KW+YGBAj9v6vUh+zab//v/96C3/pu6H+pv//r/ycIIP4pcWWTRBBBAMXgNdbRaABQ"
+        "AAABRWKwgjQVX0ECmrb///+MYxBQSM0sWWYI4A++Z/////////////0rOZ3MP//7H44QEgxgdvRVMXHZseL//5"
+        "40B4JAvMPEgaA4/0nHjxLhRgAoAYAgA/+MYxAYIAAJfGYEQAMAJAIAQMAwX936/q/tWtv/2f/+v//6v/+7qTEFN"
+        "RTMuOTkuNVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    )
+    st.markdown(
+        f"""
+        <audio autoplay>
+        <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+        </audio>
+        """,
+        unsafe_allow_html=True,
     )
 
 
@@ -470,6 +490,8 @@ for ld in all_leads:
 
 if "page" not in st.session_state:
     st.session_state["page"] = "Dashboard"
+if st.session_state["page"] == "dashboard":
+    st.session_state["page"] = "Dashboard"
 if "lead_list_collapsed" not in st.session_state:
     st.session_state["lead_list_collapsed"] = False
 if "call_completed" not in st.session_state:
@@ -478,7 +500,8 @@ head_left, head_right = st.columns([4, 1.7])
 with head_left:
     st.markdown("<div class='title-home'>", unsafe_allow_html=True)
     if st.button("Silverline Investment Group 🌿", key="home_title"):
-        nav_to("Dashboard")
+        st.session_state["page"] = "dashboard"
+        st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 with head_right:
     st.markdown("<div class='quick-search-wrap'>", unsafe_allow_html=True)
@@ -642,16 +665,16 @@ elif page == "Follow-ups":
             continue
         (warm_items if lead["status"] == "warm" else cold_items).append((item, lead))
 
-    if not warm_items and not cold_items:
-        warm_items, cold_items = seed_followup_examples()
-
     for section_name, items in [("Warm", warm_items), ("Cold", cold_items)]:
         st.markdown(f"### {section_name}")
         if not items:
             st.caption("No items")
         for item, lead in items:
             if item["lead_id"] > 0:
-                history = [i for i in db.fetch_interactions(item["lead_id"]) if i["type"] == "text"][:6]
+                history = [
+                    i for i in db.fetch_interactions(item["lead_id"])
+                    if i["type"] == "call" or (i["type"] == "text" and "suggested message approved" in i["content"].lower())
+                ][:6]
             else:
                 history = []
             _, address, situation, _ = parse_timeline_parts(lead["timeline"])
@@ -690,10 +713,7 @@ elif page == "Follow-ups":
                     db.add_interaction(item["lead_id"], "text", f"Suggested message approved: {user_dot} {user_value}: approved message \"{approved_text}\"", "outbound", ts=ts)
                     db.add_interaction(item["lead_id"], "note", f"{user_value}: approved message \"{approved_text}\"", "outbound", ts=ts)
                     st.session_state[key] = ""
-                    st.markdown(
-                        "<audio autoplay><source src='https://notificationsounds.com/storage/sounds/file-sounds-1152-pristine.mp3' type='audio/mpeg'></audio>",
-                        unsafe_allow_html=True,
-                    )
+                    autoplay_audio()
                     st.success("Message sent.")
                 st.rerun()
             if c2.button("Edit", key=f"f_edit_{item['lead_id']}"):
