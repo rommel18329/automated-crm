@@ -625,6 +625,9 @@ with head_right:
 with st.sidebar:
     st.markdown("""
     <style>
+    .nav-container {
+        margin-top: 10px;
+    }
     .nav-item {
         font-size: 16px;
         padding: 6px 0px;
@@ -642,12 +645,20 @@ with st.sidebar:
     </style>
     """, unsafe_allow_html=True)
     st.markdown("### 🌿 Navigation")
+    st.markdown('<div class="nav-container">', unsafe_allow_html=True)
 
     def nav_item(label: str, key: str) -> None:
         is_active = st.session_state["page"] == key
         class_name = "nav-item nav-active" if is_active else "nav-item"
-        st.markdown(f'<div class="{class_name}">{label}</div>', unsafe_allow_html=True)
-        if st.button(label, key=f"nav_{key}"):
+        st.markdown(
+            f"""
+            <div class="{class_name}">
+                {label}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        if st.button(label, key=f"hidden_nav_{key}"):
             st.session_state["page"] = key
             st.rerun()
 
@@ -655,6 +666,7 @@ with st.sidebar:
     nav_item("Leads", "leads")
     nav_item("Call List", "call_list")
     nav_item("Follow-ups", "followups")
+    st.markdown('</div>', unsafe_allow_html=True)
 
 st.divider()
 page = st.session_state["page"]
