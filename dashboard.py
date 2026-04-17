@@ -76,10 +76,34 @@ h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {display:none !important;}
 .tooltip-tip{visibility:hidden;opacity:0;transition:opacity .15s;position:absolute;z-index:20;left:20px;top:-6px;background:#222;color:#fff;padding:6px 8px;border-radius:6px;font-size:12px;white-space:nowrap;}
 .tooltip-wrap:hover .tooltip-tip{visibility:visible;opacity:1;}
 .quick-search-wrap {margin-top: -34px;}
-[data-testid="stSidebar"] [data-baseweb="tab-list"]{gap:6px;display:flex;flex-direction:column;}
-[data-testid="stSidebar"] [data-baseweb="tab"]{justify-content:flex-start !important;text-align:left !important;color:#2f2f2f !important;background:transparent !important;border-radius:8px !important;padding:8px 10px !important;transition:background .18s ease;}
-[data-testid="stSidebar"] [data-baseweb="tab"]:hover{background:#efefef !important;cursor:pointer !important;}
-[data-testid="stSidebar"] [aria-selected="true"]{background:#e7f0e8 !important;color:#2f2f2f !important;font-weight:600 !important;border-left:2px solid #6B8F71 !important;}
+[data-testid="stSidebar"] [data-baseweb="tab-list"]{
+  gap:2px;
+  display:flex;
+  flex-direction:column;
+  align-items:stretch;
+}
+[data-testid="stSidebar"] [data-baseweb="tab"]{
+  justify-content:flex-start !important;
+  text-align:left !important;
+  color:#2f2f2f !important;
+  background:transparent !important;
+  border:none !important;
+  border-radius:0 !important;
+  box-shadow:none !important;
+  padding:6px 4px !important;
+  margin:0 !important;
+  transition:background .15s ease,color .15s ease;
+}
+[data-testid="stSidebar"] [data-baseweb="tab"]:hover{
+  background:#efefef !important;
+  cursor:pointer !important;
+}
+[data-testid="stSidebar"] [aria-selected="true"]{
+  background:#ececec !important;
+  color:#1f1f1f !important;
+  font-weight:600 !important;
+  border-left:2px solid #6B8F71 !important;
+}
 [data-testid="stToggle"] [data-baseweb="switch"]{height:34px !important;width:78px !important;}
 [data-testid="stToggle"] [data-baseweb="switch"] > div{background:#d64b4b !important;}
 [data-testid="stToggle"] input:checked + div{background:#54a96a !important;}
@@ -220,28 +244,37 @@ def render_global_search(leads: list[dict]) -> None:
                 nav_to("Leads", item["id"])
 
 
-def seed_followup_examples() -> tuple[list[tuple[dict, dict]], list[tuple[dict, dict]]]:
-    warm = [
-        (
-            {"lead_id": -1001, "lead_name": "Maya Porter", "new_message": "Would a quick value range help you decide next steps?"},
-            {"timeline": "Considering options this quarter. Address: 214 Willow Brook Dr, Dallas, TX 75201. Situation: Downsizing soon. Notes: Responsive but cautious.", "status": "warm", "phone": "555-240-1101"},
-        ),
-        (
-            {"lead_id": -1002, "lead_name": "Brent Lawson", "new_message": "No pressure—want me to text a simple path so you can compare?"}, 
-            {"timeline": "Could move in 60 days. Address: 88 Maple Crest Ln, Dallas, TX 75202. Situation: Job relocation possible. Notes: Asked about speed.", "status": "warm", "phone": "555-240-1102"},
-        ),
-    ]
-    cold = [
-        (
-            {"lead_id": -2001, "lead_name": "Tina Ramirez", "new_message": "Happy to check back later—still okay if I circle back next month?"},
-            {"timeline": "No urgent timeline. Address: 17 Cedar Point Way, Dallas, TX 75203. Situation: Monitoring market. Notes: Low urgency.", "status": "cold", "phone": "555-240-2101"},
-        ),
-        (
-            {"lead_id": -2002, "lead_name": "Paul Everett", "new_message": "If timing changed, I can keep this simple with one quick option."},
-            {"timeline": "Maybe next year. Address: 502 Garden Row St, Dallas, TX 75204. Situation: Renovation planning. Notes: Minimal replies.", "status": "cold", "phone": "555-240-2102"},
-        ),
-    ]
-    return warm, cold
+def generate_sample_followups_from_leads(leads: list[dict]) -> tuple[list[dict], list[dict]]:
+    warm_items: list[dict] = []
+    cold_items: list[dict] = []
+    for lead in leads:
+        timeline_text, _, situation_text, notes_text = parse_timeline_parts(lead.get("timeline", ""))
+        context_hint = notes_text or situation_text or timeline_text
+        if lead["status"] == "warm" and len(warm_items) < 5:
+            warm_items.append(
+                {
+                    "lead_id": lead["id"],
+                    "lead_name": lead["name"],
+                    "new_message": (
+                        f"Hey {lead['name']}, just wanted to check in — are you still thinking about selling? "
+                        f"{context_hint[:80]}"
+                    ).strip(),
+                }
+            )
+        if lead["status"] == "cold" and len(cold_items) < 5:
+            cold_items.append(
+                {
+                    "lead_id": lead["id"],
+                    "lead_name": lead["name"],
+                    "new_message": (
+                        f"Hey {lead['name']}, circling back — let me know if timing changes on your end. "
+                        f"{context_hint[:80]}"
+                    ).strip(),
+                }
+            )
+        if len(warm_items) >= 5 and len(cold_items) >= 5:
+            break
+    return warm_items, cold_items
 
 
 def interaction_windows(interactions: list[dict]) -> dict[str, list[dict]]:
@@ -776,6 +809,11 @@ elif page == "Follow-ups":
         if overdue_only and lead.get("next_action_date") and lead["next_action_date"] >= date.today().isoformat():
             continue
         (warm_items if lead["status"] == "warm" else cold_items).append((item, lead))
+
+    if not warm_items and not cold_items:
+        sample_warm, sample_cold = generate_sample_followups_from_leads(all_leads)
+        warm_items = [(item, lead_lookup[item["lead_id"]]) for item in sample_warm if item["lead_id"] in lead_lookup]
+        cold_items = [(item, lead_lookup[item["lead_id"]]) for item in sample_cold if item["lead_id"] in lead_lookup]
 
     if overdue_only:
         st.markdown("#### Overdue Follow-ups")
