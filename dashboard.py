@@ -204,8 +204,15 @@ def fmt_date_time(iso_value: str) -> tuple[str, str]:
 
 
 def nav_to(page: str, lead_id: int | None = None) -> None:
-    st.session_state["page"] = page
-    if page == "Leads" and lead_id is None:
+    page_map = {
+        "Dashboard": "dashboard",
+        "Leads": "leads",
+        "Call List": "call_list",
+        "Follow-ups": "followups",
+    }
+    normalized = page_map.get(page, page)
+    st.session_state["page"] = normalized
+    if normalized == "leads" and lead_id is None:
         st.session_state["lead_list_collapsed"] = False
     if lead_id is not None:
         st.session_state["selected_lead_id"] = lead_id
@@ -597,9 +604,7 @@ for ld in all_leads:
     all_interactions.extend(db.fetch_interactions(ld["id"]))
 
 if "page" not in st.session_state:
-    st.session_state["page"] = "Dashboard"
-if st.session_state["page"] == "dashboard":
-    st.session_state["page"] = "Dashboard"
+    st.session_state["page"] = "dashboard"
 if "lead_list_collapsed" not in st.session_state:
     st.session_state["lead_list_collapsed"] = False
 if "call_completed" not in st.session_state:
@@ -618,16 +623,43 @@ with head_right:
     st.markdown("</div>", unsafe_allow_html=True)
 
 with st.sidebar:
+    st.markdown("""
+    <style>
+    .nav-item {
+        font-size: 16px;
+        padding: 6px 0px;
+        cursor: pointer;
+        color: #333;
+    }
+    .nav-item:hover {
+        color: black;
+        font-weight: 600;
+    }
+    .nav-active {
+        font-weight: 700;
+        color: black;
+    }
+    </style>
+    """, unsafe_allow_html=True)
     st.markdown("### 🌿 Navigation")
-    selected = st.pills("Navigate", PAGES, selection_mode="single", default=st.session_state["page"], label_visibility="collapsed")
-    if selected and selected != st.session_state["page"]:
-        st.session_state["page"] = selected
-        st.rerun()
+
+    def nav_item(label: str, key: str) -> None:
+        is_active = st.session_state["page"] == key
+        class_name = "nav-item nav-active" if is_active else "nav-item"
+        st.markdown(f'<div class="{class_name}">{label}</div>', unsafe_allow_html=True)
+        if st.button(label, key=f"nav_{key}"):
+            st.session_state["page"] = key
+            st.rerun()
+
+    nav_item("Dashboard", "dashboard")
+    nav_item("Leads", "leads")
+    nav_item("Call List", "call_list")
+    nav_item("Follow-ups", "followups")
 
 st.divider()
 page = st.session_state["page"]
 
-if page == "Dashboard":
+if page == "dashboard":
     calls_completed_today = sum(
         1 for item in all_interactions
         if item["type"] == "call" and datetime.fromisoformat(item["timestamp"]).date() == date.today()
@@ -721,7 +753,7 @@ if page == "Dashboard":
             st.markdown(f"**{info_icon(k, 'Operational efficiency benchmark for consistent pipeline progress')}:** {v}", unsafe_allow_html=True)
 
 
-elif page == "Leads":
+elif page == "leads":
     st.subheader("Leads")
     q = st.text_input("Search", placeholder="Type name or phone...").strip().lower()
     status_filter = st.multiselect("Optional filters", ["hot", "warm", "cold"], default=[])
@@ -763,7 +795,7 @@ elif page == "Leads":
         else:
             st.info("Select a lead to begin.")
 
-elif page == "Call List":
+elif page == "call_list":
     st.subheader("Call List")
     call_list = result["call_list"]
     calls_today = sum(1 for i in all_interactions if i["type"] == "call" and datetime.fromisoformat(i["timestamp"]).date() == date.today())
@@ -801,7 +833,7 @@ elif page == "Call List":
     if call_list and completed == len(call_list):
         st.balloons()
 
-elif page == "Follow-ups":
+elif page == "followups":
     st.subheader("Follow-up Suggestions")
     overdue_only = st.session_state.get("followup_overdue_only", False)
     queue = result["followup_queue"]
