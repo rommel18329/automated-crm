@@ -58,15 +58,19 @@ h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {display:none !important;}
 .tooltip-tip{visibility:hidden;opacity:0;transition:opacity .15s;position:absolute;z-index:20;left:20px;top:-6px;background:#222;color:#fff;padding:6px 8px;border-radius:6px;font-size:12px;white-space:nowrap;}
 .tooltip-wrap:hover .tooltip-tip{visibility:visible;opacity:1;}
 .big-title {font-size: 36px !important; font-weight: 800 !important; margin-bottom: 10px;}
-.big-title-wrap {margin-bottom: 2px !important;}
+.big-title-wrap {margin-bottom: 0 !important;}
 .quick-search-wrap {margin-top: -34px;}
-[data-testid="stSidebar"] [data-baseweb="tab-list"]{gap:4px;display:flex;flex-direction:column;}
-[data-testid="stSidebar"] [data-baseweb="tab"]{justify-content:flex-start !important;color:#2f2f2f !important;background:transparent !important;border-radius:8px !important;padding:6px 8px !important;}
-[data-testid="stSidebar"] [data-baseweb="tab"]:hover{background:#ece7df !important;cursor:pointer !important;}
-[data-testid="stSidebar"] [aria-selected="true"]{background:#e7f0e8 !important;color:#2f4f35 !important;font-weight:600 !important;border-left:2px solid #6B8F71 !important;}
-[data-testid="stToggle"] label{font-weight:600;}
+[data-testid="stSidebar"] [data-baseweb="tab-list"]{gap:6px;display:flex;flex-direction:column;}
+[data-testid="stSidebar"] [data-baseweb="tab"]{justify-content:flex-start !important;text-align:left !important;color:#2f2f2f !important;background:transparent !important;border-radius:8px !important;padding:8px 10px !important;transition:background .18s ease;}
+[data-testid="stSidebar"] [data-baseweb="tab"]:hover{background:#efefef !important;cursor:pointer !important;}
+[data-testid="stSidebar"] [aria-selected="true"]{background:#e7f0e8 !important;color:#2f2f2f !important;font-weight:600 !important;border-left:2px solid #6B8F71 !important;}
+.title-home button{border:none !important;background:transparent !important;font-size:36px !important;font-weight:800 !important;text-align:left !important;padding:0 !important;margin:0 !important;}
+.title-home button:hover{background:transparent !important;color:#2e2e2e !important;}
+[data-testid="stToggle"] [data-baseweb="switch"]{height:34px !important;width:78px !important;}
 [data-testid="stToggle"] [data-baseweb="switch"] > div{background:#d64b4b !important;}
 [data-testid="stToggle"] input:checked + div{background:#54a96a !important;}
+[data-testid="stToggle"] [data-baseweb="switch"] > div::before{content:'RJ';position:absolute;left:12px;top:8px;color:#fff;font-size:12px;font-weight:700;}
+[data-testid="stToggle"] input:checked + div::before{content:'GL';left:44px;}
 .note-actions button{border:none !important;background:transparent !important;padding:0 !important;min-height:20px !important;font-size:0.85rem !important;}
 .note-bubble{background:#f4f1ec;border:1px solid #e7e2d9;border-radius:12px;padding:8px 10px;}
 .typing-dot{display:inline-block;animation:blink 1.2s infinite;}
@@ -452,16 +456,7 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
 
 
 st.markdown(THEME_CSS, unsafe_allow_html=True)
-st.markdown("""
-<style>
-.big-title {
-    font-size: 36px !important;
-    font-weight: 800 !important;
-    margin-bottom: 10px;
-}
-</style>
-<div class="big-title-wrap"><h1 class="big-title">Silverline Investment Group 🌿</h1></div>
-""", unsafe_allow_html=True)
+st.markdown("<style>.big-title{font-size:36px !important;font-weight:800 !important;margin-bottom:0 !important;}</style>", unsafe_allow_html=True)
 db.init_db()
 result = engine.evaluate_all_leads()
 all_leads = db.fetch_leads()
@@ -481,12 +476,15 @@ if "call_completed" not in st.session_state:
     st.session_state["call_completed"] = {}
 head_left, head_right = st.columns([4, 1.7])
 with head_left:
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='title-home'>", unsafe_allow_html=True)
+    if st.button("Silverline Investment Group 🌿", key="home_title"):
+        nav_to("Dashboard")
+    st.markdown("</div>", unsafe_allow_html=True)
 with head_right:
     st.markdown("<div class='quick-search-wrap'>", unsafe_allow_html=True)
     if "user" not in st.session_state:
         st.session_state["user"] = "RJ"
-    is_gl = st.toggle("RJ  ⟷  GL", value=st.session_state["user"] == "GL", key="user_toggle")
+    is_gl = st.toggle("", value=st.session_state["user"] == "GL", key="user_toggle", label_visibility="collapsed")
     st.session_state["user"] = "GL" if is_gl else "RJ"
     st.markdown("##### Quick Search")
     render_global_search(all_leads)
@@ -613,8 +611,9 @@ elif page == "Call List":
             lead = lead_lookup.get(lid)
             _, address_text, situation, _ = parse_timeline_parts(lead["timeline"] if lead else "")
             row_left, row_right = st.columns([5, 1])
-            if row_left.button(f"{entry['name']}\n{address_text}", key=f"open_name_{lid}", type="tertiary", use_container_width=True):
+            if row_left.button(entry["name"], key=f"open_name_{lid}", type="tertiary", use_container_width=True):
                 nav_to("Leads", lid)
+            row_left.caption(address_text)
             checked = row_right.checkbox("", key=done_key, label_visibility="collapsed")
             completed, remaining = completion_counts(call_list)
             st.caption(f"Address: {address_text}")
@@ -654,10 +653,7 @@ elif page == "Follow-ups":
             if item["lead_id"] > 0:
                 history = [i for i in db.fetch_interactions(item["lead_id"]) if i["type"] == "text"][:6]
             else:
-                history = [
-                    {"timestamp": datetime.utcnow().isoformat(timespec="seconds"), "direction": "outbound", "type": "text", "content": "Quick check-in on your timeline."},
-                    {"timestamp": datetime.utcnow().isoformat(timespec="seconds"), "direction": "inbound", "type": "text", "content": "Still deciding, open to options."},
-                ]
+                history = []
             _, address, situation, _ = parse_timeline_parts(lead["timeline"])
             st.markdown("<div class='card'>", unsafe_allow_html=True)
             if item["lead_id"] > 0 and st.button(f"{item['lead_name']}", key=f"f_name_{item['lead_id']}", type="tertiary"):
@@ -673,13 +669,7 @@ elif page == "Follow-ups":
             key = f"f_msg_{item['lead_id']}"
             if key not in st.session_state:
                 st.session_state[key] = item["new_message"]
-            sent_key = f"sent_preview_{item['lead_id']}"
-            if sent_key not in st.session_state:
-                st.session_state[sent_key] = []
             st.text_area("Suggestion", key=key, height=80)
-            for sent_msg in st.session_state[sent_key]:
-                ts = datetime.utcnow().isoformat(timespec="seconds")
-                render_imessage([{"timestamp": ts, "direction": "outbound", "type": "text", "content": sent_msg}], max_items=1)
 
             c1, c2, c3 = st.columns(3)
             if c1.button("Approve", key=f"f_app_{item['lead_id']}"):
@@ -695,7 +685,6 @@ elif page == "Follow-ups":
                     ts = datetime.utcnow()
                     send_sms(item["lead_id"], st.session_state[key])
                     approved_text = st.session_state[key]
-                    st.session_state[sent_key].append(approved_text)
                     user_value = st.session_state.get("user", "RJ")
                     user_dot = "🔴" if user_value == "RJ" else "🟢"
                     db.add_interaction(item["lead_id"], "text", f"Suggested message approved: {user_dot} {user_value}: approved message \"{approved_text}\"", "outbound", ts=ts)
