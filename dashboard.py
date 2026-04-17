@@ -10,6 +10,25 @@ from crm_engine import db, engine
 from crm_engine.messaging_gateway import send_sms
 
 st.set_page_config(page_title="Silverline Investment Group", layout="wide")
+st.markdown("""
+<style>
+div[data-testid="stAppViewContainer"] .main .block-container {
+    max-width: 100% !important;
+    padding-top: 1rem !important;
+}
+
+.big-title {
+    font-size: 48px !important;
+    font-weight: 800 !important;
+    line-height: 1.1 !important;
+    margin-bottom: 0.5rem !important;
+}
+</style>
+""", unsafe_allow_html=True)
+st.markdown(
+    '<div class="big-title">Silverline Investment Group 🌿</div>',
+    unsafe_allow_html=True
+)
 
 THEME_CSS = """
 <style>
@@ -52,21 +71,15 @@ html, body, [data-testid="stAppViewContainer"] {
 .msg-bubble-out{background:#dff0ff;padding:8px 10px;border-radius:14px;max-width:78%;}
 .msg-time{font-size:.73rem;color:#808080;margin-bottom:2px;}
 h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {display:none !important;}
-.st-key-home_title button {font-size: 2.0rem !important; font-weight: 700 !important; border: none !important; background: transparent !important; padding-left: 0 !important;}
-.st-key-home_title button {font-size: 2.3rem !important; font-weight: 800 !important; border: none !important; background: transparent !important; padding-left: 0 !important; width: 100% !important; text-align: left !important;}
 .tooltip-wrap{position:relative;display:inline-flex;align-items:center;gap:6px;}
 .tooltip-icon{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border:1px solid #8b8b8b;border-radius:50%;font-size:11px;line-height:1;color:#5d5d5d;cursor:default;}
 .tooltip-tip{visibility:hidden;opacity:0;transition:opacity .15s;position:absolute;z-index:20;left:20px;top:-6px;background:#222;color:#fff;padding:6px 8px;border-radius:6px;font-size:12px;white-space:nowrap;}
 .tooltip-wrap:hover .tooltip-tip{visibility:visible;opacity:1;}
-.big-title {font-size: 36px !important; font-weight: 800 !important; margin-bottom: 10px;}
-.big-title-wrap {margin-bottom: 0 !important;}
 .quick-search-wrap {margin-top: -34px;}
 [data-testid="stSidebar"] [data-baseweb="tab-list"]{gap:6px;display:flex;flex-direction:column;}
 [data-testid="stSidebar"] [data-baseweb="tab"]{justify-content:flex-start !important;text-align:left !important;color:#2f2f2f !important;background:transparent !important;border-radius:8px !important;padding:8px 10px !important;transition:background .18s ease;}
 [data-testid="stSidebar"] [data-baseweb="tab"]:hover{background:#efefef !important;cursor:pointer !important;}
 [data-testid="stSidebar"] [aria-selected="true"]{background:#e7f0e8 !important;color:#2f2f2f !important;font-weight:600 !important;border-left:2px solid #6B8F71 !important;}
-.title-home button{border:none !important;background:transparent !important;font-size:36px !important;font-weight:800 !important;text-align:left !important;padding:0 !important;margin:0 !important;}
-.title-home button:hover{background:transparent !important;color:#2e2e2e !important;}
 [data-testid="stToggle"] [data-baseweb="switch"]{height:34px !important;width:78px !important;}
 [data-testid="stToggle"] [data-baseweb="switch"] > div{background:#d64b4b !important;}
 [data-testid="stToggle"] input:checked + div{background:#54a96a !important;}
@@ -181,17 +194,30 @@ def render_global_search(leads: list[dict]) -> None:
         st.session_state["quick_search_value"] = ""
     q = st.text_input(
         "Quick Search",
-        placeholder="Name or phone",
+        placeholder="Search leads...",
         label_visibility="collapsed",
         key="quick_search_value",
-    ).strip().lower()
+    ).lower()
     if not q:
         return
-    matches = [l for l in leads if q in l["name"].lower() or q in l["phone"].lower()][:8]
-    with st.container(height=150):
+
+    matches = []
+    for lead in leads:
+        _, address_text, _, _ = parse_timeline_parts(lead["timeline"])
+        searchable = f"{lead['name']} {lead['phone']} {address_text}".lower()
+        if q in searchable:
+            matches.append((lead, address_text))
+        if len(matches) >= 8:
+            break
+
+    with st.container(height=180):
+        if not matches:
+            st.caption("No matches")
+            return
         for lead in matches:
-            if st.button(f"{lead['name']} · {lead['phone']}", key=f"quick_pick_{lead['id']}"):
-                nav_to("Leads", lead["id"])
+            item, address_text = lead
+            if st.button(f"{item['name']} · {address_text}", key=f"quick_pick_{item['id']}"):
+                nav_to("Leads", item["id"])
 
 
 def seed_followup_examples() -> tuple[list[tuple[dict, dict]], list[tuple[dict, dict]]]:
@@ -258,25 +284,70 @@ def overdue_followups(leads: list[dict]) -> list[dict]:
     ]
 
 
+def hot_not_contacted_today(leads: list[dict], interactions: list[dict]) -> list[dict]:
+    today = date.today()
+    touched_today: set[int] = set()
+    for item in interactions:
+        if item["type"] not in {"call", "text"}:
+            continue
+        if datetime.fromisoformat(item["timestamp"]).date() == today:
+            touched_today.add(item["lead_id"])
+    return [lead for lead in leads if lead["status"] == "hot" and lead["id"] not in touched_today]
+
+
+def followups_waiting_approval(queue: list[dict], interactions: list[dict]) -> int:
+    approved_ids = {
+        item["lead_id"]
+        for item in interactions
+        if item["type"] == "text" and "suggested message approved" in item["content"].lower()
+    }
+    return sum(1 for item in queue if item["lead_id"] not in approved_ids)
+
+
 def progression_metrics(leads: list[dict], interactions: list[dict]) -> dict[str, float]:
     warm = [l for l in leads if l["status"] == "warm"]
     hot = [l for l in leads if l["status"] == "hot"]
-    contract = [l for l in leads if l["status"] == "contract"]
-
+    contracts = [l for l in leads if l["status"] == "contract"]
     offer_lead_ids = {i["lead_id"] for i in interactions if "offer made" in i["content"].lower()}
-    hot_ids = {l["id"] for l in hot}
-    contract_ids = {l["id"] for l in contract}
-
-    warm_hot = (len(hot) / max(1, len(warm) + len(hot))) * 100
-    hot_offer = (len(hot_ids & offer_lead_ids) / max(1, len(hot_ids))) * 100
-    offer_contract = (len(contract_ids & offer_lead_ids) / max(1, len(offer_lead_ids))) * 100
-    contract_deal = 100.0 if contract else 0.0
-    return {
-        "Warm→Hot": warm_hot,
-        "Hot→Offer": hot_offer,
-        "Offer→Contract": offer_contract,
-        "Contract→Deal": contract_deal,
+    closed_deal_ids = {
+        i["lead_id"] for i in interactions
+        if "deal closed" in i["content"].lower() or "closed deal" in i["content"].lower()
     }
+    closed_deal_ids |= {lead["id"] for lead in leads if lead["status"] == "closed"}
+
+    warm_hot_num = len(hot)
+    warm_hot_den = len(warm)
+    hot_offer_num = len({lead["id"] for lead in hot} & offer_lead_ids)
+    hot_offer_den = len(hot)
+    offer_contract_num = len({lead["id"] for lead in contracts} & offer_lead_ids)
+    offer_contract_den = len(offer_lead_ids)
+    contract_deal_num = len({lead["id"] for lead in contracts} & closed_deal_ids)
+    contract_deal_den = len(contracts)
+
+    warm_hot = (warm_hot_num / max(1, warm_hot_den)) * 100
+    hot_offer = (hot_offer_num / max(1, hot_offer_den)) * 100
+    offer_contract = (offer_contract_num / max(1, offer_contract_den)) * 100
+    contract_deal = (contract_deal_num / max(1, contract_deal_den)) * 100
+    return {
+        "Warm→Hot": (warm_hot, warm_hot_num, warm_hot_den),
+        "Hot→Offer": (hot_offer, hot_offer_num, hot_offer_den),
+        "Offer→Contract": (offer_contract, offer_contract_num, offer_contract_den),
+        "Contract→Deal": (contract_deal, contract_deal_num, contract_deal_den),
+    }
+
+
+def stuck_leads(leads: list[dict]) -> list[dict]:
+    cutoff = date.today().toordinal() - 3
+    out: list[dict] = []
+    for lead in leads:
+        if lead["status"] not in {"warm", "hot"}:
+            continue
+        last_contact = lead.get("last_contact_date")
+        if not last_contact:
+            continue
+        if date.fromisoformat(last_contact).toordinal() < cutoff:
+            out.append(lead)
+    return out
 
 
 def advanced_metrics(leads: list[dict], interactions: list[dict]) -> dict[str, str]:
@@ -476,7 +547,6 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
 
 
 st.markdown(THEME_CSS, unsafe_allow_html=True)
-st.markdown("<style>.big-title{font-size:36px !important;font-weight:800 !important;margin-bottom:0 !important;}</style>", unsafe_allow_html=True)
 db.init_db()
 result = engine.evaluate_all_leads()
 all_leads = db.fetch_leads()
@@ -498,11 +568,7 @@ if "call_completed" not in st.session_state:
     st.session_state["call_completed"] = {}
 head_left, head_right = st.columns([4, 1.7])
 with head_left:
-    st.markdown("<div class='title-home'>", unsafe_allow_html=True)
-    if st.button("Silverline Investment Group 🌿", key="home_title"):
-        st.session_state["page"] = "dashboard"
-        st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.empty()
 with head_right:
     st.markdown("<div class='quick-search-wrap'>", unsafe_allow_html=True)
     if "user" not in st.session_state:
@@ -524,6 +590,40 @@ st.divider()
 page = st.session_state["page"]
 
 if page == "Dashboard":
+    calls_completed_today = sum(
+        1 for item in all_interactions
+        if item["type"] == "call" and datetime.fromisoformat(item["timestamp"]).date() == date.today()
+    )
+    hot_total = sum(1 for lead in all_leads if lead["status"] == "hot")
+    calls_remaining_today = max(0, hot_total - calls_completed_today)
+    overdue_items = overdue_followups(all_leads)
+    overdue_count = len(overdue_items)
+    hot_not_contacted = hot_not_contacted_today(all_leads, all_interactions)
+    waiting_approval = followups_waiting_approval(result["followup_queue"], all_interactions)
+
+    st.markdown("### Today’s Priorities")
+    pcols = st.columns(5)
+    if pcols[0].button(f"Calls remaining today: {calls_remaining_today}", key="prio_calls_remaining"):
+        nav_to("Call List")
+    if pcols[1].button(f"Calls completed today: {calls_completed_today}", key="prio_calls_completed"):
+        nav_to("Call List")
+    overdue_label = f"🔴 Overdue follow-ups: {overdue_count}" if overdue_count > 0 else f"Overdue follow-ups: {overdue_count}"
+    if pcols[2].button(overdue_label, key="prio_overdue"):
+        st.session_state["followup_overdue_only"] = True
+        nav_to("Follow-ups")
+    if pcols[3].button(f"Hot leads not contacted today: {len(hot_not_contacted)}", key="prio_hot_not_contacted"):
+        st.session_state["lead_focus_ids"] = [lead["id"] for lead in hot_not_contacted]
+        nav_to("Leads")
+    if pcols[4].button(f"Follow-ups waiting approval: {waiting_approval}", key="prio_waiting_approval"):
+        st.session_state["followup_overdue_only"] = False
+        nav_to("Follow-ups")
+
+    stuck = stuck_leads(all_leads)
+    st.markdown("### Leads Stuck")
+    if st.button(f"Stuck leads: {len(stuck)}", key="stuck_leads_btn"):
+        st.session_state["lead_focus_ids"] = [lead["id"] for lead in stuck]
+        nav_to("Leads")
+
     summary = result["summary"]
     cols = st.columns(5)
     for c, (label, value) in zip(
@@ -570,9 +670,10 @@ if page == "Dashboard":
     st.markdown("### Lead Progression")
     prog = progression_metrics(all_leads, all_interactions)
     pc = st.columns(4)
-    for c, (k, v) in zip(pc, prog.items()):
+    for c, (k, values) in zip(pc, prog.items()):
+        v, num, den = values
         c.markdown(
-            f"<div class='card'><b>{info_icon(k, 'How effectively warm leads are escalated.')}</b><br>{v:.1f}%</div>",
+            f"<div class='card'><b>{info_icon(k, 'How effectively warm leads are escalated.')}</b><br>{v:.1f}% ({num} / {den})</div>",
             unsafe_allow_html=True,
         )
 
@@ -591,6 +692,10 @@ elif page == "Leads":
         if (not status_filter or l["status"] in status_filter)
         and (not q or q in l["name"].lower() or q in l["phone"].lower())
     ]
+    focus_ids = st.session_state.pop("lead_focus_ids", [])
+    if focus_ids:
+        focus_set = set(focus_ids)
+        matches = [lead for lead in matches if lead["id"] in focus_set]
 
     if not st.session_state.get("lead_list_collapsed"):
         left, right = st.columns([1, 1.8])
@@ -627,6 +732,11 @@ elif page == "Call List":
     st.caption(f"Total calls today: {calls_today}")
 
     completed, remaining = completion_counts(call_list)
+    total_calls_today = len(call_list)
+    completed_calls_today = completed
+    pct_complete = int((completed_calls_today / max(1, total_calls_today)) * 100)
+    st.progress(completed_calls_today / max(1, total_calls_today))
+    st.caption(f"{completed_calls_today} / {total_calls_today} completed ({pct_complete}%)")
     with st.container(height=640):
         for entry in call_list:
             lid = entry["lead_id"]
@@ -639,6 +749,8 @@ elif page == "Call List":
             row_left.caption(address_text)
             checked = row_right.checkbox("", key=done_key, label_visibility="collapsed")
             completed, remaining = completion_counts(call_list)
+            completed_calls_today = completed
+            pct_complete = int((completed_calls_today / max(1, total_calls_today)) * 100)
             st.caption(f"Address: {address_text}")
             st.caption(situation)
             labels = human_intent_labels(entry.get("intent_signals", []))
@@ -664,6 +776,11 @@ elif page == "Follow-ups":
         if overdue_only and lead.get("next_action_date") and lead["next_action_date"] >= date.today().isoformat():
             continue
         (warm_items if lead["status"] == "warm" else cold_items).append((item, lead))
+
+    if overdue_only:
+        st.markdown("#### Overdue Follow-ups")
+        warm_items.sort(key=lambda pair: pair[1].get("next_action_date") or "9999-12-31")
+        cold_items.sort(key=lambda pair: pair[1].get("next_action_date") or "9999-12-31")
 
     for section_name, items in [("Warm", warm_items), ("Cold", cold_items)]:
         st.markdown(f"### {section_name}")
