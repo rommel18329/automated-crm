@@ -605,6 +605,9 @@ for ld in all_leads:
 
 if "page" not in st.session_state:
     st.session_state["page"] = "dashboard"
+query_params = st.query_params
+if "page" in query_params:
+    st.session_state["page"] = query_params["page"]
 if "lead_list_collapsed" not in st.session_state:
     st.session_state["lead_list_collapsed"] = False
 if "call_completed" not in st.session_state:
@@ -643,31 +646,24 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     st.markdown("### 🌿 Navigation")
 
-    def nav_click(label: str, key: str) -> None:
+    def nav_item(label: str, key: str) -> None:
         is_active = st.session_state["page"] == key
         class_name = "nav-item nav-active" if is_active else "nav-item"
         st.markdown(
             f"""
             <div class="{class_name}">
-                {label}
+                <a href="/?page={key}" target="_self" style="text-decoration:none; color:inherit;">
+                    {label}
+                </a>
             </div>
             """,
             unsafe_allow_html=True
         )
-        if st.session_state.get(f"click_{key}", False):
-            st.session_state["page"] = key
-            st.session_state[f"click_{key}"] = False
-            st.rerun()
 
-    for label, key in [
-        ("Dashboard", "dashboard"),
-        ("Leads", "leads"),
-        ("Call List", "call_list"),
-        ("Follow-ups", "followups"),
-    ]:
-        if st.button("", key=f"hidden_{key}"):
-            st.session_state[f"click_{key}"] = True
-        nav_click(label, key)
+    nav_item("Dashboard", "dashboard")
+    nav_item("Leads", "leads")
+    nav_item("Call List", "call_list")
+    nav_item("Follow-ups", "followups")
 
 st.divider()
 page = st.session_state["page"]
