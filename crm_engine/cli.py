@@ -80,6 +80,14 @@ def _cmd_import_csv(args: argparse.Namespace) -> None:
         print(f"ERROR: {err}")
 
 
+def _cmd_reset_seed(args: argparse.Namespace) -> None:
+    path = Path(args.db)
+    db.init_db(path)
+    db.seed_sample_data(path, replace_existing=True)
+    leads = db.fetch_leads(path)
+    print(f"Seed reset complete. Leads loaded: {len(leads)}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Automated CRM decision + escalation engine")
     parser.add_argument("--db", default="crm.db", help="SQLite file path")
@@ -110,6 +118,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_import.add_argument("file_path")
     p_import.add_argument("--clear-existing", action="store_true")
     p_import.set_defaults(func=_cmd_import_csv)
+
+    p_seed = sub.add_parser("reset-seed")
+    p_seed.set_defaults(func=_cmd_reset_seed)
     return parser
 
 

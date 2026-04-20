@@ -16,6 +16,7 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e .
 crm --db crm.db init
+crm --db crm.db reset-seed
 crm --db crm.db import-csv leads.csv --clear-existing
 crm --db crm.db daily-run
 streamlit run dashboard.py
@@ -24,6 +25,7 @@ streamlit run dashboard.py
 ## CLI commands
 ```bash
 crm --db crm.db init
+crm --db crm.db reset-seed
 crm --db crm.db import-csv leads.csv --clear-existing
 crm --db crm.db daily-run
 crm --db crm.db queue
