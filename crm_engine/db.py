@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
-DB_PATH = Path("crm.db")
+DB_PATH = Path(__file__).resolve().parents[1] / "crm.db"
 
 
 @dataclass(slots=True)
