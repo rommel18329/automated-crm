@@ -90,7 +90,7 @@ def _cmd_reset_seed(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Automated CRM decision + escalation engine")
-    parser.add_argument("--db", default="crm.db", help="SQLite file path")
+    parser.add_argument("--db", default=str(db.DB_PATH), help="SQLite file path")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_init = sub.add_parser("init")

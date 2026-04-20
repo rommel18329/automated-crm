@@ -7,6 +7,7 @@ import time
 import streamlit as st
 
 from crm_engine import db, engine
+from crm_engine.followup_engine import generate_followup_message
 from crm_engine.messaging_gateway import send_sms
 
 st.set_page_config(page_title="Silverline Investment Group", layout="wide")
@@ -251,36 +252,44 @@ def render_global_search(leads: list[dict]) -> None:
                 nav_to("Leads", item["id"])
 
 
-def generate_sample_followups_from_leads(leads: list[dict]) -> tuple[list[dict], list[dict]]:
+def get_all_leads() -> list[dict]:
+    return db.fetch_leads()
+
+
+def get_lead_by_id(lead_id: int | None, leads: list[dict]) -> dict | None:
+    if lead_id is None:
+        return None
+    for lead in leads:
+        if lead["id"] == lead_id:
+            return lead
+    return None
+
+
+def build_followups(leads: list[dict]) -> tuple[list[dict], list[dict]]:
     warm_items: list[dict] = []
     cold_items: list[dict] = []
     for lead in leads:
-        timeline_text, _, situation_text, notes_text = parse_timeline_parts(lead.get("timeline", ""))
-        context_hint = notes_text or situation_text or timeline_text
-        if lead["status"] == "warm" and len(warm_items) < 5:
-            warm_items.append(
-                {
-                    "lead_id": lead["id"],
-                    "lead_name": lead["name"],
-                    "new_message": (
-                        f"Hey {lead['name']}, just wanted to check in — are you still thinking about selling? "
-                        f"{context_hint[:80]}"
-                    ).strip(),
-                }
-            )
-        if lead["status"] == "cold" and len(cold_items) < 5:
-            cold_items.append(
-                {
-                    "lead_id": lead["id"],
-                    "lead_name": lead["name"],
-                    "new_message": (
-                        f"Hey {lead['name']}, circling back — let me know if timing changes on your end. "
-                        f"{context_hint[:80]}"
-                    ).strip(),
-                }
-            )
-        if len(warm_items) >= 5 and len(cold_items) >= 5:
-            break
+        if lead["status"] not in {"warm", "cold"}:
+            continue
+        interactions = db.fetch_interactions(lead["id"])
+        eval_ = engine.evaluate_lead(lead, interactions)
+        texts = [i for i in interactions if i["type"] == "text"]
+        last_message = texts[0]["content"] if texts else ""
+        draft = generate_followup_message(
+            lead=lead,
+            last_message=last_message,
+            ignored_texts=eval_.ignored_outbound_texts,
+            strong_intent=eval_.strong_intent,
+        )
+        entry = {
+            "lead_id": lead["id"],
+            "lead_name": lead["name"],
+            "new_message": draft.message,
+        }
+        if lead["status"] == "warm":
+            warm_items.append(entry)
+        else:
+            cold_items.append(entry)
     return warm_items, cold_items
 
 
@@ -510,6 +519,8 @@ def render_notes(lead_id: int, interactions: list[dict]) -> None:
 def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
     lead = lead_lookup.get(lead_id)
     if not lead:
+        st.warning("Lead not found — data mismatch")
+        st.stop()
         return
     interactions = db.fetch_interactions(lead_id)
     conversation = lead_conversation_items(lead_id)
@@ -594,7 +605,7 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
 st.markdown(THEME_CSS, unsafe_allow_html=True)
 db.init_db()
 result = engine.evaluate_all_leads()
-all_leads = db.fetch_leads()
+all_leads = get_all_leads()
 lead_lookup = {lead["id"]: lead for lead in all_leads}
 selected_id = st.session_state.get("selected_lead_id")
 if selected_id is not None and selected_id not in lead_lookup:
@@ -849,7 +860,7 @@ elif page == "followups":
 
     warm_items, cold_items = [], []
     for item in queue:
-        lead = lead_lookup.get(item["lead_id"])
+        lead = get_lead_by_id(item["lead_id"], all_leads)
         if not lead:
             continue
         if overdue_only and lead.get("next_action_date") and lead["next_action_date"] >= date.today().isoformat():
@@ -857,9 +868,9 @@ elif page == "followups":
         (warm_items if lead["status"] == "warm" else cold_items).append((item, lead))
 
     if not warm_items and not cold_items:
-        sample_warm, sample_cold = generate_sample_followups_from_leads(all_leads)
-        warm_items = [(item, lead_lookup[item["lead_id"]]) for item in sample_warm if item["lead_id"] in lead_lookup]
-        cold_items = [(item, lead_lookup[item["lead_id"]]) for item in sample_cold if item["lead_id"] in lead_lookup]
+        warm_built, cold_built = build_followups(all_leads)
+        warm_items = [(item, lead_lookup[item["lead_id"]]) for item in warm_built if item["lead_id"] in lead_lookup]
+        cold_items = [(item, lead_lookup[item["lead_id"]]) for item in cold_built if item["lead_id"] in lead_lookup]
 
     if overdue_only:
         st.markdown("#### Overdue Follow-ups")
