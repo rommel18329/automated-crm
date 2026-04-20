@@ -133,7 +133,49 @@ def seed_sample_data(db_path: Path = DB_PATH, replace_existing: bool = False) ->
         {"first": "JINGYUN", "last": "HUANG", "email": "", "phones": ["3124093384", "3096607700", "6462078489", "", ""], "address1": "2420 63RD ST", "city": "DOWNERS GROVE", "state": "Illinois"},
         {"first": "Simon", "last": "Dortch", "email": "reecedillardsigns@gmail.com", "phones": ["7738245185", "3125208532", "7733780939", "7732873077", "7083666744"], "address1": "560 N Laramie Ave # 1", "city": "Chicago", "state": "IL"},
         {"first": "Ryan", "last": "Andreini", "email": "", "phones": ["5157071144", "5152250700", "5152801618", "", ""], "address1": "612 SE 6th St", "city": "Des Moines", "state": "IA"},
+        {"first": "Cinda", "last": "Goodvin", "email": "", "phones": ["3192319244", "3194040875", "", "", ""], "address1": "1205 W Mullan Ave", "city": "Waterloo", "state": "IA"},
     ]
+
+    zip_by_name = {
+        "Sanchez Chavez": "60629-1417",
+        "Zach Hellberg": "52240",
+        "Joeseph Schneider": "52404-1629",
+        "Jimmie Stanley": "52531-2327",
+        "Beau/Jenny Jensen": "50246-7622",
+        "Christian Committed": "60649-5219",
+        "Steven B Hebert": "50501-4525",
+        "Taneka Dennie": "60621-2541",
+        "Premsagar Mulkanoor": "60428-4107",
+        "Dondra Davis": "62002-3450",
+        "Jonathan Kutas": "60647-5214",
+        "James Duban": "62258-2748",
+        "Zachary Anderson": "61729-9502",
+        "Fernado Suaste": "60426-4339",
+        "Zenah Taher": "60426-3112",
+        "Barry Tobin": "60115-4240",
+        "BENJAMIN HICKMAN": "62650",
+        "Cleo Grant": "60628-6816",
+        "MARGARET LIEN": "61455",
+        "CINDY HARDEN": "61350",
+        "EDVAR DUARTE": "61455",
+        "Nicholas Hemann": "52240-5275",
+        "Robert A Chidester": "60098-2922",
+        "Lindsay M Dewitt": "50533-1311",
+        "Dixie Leon": "52501-3413",
+        "CLETUS FEIG": "62801",
+        "Kendra Harms": "50633-8901",
+        "James Maher": "52802-3511",
+        "David Sharkey": "51449-1213",
+        "Stephan Palen": "52501-1216",
+        "DANNY SALGADO": "60638",
+        "Elmer Montejo": "52501-3133",
+        "S Latinik": "60643-5029",
+        "Andre ALJ INVESTMENTS": "60636-4125",
+        "JINGYUN HUANG": "60516",
+        "Simon Dortch": "60644-1621",
+        "Ryan Andreini": "50309-5206",
+        "Cinda Goodvin": "50701-2651",
+    }
 
     def normalize_seed_phone(raw: str) -> str | None:
         digits = re.sub(r"\D", "", raw or "")
@@ -141,8 +183,11 @@ def seed_sample_data(db_path: Path = DB_PATH, replace_existing: bool = False) ->
             return None
         return f"{digits[0:3]}-{digits[3:6]}-{digits[6:10]}"
 
-    def make_address(row: dict[str, Any]) -> str:
+    def make_address(row: dict[str, Any], full_name: str) -> str:
         parts = [row["address1"].strip(), row["city"].strip(), row["state"].strip()]
+        zip_code = zip_by_name.get(full_name, "").strip()
+        if zip_code:
+            parts.append(zip_code)
         return ", ".join([p for p in parts if p])
 
     records: list[dict[str, Any]] = []
@@ -189,7 +234,7 @@ def seed_sample_data(db_path: Path = DB_PATH, replace_existing: bool = False) ->
                 "status": status,
                 "motivation": motivation,
                 "timeline": (
-                    f"{timeline_text}. Address: {make_address(row)}. Situation: imported lead. "
+                    f"{timeline_text}. Address: {make_address(row, full_name)}. Situation: imported lead. "
                     f"Notes: seeded from provided list.{email_note}{alt_phone_note}"
                 ),
                 "timeline_days": timeline_days,
