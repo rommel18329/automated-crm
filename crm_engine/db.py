@@ -89,211 +89,125 @@ def init_db(db_path: Path = DB_PATH) -> None:
         )
 
 
-def seed_sample_data(db_path: Path = DB_PATH) -> None:
+def seed_sample_data(db_path: Path = DB_PATH, replace_existing: bool = False) -> None:
     today = date.today().isoformat()
     now = datetime.utcnow()
 
-    hot_leads = [
-        {
-            "name": "John Carter",
-            "phone": "555-201-1001",
-            "status": "hot",
-            "motivation": 9,
-            "timeline": "Looking to close in 2 weeks",
-            "timeline_days": 14,
-            "stage": "negotiating",
-            "probability": 86,
-            "touch_count": 5,
-            "last_strategy": "call",
-            "situation": "Relocating for a job transfer",
-            "notes": "Asked for an offer number and close timeline this month.",
-            "interactions": [
-                ("text", "Hey John, are you still open to selling your property?", "outbound", 4200),
-                ("text", "Yes, what price can you offer if we move quickly?", "inbound", 4160),
-                ("call", "Reviewed property condition and timing; he said he needs to sell fast.", "outbound", 2800),
-                ("text", "I need to sell fast, can you close this month?", "inbound", 1800),
-                ("note", "Situation: relocating. Notes: comparing two buyers, wants certainty.", "outbound", 1200),
-            ],
-        },
-        {
-            "name": "Sarah Mitchell",
-            "phone": "555-201-1002",
-            "status": "hot",
-            "motivation": 8,
-            "timeline": "Wants this wrapped up in under 30 days",
-            "timeline_days": 21,
-            "stage": "qualifying",
-            "probability": 80,
-            "touch_count": 4,
-            "last_strategy": "follow-up",
-            "situation": "Inherited a property she does not want to manage",
-            "notes": "Asked if we can close this month and what range we can offer.",
-            "interactions": [
-                ("text", "Checking in Sarah—still considering a sale this month?", "outbound", 4600),
-                ("text", "I might, depends on speed. Can you close this month?", "inbound", 4500),
-                ("call", "Walked through inherited-home process and net sheet expectations.", "outbound", 2600),
-                ("text", "What price range can you offer me?", "inbound", 900),
-            ],
-        },
-        {
-            "name": "Michael Reyes",
-            "phone": "555-201-1003",
-            "status": "hot",
-            "motivation": 7,
-            "timeline": "Aiming to sell within 10-14 days",
-            "timeline_days": 10,
-            "stage": "negotiating",
-            "probability": 84,
-            "touch_count": 6,
-            "last_strategy": "call",
-            "situation": "Vacant rental is creating monthly carrying costs",
-            "notes": "Wants as-is terms and quick close before next mortgage payment.",
-            "interactions": [
-                ("text", "Hey Michael, still evaluating options for your rental?", "outbound", 5000),
-                ("text", "Yes, I need a clean as-is offer.", "inbound", 4940),
-                ("call", "Discussed fast-close options and title timeline.", "outbound", 3200),
-                ("text", "Can you close this month if I accept?", "inbound", 2100),
-                ("note", "Situation: vacant rental. Notes: urgency tied to payment due date.", "outbound", 1300),
-            ],
-        },
-        {
-            "name": "Alicia Gomez",
-            "phone": "555-201-1004",
-            "status": "hot",
-            "motivation": 8,
-            "timeline": "Needs a buyer in 3 weeks",
-            "timeline_days": 20,
-            "stage": "qualifying",
-            "probability": 78,
-            "touch_count": 4,
-            "last_strategy": "call",
-            "situation": "Divorce settlement requires property decision soon",
-            "notes": "Asked directly about proceeds and certainty of closing date.",
-            "interactions": [
-                ("text", "Alicia, are you still open to a direct sale option?", "outbound", 4300),
-                ("text", "Yes, I need a clear number soon.", "inbound", 4250),
-                ("call", "Discussed timeline pressure from legal deadlines.", "outbound", 2400),
-                ("text", "If we agree, can you close this month?", "inbound", 700),
-            ],
-        },
-        {
-            "name": "David Nguyen",
-            "phone": "555-201-1005",
-            "status": "hot",
-            "motivation": 6,
-            "timeline": "Trying to sell in under 30 days",
-            "timeline_days": 28,
-            "stage": "negotiating",
-            "probability": 75,
-            "touch_count": 5,
-            "last_strategy": "follow-up",
-            "situation": "Behind on payments and wants a fast resolution",
-            "notes": "Repeated urgency and asked for quickest path to close.",
-            "interactions": [
-                ("text", "David, are you still looking for a fast sale?", "outbound", 4700),
-                ("text", "Yes, I need to move quickly.", "inbound", 4650),
-                ("text", "Would a same-month close help solve timing?", "outbound", 3000),
-                ("text", "Yes, what can you offer?", "inbound", 2900),
-                ("call", "Reviewed as-is process and close timeline.", "outbound", 900),
-            ],
-        },
+    raw_rows = [
+        {"first": "Sanchez", "last": "Chavez", "email": "echavez101215@gmail.com", "phones": ["7734544780", "7739889874", "7738424153", "7734740770", ""], "address1": "2424 W Lithuanian Plaza Ct", "city": "Chicago", "state": "IL"},
+        {"first": "Zach", "last": "Hellberg", "email": "", "phones": ["3195947713", "3199360881", "3193391300", "3197527363", "3197523563"], "address1": "1516 Sheridan Ave", "city": "Iowa City", "state": "Iowa"},
+        {"first": "Joeseph", "last": "Schneider", "email": "", "phones": ["3193619602", "", "", "", ""], "address1": "2150 Chandler St SW", "city": "Cedar Rapids", "state": "IA"},
+        {"first": "Jimmie", "last": "Stanley", "email": "", "phones": ["6417773299", "6419325373", "", "", ""], "address1": "323 S 2nd St", "city": "Albia", "state": "IA"},
+        {"first": "Beau/Jenny", "last": "Jensen", "email": "", "phones": ["5158357794", "5158364415", "5158263743", "", ""], "address1": "490 Bute St", "city": "Stanhope", "state": "IA"},
+        {"first": "KIMBERLI", "last": "(last)", "email": "n/a", "phones": ["319-270-0975", "", "", "", ""], "address1": "1925 belmont parkway NW", "city": "", "state": ""},
+        {"first": "Christian", "last": "Committed", "email": "creativerenovationsoutreach@yahoo.com", "phones": ["7733678437", "3122877941", "3124347739", "7083335694", "7738631322"], "address1": "7833 S Marquette Ave", "city": "Chicago", "state": "IL"},
+        {"first": "Steven B", "last": "Hebert", "email": "", "phones": ["5159553051", "3039796639", "", "", ""], "address1": "500 Avenue E", "city": "Fort Dodge", "state": "IA"},
+        {"first": "Taneka", "last": "Dennie", "email": "tanekadennie@gmail.com", "phones": ["7736511568", "7733391567", "", "", ""], "address1": "6811 S Parnell Ave", "city": "Chicago", "state": "IL"},
+        {"first": "Premsagar", "last": "Mulkanoor", "email": "premsagarm@gmail.com", "phones": ["7087158561", "8154690025", "7087995863", "8143972947", "6194466395"], "address1": "15870 Dixie Hwy", "city": "Markham", "state": "IL"},
+        {"first": "Dondra", "last": "Davis", "email": "fatselftj@hotmail.com", "phones": ["6187221776", "6184331993", "3144564642", "6184331216", "6184625197"], "address1": "1910 Sycamore St", "city": "Alton", "state": "Illinois"},
+        {"first": "Jonathan", "last": "Kutas", "email": "jksatuk2@aol.com", "phones": ["2195887890", "8505448525", "8728024002", "2199721754", "3129521530"], "address1": "1702 N Maplewood Ave # 1", "city": "Chicago", "state": "IL"},
+        {"first": "James", "last": "Duban", "email": "", "phones": ["(937) 750-1826", "9377501426", "9377501826", "6184480083", "6182358901"], "address1": "1248 Antique Ln", "city": "Mascoutah", "state": "IL"},
+        {"first": "Zachary", "last": "Anderson", "email": "", "phones": ["(937) 750-1826", "2172023878", "3094482495", "2173754474", "2178417804"], "address1": "303 1st St", "city": "Congerville", "state": "IL"},
+        {"first": "Fernado", "last": "Suaste", "email": "chelsea.mae.1414@gmail.com", "phones": ["7733708049", "7083396685", "7733345218", "7085665932", "7735614302"], "address1": "15637 Turlington Ave", "city": "Harvey", "state": "IL"},
+        {"first": "Zenah", "last": "Taher", "email": "brittanysmith3442@gmail.com", "phones": ["7084975910", "7086141855", "7086140443", "7088608497", "7086921856"], "address1": "15217 Lexington Ave", "city": "Harvey", "state": "IL"},
+        {"first": "Barry", "last": "Tobin", "email": "tobinbarry@hotmail.com", "phones": ["8153750582", "8157588754", "6077769534", "6183031526", "7087172624"], "address1": "212 S 11th St", "city": "Dekalb", "state": "IL"},
+        {"first": "DENNIS", "last": "BALES", "email": "", "phones": ["2178218635", "6189675428", "6184835290", "", ""], "address1": "350 Main St", "city": "Westervelt", "state": ""},
+        {"first": "BENJAMIN", "last": "HICKMAN", "email": "", "phones": ["2173160428", "", "", "", ""], "address1": "807 SPATES ST", "city": "JACKSONVILLE", "state": "IL"},
+        {"first": "Cleo", "last": "Grant", "email": "gcleo@hotmail.com", "phones": ["7736101332", "7739283983", "7089259974", "7736773921", "7735443156"], "address1": "33 E 122nd Pl", "city": "Chicago", "state": "IL"},
+        {"first": "MARGARET", "last": "LIEN", "email": "", "phones": ["3093330623", "", "", "", ""], "address1": "421 S LAFAYETTE ST", "city": "MACOMB", "state": "IL"},
+        {"first": "CINDY", "last": "HARDEN", "email": "", "phones": ["8154053759", "8154335152", "8154330090", "8154332837", "6308702418"], "address1": "614 2ND AVE", "city": "OTTAWA", "state": "IL"},
+        {"first": "EDVAR", "last": "DUARTE", "email": "", "phones": ["9095613270", "", "", "", ""], "address1": "820 BOBBY AVE", "city": "MACOMB", "state": "IL"},
+        {"first": "Nicholas", "last": "Hemann", "email": "", "phones": ["3193216133", "", "", "", ""], "address1": "708 E Iowa Ave", "city": "Iowa City", "state": "IA"},
+        {"first": "Robert A", "last": "Chidester", "email": "nchidester@yahoo.com", "phones": ["8153827667", "7737282726", "8153388464", "8153388408", "8153381799"], "address1": "611 McHenry Ave", "city": "Woodstock", "state": "IL"},
+        {"first": "Lindsay M", "last": "Dewitt", "email": "", "phones": ["5152930286", "", "", "", ""], "address1": "303 N Cadwell Ave", "city": "Eagle Grove", "state": "IA"},
+        {"first": "Dixie", "last": "Leon", "email": "", "phones": ["6416827323", "", "", "", ""], "address1": "418 S Foster Ave", "city": "Ottumwa", "state": "IA"},
+        {"first": "CLETUS", "last": "FEIG", "email": "", "phones": ["6183223680", "", "", "", ""], "address1": "633 W 6TH ST", "city": "CENTRALIA", "state": "IL"},
+        {"first": "Kendra", "last": "Harms", "email": "", "phones": ["6414308179", "6418476935", "", "", ""], "address1": "725 Front St", "city": "Geneva", "state": "IA"},
+        {"first": "James", "last": "Maher", "email": "", "phones": ["(773) 594-6482", "7735946482", "8476630000", "8476639116", "8479665686"], "address1": "1132 W 4th St", "city": "Davenport", "state": "IA"},
+        {"first": "David", "last": "Sharkey", "email": "", "phones": ["6417809831", "5152662369", "6412040317", "", ""], "address1": "705 N Illinois St", "city": "Lake City", "state": "IA"},
+        {"first": "Stephan", "last": "Palen", "email": "", "phones": ["6417992366", "6416821723", "6417770525", "", ""], "address1": "2420 N Court St", "city": "Ottumwa", "state": "IA"},
+        {"first": "DANNY", "last": "SALGADO", "email": "", "phones": ["7739317774", "7737674860", "7735308180", "7734062272", "7737350902"], "address1": "5610 S PARKSIDE AVE", "city": "CHICAGO", "state": "IL"},
+        {"first": "Elmer", "last": "Montejo", "email": "", "phones": ["6412267098", "6412267098", "", "", ""], "address1": "1015 Locust St", "city": "Ottumwa", "state": "IA"},
+        {"first": "S", "last": "Latinik", "email": "sshlomol@aol.com", "phones": ["2244130735", "2244130735", "8474206533", "8479331210", "8476762011"], "address1": "11545 S Laflin St", "city": "Chicago", "state": "IL"},
+        {"first": "Andre", "last": "ALJ INVESTMENTS", "email": "anthony_c_jackson@yahoo.com", "phones": ["7082831152", "3128671883", "7082830780", "", ""], "address1": "1327 W 72nd Pl # 1", "city": "Chicago", "state": "Illinois"},
+        {"first": "JINGYUN", "last": "HUANG", "email": "", "phones": ["3124093384", "3096607700", "6462078489", "", ""], "address1": "2420 63RD ST", "city": "DOWNERS GROVE", "state": "Illinois"},
+        {"first": "Simon", "last": "Dortch", "email": "reecedillardsigns@gmail.com", "phones": ["7738245185", "3125208532", "7733780939", "7732873077", "7083666744"], "address1": "560 N Laramie Ave # 1", "city": "Chicago", "state": "IL"},
+        {"first": "Ryan", "last": "Andreini", "email": "", "phones": ["5157071144", "5152250700", "5152801618", "", ""], "address1": "612 SE 6th St", "city": "Des Moines", "state": "IA"},
     ]
 
-    warm_leads = [
-        ("Emily Brooks", "555-202-2001", 6, "Likely decision in 2-3 months", 75, "qualifying", 56, 3, "value-based", "Downsizing after kids moved out", "Engaged but comparing options and timing."),
-        ("Daniel Foster", "555-202-2002", 5, "Possibly later this year", 120, "initial_contact", 47, 2, "follow-up", "Needs repairs before listing", "Responds slowly after contractor updates."),
-        ("Olivia Price", "555-202-2003", 4, "Maybe after school year", 90, "initial_contact", 43, 3, "casual follow-up", "Family considering relocation", "Interested but timeline still unclear."),
-        ("Ryan Bennett", "555-202-2004", 6, "Could move forward in 60-90 days", 80, "qualifying", 58, 4, "value-based", "Household transition in progress", "Asks occasional pricing questions."),
-        ("Megan Walsh", "555-202-2005", 5, "After tenant lease ends", 110, "initial_contact", 45, 2, "follow-up", "Managing tenant turnover", "Open to follow-up, no clear commitment."),
-        ("Brian Coleman", "555-202-2006", 4, "Unclear, maybe this fall", 100, "initial_contact", 42, 3, "casual follow-up", "Unsure whether to sell or rent", "One reply then delayed response."),
-        ("Jasmine Patel", "555-202-2007", 5, "Could revisit in 2 months", 70, "qualifying", 52, 3, "value-based", "Considering move for work", "Wants numbers before deciding."),
-        ("Trevor Hall", "555-202-2008", 6, "Maybe by end of quarter", 85, "qualifying", 55, 4, "follow-up", "Planning around business schedule", "Inconsistent but responsive to calls."),
-        ("Nina Lawson", "555-202-2009", 4, "Possibly in 3-4 months", 105, "initial_contact", 44, 2, "casual follow-up", "Exploring neighborhood comps", "Curious, but low urgency today."),
-        ("Marcus Reed", "555-202-2010", 5, "Could sell in about 90 days", 90, "qualifying", 50, 3, "value-based", "Potential move to another state", "Needs confidence in net proceeds."),
-    ]
-
-    cold_leads = [
-        ("Laura Jenkins", "555-203-3001", 2, "No plans this year", 365, "initial_contact", 17, 1, "value-based", "Staying put for now", "Asked for rough value then went silent."),
-        ("Kevin Simmons", "555-203-3002", 4, "Maybe next year", 210, "initial_contact", 28, 2, "follow-up", "Exploring refinance first", "Vague interest only."),
-        ("Natalie Reed", "555-203-3003", 3, "No clear timeline", 240, "initial_contact", 19, 1, "casual follow-up", "Family plans undecided", "Hard to reach."),
-        ("Brandon Hayes", "555-203-3004", 2, "After major renovations", 300, "initial_contact", 15, 1, "value-based", "Property not market-ready", "No urgency expressed."),
-        ("Alyssa Grant", "555-203-3005", 4, "Maybe in 6+ months", 200, "initial_contact", 30, 2, "follow-up", "Waiting for job clarity", "Short replies then silence."),
-        ("Tyler Morgan", "555-203-3006", 3, "Unknown until paperwork clears", 270, "initial_contact", 22, 1, "casual follow-up", "Probate process still open", "No near-term decision."),
-        ("Rachel Stone", "555-203-3007", 2, "Not this year", 365, "initial_contact", 14, 1, "follow-up", "Prefers keeping as rental", "Did not respond to last outreach."),
-        ("Ethan Parker", "555-203-3008", 4, "Maybe next spring", 190, "initial_contact", 29, 2, "value-based", "Watching market conditions", "Interested in comps only."),
-        ("Hannah Collins", "555-203-3009", 1, "No intent to sell now", 420, "initial_contact", 11, 1, "casual follow-up", "Information gathering only", "Requested later check-in."),
-        ("Noah Bryant", "555-203-3010", 3, "Could revisit in a year", 400, "initial_contact", 18, 1, "value-based", "Holding as long-term rental", "No urgency and minimal engagement."),
-        ("Grace Kim", "555-203-3011", 2, "Maybe after retirement", 500, "initial_contact", 12, 1, "casual follow-up", "No immediate life event", "One brief response only."),
-        ("Owen Lewis", "555-203-3012", 4, "Possibly in 8-10 months", 280, "initial_contact", 26, 2, "follow-up", "Considering relocation eventually", "Not ready for concrete steps."),
-        ("Chloe Sanders", "555-203-3013", 3, "Undecided timeline", 260, "initial_contact", 20, 1, "casual follow-up", "Comparing refinance and sale", "Paused communication."),
-        ("Evan Harper", "555-203-3014", 2, "Not before next year", 330, "initial_contact", 16, 1, "value-based", "Focused on other priorities", "Very low response rate."),
-        ("Sophie Bennett", "555-203-3015", 4, "Could consider in 6-9 months", 220, "initial_contact", 27, 2, "follow-up", "Might move if job changes", "No urgency signals yet."),
-    ]
-
-    def lead_tuple(record: dict) -> tuple:
-        phone_digits = "".join(ch for ch in record["phone"] if ch.isdigit())
-        address = record.get("address") or (
-            f"{100 + int(phone_digits[-3:])} Oakridge Ave, Dallas, TX "
-            f"{75000 + (int(phone_digits[-3:]) % 900):05d}"
-        )
-        timeline = (
-            f"{record['timeline']}. Address: {address}. "
-            f"Situation: {record['situation']}. Notes: {record['notes']}"
-        )
-        return (
-            record["name"],
-            record["phone"],
-            record["status"],
-            record["motivation"],
-            timeline,
-            record["timeline_days"],
-            today,
-            today,
-            record["touch_count"],
-            record["last_strategy"],
-            record["stage"],
-            record["probability"],
-        )
-
-    def warm_or_cold_record(row: tuple, status: str) -> dict:
-        (
-            name,
-            phone,
-            motivation,
-            timeline,
-            timeline_days,
-            stage,
-            probability,
-            touch_count,
-            last_strategy,
-            situation,
-            notes,
-        ) = row
-        return {
-            "name": name,
-            "phone": phone,
-            "status": status,
-            "motivation": motivation,
-            "timeline": timeline,
-            "timeline_days": timeline_days,
-            "stage": stage,
-            "probability": probability,
-            "touch_count": touch_count,
-            "last_strategy": last_strategy,
-            "situation": situation,
-            "notes": notes,
-        }
-
-    all_records = hot_leads + [warm_or_cold_record(r, "warm") for r in warm_leads] + [warm_or_cold_record(r, "cold") for r in cold_leads]
-    for rec in all_records:
-        digits = re.sub(r"\D", "", rec["phone"])
+    def normalize_seed_phone(raw: str) -> str | None:
+        digits = re.sub(r"\D", "", raw or "")
         if len(digits) != 10:
-            raise ValueError(f"Seed phone must contain 10 digits: {rec['name']} -> {rec['phone']}")
+            return None
+        return f"{digits[0:3]}-{digits[3:6]}-{digits[6:10]}"
+
+    def make_address(row: dict[str, Any]) -> str:
+        parts = [row["address1"].strip(), row["city"].strip(), row["state"].strip()]
+        return ", ".join([p for p in parts if p])
+
+    records: list[dict[str, Any]] = []
+    for idx, row in enumerate(raw_rows, start=1):
+        full_name = f"{row['first']} {row['last']}".strip()
+        if idx <= 5:
+            status = "hot"
+            motivation = 7 + (idx % 3)
+            stage = "negotiating"
+            timeline_days = 30 - idx
+            timeline_text = "Wants to sell this month"
+            probability = 72 + idx
+            touch_count = 4
+            last_strategy = "call"
+        elif idx <= 15:
+            status = "warm"
+            motivation = 4 + (idx % 3)
+            stage = "qualifying"
+            timeline_days = 60 + idx
+            timeline_text = "Considering options in the next 2-4 months"
+            probability = 42 + idx
+            touch_count = 2
+            last_strategy = "follow-up"
+        else:
+            status = "cold"
+            motivation = 2 + (idx % 3)
+            stage = "initial_contact"
+            timeline_days = 180 + idx
+            timeline_text = "No immediate timeline to sell"
+            probability = min(35, 10 + idx)
+            touch_count = 1
+            last_strategy = "value-based"
+
+        normalized = [normalize_seed_phone(p) for p in row["phones"]]
+        phone = normalized[0] or f"555-3{idx // 100}{(idx // 10) % 10}-{idx:04d}"
+        alt_phones = [p for p in normalized[1:] if p]
+        alt_phone_note = f" Alt phones: {', '.join(alt_phones)}." if alt_phones else ""
+        email_note = f" Email: {row['email']}." if row["email"] else ""
+
+        records.append(
+            {
+                "name": full_name,
+                "phone": phone,
+                "status": status,
+                "motivation": motivation,
+                "timeline": (
+                    f"{timeline_text}. Address: {make_address(row)}. Situation: imported lead. "
+                    f"Notes: seeded from provided list.{email_note}{alt_phone_note}"
+                ),
+                "timeline_days": timeline_days,
+                "stage": stage,
+                "probability": probability,
+                "touch_count": touch_count,
+                "last_strategy": last_strategy,
+            }
+        )
 
     with get_conn(db_path) as conn:
         existing = conn.execute("SELECT COUNT(*) AS c FROM leads").fetchone()["c"]
-        if existing:
+        if existing and not replace_existing:
             return
+        if replace_existing:
+            conn.execute("DELETE FROM interactions")
+            conn.execute("DELETE FROM performance_logs")
+            conn.execute("DELETE FROM leads")
 
         conn.executemany(
             """
@@ -303,44 +217,51 @@ def seed_sample_data(db_path: Path = DB_PATH) -> None:
                 conversation_stage, deal_probability
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            [lead_tuple(record) for record in all_records],
+            [
+                (
+                    r["name"],
+                    r["phone"],
+                    r["status"],
+                    r["motivation"],
+                    r["timeline"],
+                    r["timeline_days"],
+                    today,
+                    today,
+                    r["touch_count"],
+                    r["last_strategy"],
+                    r["stage"],
+                    r["probability"],
+                )
+                for r in records
+            ],
         )
 
         leads_by_name = {row["name"]: row["id"] for row in conn.execute("SELECT id, name FROM leads").fetchall()}
-
         interactions_data: list[tuple[int, str, str, str, str]] = []
 
-        # Hot interactions: 4-6 each with strong intent language.
-        for record in hot_leads:
-            for type_, content, direction, minutes_ago in record["interactions"]:
-                ts = (now - timedelta(minutes=minutes_ago)).isoformat(timespec="seconds")
-                interactions_data.append((leads_by_name[record["name"]], type_, content, ts, direction))
-
-        # Warm interactions: 3-5 each with mixed signals.
-        for idx, row in enumerate(warm_leads):
-            rec = warm_or_cold_record(row, "warm")
+        for idx, rec in enumerate(records, start=1):
             lead_id = leads_by_name[rec["name"]]
-            base = 6500 + (idx * 120)
-            interactions_data.extend(
-                [
-                    (lead_id, "text", f"Hi {rec['name'].split()[0]}, are you still considering selling?", (now - timedelta(minutes=base)).isoformat(timespec="seconds"), "outbound"),
-                    (lead_id, "text", "I might sell soon, still exploring options.", (now - timedelta(minutes=base - 80)).isoformat(timespec="seconds"), "inbound"),
-                    (lead_id, "text", "No rush—want me to share a simple value range?", (now - timedelta(minutes=base - 600)).isoformat(timespec="seconds"), "outbound"),
-                ]
-            )
-            if idx % 2 == 0:
-                interactions_data.append((lead_id, "text", "Maybe. I need a little more time to decide.", (now - timedelta(minutes=base - 760)).isoformat(timespec="seconds"), "inbound"))
-
-        # Cold interactions: 1-3 each with weak engagement/ghosting patterns.
-        for idx, row in enumerate(cold_leads):
-            rec = warm_or_cold_record(row, "cold")
-            lead_id = leads_by_name[rec["name"]]
-            base = 8200 + (idx * 90)
-            interactions_data.append((lead_id, "text", f"Hey {rec['name'].split()[0]}, still open to discussing your property options?", (now - timedelta(minutes=base)).isoformat(timespec="seconds"), "outbound"))
-            if idx % 3 != 1:
-                interactions_data.append((lead_id, "text", "Just exploring, nothing urgent right now.", (now - timedelta(minutes=base - 70)).isoformat(timespec="seconds"), "inbound"))
-            if idx % 4 == 0:
-                interactions_data.append((lead_id, "text", "Totally fine—I can check back later in the year.", (now - timedelta(minutes=base - 500)).isoformat(timespec="seconds"), "outbound"))
+            first_name = rec["name"].split()[0]
+            base = 500 + idx * 9
+            if rec["status"] == "hot":
+                interactions_data.extend(
+                    [
+                        (lead_id, "text", f"Hi {first_name}, can you share your target close date?", (now - timedelta(minutes=base + 60)).isoformat(timespec="seconds"), "outbound"),
+                        (lead_id, "text", "I need to move quickly. What can you offer?", (now - timedelta(minutes=base + 40)).isoformat(timespec="seconds"), "inbound"),
+                        (lead_id, "call", "Reviewed condition and fast-close options.", (now - timedelta(minutes=base)).isoformat(timespec="seconds"), "outbound"),
+                    ]
+                )
+            elif rec["status"] == "warm":
+                interactions_data.extend(
+                    [
+                        (lead_id, "text", f"Hey {first_name}, still thinking about selling?", (now - timedelta(minutes=base + 45)).isoformat(timespec="seconds"), "outbound"),
+                        (lead_id, "text", "Possibly, still reviewing options.", (now - timedelta(minutes=base)).isoformat(timespec="seconds"), "inbound"),
+                    ]
+                )
+            else:
+                interactions_data.append(
+                    (lead_id, "text", f"Hi {first_name}, checking in if timing has changed on your property.", (now - timedelta(minutes=base)).isoformat(timespec="seconds"), "outbound")
+                )
 
         conn.executemany(
             "INSERT INTO interactions (lead_id, type, content, timestamp, direction) VALUES (?,?,?,?,?)",
