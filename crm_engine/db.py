@@ -89,7 +89,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
         )
 
 
-def seed_sample_data(db_path: Path = DB_PATH) -> None:
+def seed_sample_data(db_path: Path = DB_PATH, replace_existing: bool = False) -> None:
     today = date.today().isoformat()
     now = datetime.utcnow()
 
@@ -201,9 +201,13 @@ def seed_sample_data(db_path: Path = DB_PATH) -> None:
         )
 
     with get_conn(db_path) as conn:
-        conn.execute("DELETE FROM interactions")
-        conn.execute("DELETE FROM performance_logs")
-        conn.execute("DELETE FROM leads")
+        existing = conn.execute("SELECT COUNT(*) AS c FROM leads").fetchone()["c"]
+        if existing and not replace_existing:
+            return
+        if replace_existing:
+            conn.execute("DELETE FROM interactions")
+            conn.execute("DELETE FROM performance_logs")
+            conn.execute("DELETE FROM leads")
 
         conn.executemany(
             """
