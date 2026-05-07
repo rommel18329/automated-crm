@@ -20,3 +20,4 @@ include = ["crm_engine*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

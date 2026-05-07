@@ -18,18 +18,36 @@ div[data-testid="stAppViewContainer"] .main .block-container {
     padding-top: 1rem !important;
 }
 
-.big-title {
-    font-size: 48px !important;
-    font-weight: 800 !important;
-    line-height: 1.1 !important;
-    margin-bottom: 0.5rem !important;
+div[data-testid="stButton"] button[kind="secondary"] {
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+}
+
+div[data-testid="stButton"] button#home_dashboard_button {
+    font-size: 32px !important;
+    font-weight: 700 !important;
+    text-align: left !important;
+    color: black !important;
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+    cursor: pointer !important;
 }
 </style>
 """, unsafe_allow_html=True)
-st.markdown(
-    '<div class="big-title">Silverline Investment Group 🌿</div>',
-    unsafe_allow_html=True
-)
+
+title_col1, title_col2 = st.columns([8, 1])
+
+with title_col1:
+    if st.button(
+        "Silverline Investment Group 🌿",
+        key="home_dashboard_button",
+        use_container_width=False
+    ):
+        st.session_state["current_page"] = "dashboard"
+        st.session_state["page"] = "dashboard"
+        st.rerun()
 
 THEME_CSS = """
 <style>
@@ -221,6 +239,20 @@ def nav_to(page: str, lead_id: int | None = None) -> None:
     st.rerun()
 
 
+def go_to_call_list() -> None:
+    st.session_state["current_page"] = "call_list"
+    st.session_state["page"] = "call_list"
+    st.rerun()
+
+
+def open_lead_from_search(lead_id: int) -> None:
+    st.session_state["current_page"] = "leads"
+    st.session_state["page"] = "leads"
+    st.session_state["selected_lead_id"] = lead_id
+    st.session_state["lead_list_collapsed"] = True
+    st.rerun()
+
+
 def render_global_search(leads: list[dict]) -> None:
     if "quick_search_value" not in st.session_state:
         st.session_state["quick_search_value"] = ""
@@ -248,8 +280,12 @@ def render_global_search(leads: list[dict]) -> None:
             return
         for lead in matches:
             item, address_text = lead
-            if st.button(f"{item['name']} · {address_text}", key=f"quick_pick_{item['id']}"):
-                nav_to("Leads", item["id"])
+            st.button(
+                f"{item['name']} · {address_text}",
+                key=f"quick_search_{item['id']}",
+                on_click=open_lead_from_search,
+                args=(item["id"],),
+            )
 
 
 def get_all_leads() -> list[dict]:
@@ -429,8 +465,13 @@ def advanced_metrics(leads: list[dict], interactions: list[dict]) -> dict[str, s
     }
 
 
+def toggle_call_completed(lead_id: int) -> None:
+    current = st.session_state["completed_calls"].get(lead_id, False)
+    st.session_state["completed_calls"][lead_id] = not current
+
+
 def completion_counts(call_list: list[dict]) -> tuple[int, int]:
-    completed = sum(1 for entry in call_list if st.session_state.get(f"done_{entry['lead_id']}", False))
+    completed = sum(1 for entry in call_list if st.session_state["completed_calls"].get(entry["lead_id"], False))
     remaining = max(0, len(call_list) - completed)
     return completed, remaining
 
@@ -621,8 +662,8 @@ if "page" in query_params:
     st.session_state["page"] = query_params["page"]
 if "lead_list_collapsed" not in st.session_state:
     st.session_state["lead_list_collapsed"] = False
-if "call_completed" not in st.session_state:
-    st.session_state["call_completed"] = {}
+if "completed_calls" not in st.session_state:
+    st.session_state["completed_calls"] = {}
 head_left, head_right = st.columns([4, 1.7])
 with head_left:
     st.empty()
@@ -688,22 +729,22 @@ if page == "dashboard":
     calls_remaining_today = max(0, hot_total - calls_completed_today)
     overdue_items = overdue_followups(all_leads)
     overdue_count = len(overdue_items)
-    hot_not_contacted = hot_not_contacted_today(all_leads, all_interactions)
     waiting_approval = followups_waiting_approval(result["followup_queue"], all_interactions)
 
     st.markdown("### Today’s Priorities")
     pcols = st.columns(5)
-    if pcols[0].button(f"Calls remaining today: {calls_remaining_today}", key="prio_calls_remaining"):
-        nav_to("Call List")
+    pcols[0].button(
+        f"Calls remaining today: {calls_remaining_today}",
+        key="calls_remaining_today_button",
+        on_click=go_to_call_list,
+    )
     if pcols[1].button(f"Calls completed today: {calls_completed_today}", key="prio_calls_completed"):
         nav_to("Call List")
     overdue_label = f"🔴 Overdue follow-ups: {overdue_count}" if overdue_count > 0 else f"Overdue follow-ups: {overdue_count}"
     if pcols[2].button(overdue_label, key="prio_overdue"):
         st.session_state["followup_overdue_only"] = True
         nav_to("Follow-ups")
-    if pcols[3].button(f"Hot leads not contacted today: {len(hot_not_contacted)}", key="prio_hot_not_contacted"):
-        st.session_state["lead_focus_ids"] = [lead["id"] for lead in hot_not_contacted]
-        nav_to("Leads")
+    pcols[3].empty()
     if pcols[4].button(f"Follow-ups waiting approval: {waiting_approval}", key="prio_waiting_approval"):
         st.session_state["followup_overdue_only"] = False
         nav_to("Follow-ups")
@@ -830,14 +871,20 @@ elif page == "call_list":
     with st.container(height=640):
         for entry in call_list:
             lid = entry["lead_id"]
-            done_key = f"done_{lid}"
             lead = lead_lookup.get(lid)
             _, address_text, situation, _ = parse_timeline_parts(lead["timeline"] if lead else "")
             row_left, row_right = st.columns([5, 1])
             if row_left.button(entry["name"], key=f"open_name_{lid}", type="tertiary", use_container_width=True):
                 nav_to("Leads", lid)
             row_left.caption(address_text)
-            checked = row_right.checkbox("", key=done_key, label_visibility="collapsed")
+            row_right.checkbox(
+                "",
+                value=st.session_state["completed_calls"].get(lid, False),
+                key=f"call_complete_{lid}",
+                on_change=toggle_call_completed,
+                args=(lid,),
+                label_visibility="collapsed",
+            )
             completed, remaining = completion_counts(call_list)
             completed_calls_today = completed
             pct_complete = int((completed_calls_today / max(1, total_calls_today)) * 100)
