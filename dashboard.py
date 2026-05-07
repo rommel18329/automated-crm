@@ -231,6 +231,7 @@ def nav_to(page: str, lead_id: int | None = None) -> None:
     }
     normalized = page_map.get(page, page)
     st.session_state["page"] = normalized
+    st.query_params["page"] = normalized
     if normalized == "leads" and lead_id is None:
         st.session_state["lead_list_collapsed"] = False
     if lead_id is not None:
@@ -466,8 +467,7 @@ def advanced_metrics(leads: list[dict], interactions: list[dict]) -> dict[str, s
 
 
 def toggle_call_completed(lead_id: int) -> None:
-    current = st.session_state["completed_calls"].get(lead_id, False)
-    st.session_state["completed_calls"][lead_id] = not current
+    st.session_state["completed_calls"][lead_id] = st.session_state.get(f"call_complete_{lead_id}", False)
 
 
 def completion_counts(call_list: list[dict]) -> tuple[int, int]:
@@ -877,10 +877,13 @@ elif page == "call_list":
             if row_left.button(entry["name"], key=f"open_name_{lid}", type="tertiary", use_container_width=True):
                 nav_to("Leads", lid)
             row_left.caption(address_text)
+            call_key = f"call_complete_{lid}"
+            if call_key not in st.session_state:
+                st.session_state[call_key] = st.session_state["completed_calls"].get(lid, False)
             row_right.checkbox(
                 "",
                 value=st.session_state["completed_calls"].get(lid, False),
-                key=f"call_complete_{lid}",
+                key=call_key,
                 on_change=toggle_call_completed,
                 args=(lid,),
                 label_visibility="collapsed",
