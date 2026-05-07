@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "automated-crm"
+version = "0.1.0"
+description = "Local CRM + lead decision & escalation engine for real estate follow-up"
+requires-python = ">=3.10"
+dependencies = [
+  "streamlit>=1.35",
+  "openai>=1.0.0",
+]
+
+[project.scripts]
+crm = "crm_engine.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["crm_engine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
