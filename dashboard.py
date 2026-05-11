@@ -25,7 +25,7 @@ div[data-testid="stButton"] button[kind="secondary"] {
 }
 
 div[data-testid="stButton"] button#home_dashboard_button {
-    font-size: 32px !important;
+    font-size: 20px !important;
     font-weight: 700 !important;
     text-align: left !important;
     color: black !important;
@@ -510,6 +510,23 @@ def auto_save_field(lead_id: int, field: str, key: str) -> None:
     db.update_lead(lead_id, {field: st.session_state[key]})
 
 
+def save_timeline(lead_id: int, key: str) -> None:
+    """Save the editable timeline prefix while preserving Address/Situation/Notes parts."""
+    new_prefix = st.session_state[key].strip()
+    lead = db.fetch_lead(lead_id)
+    if not lead:
+        return
+    _, address, situation, notes = parse_timeline_parts(lead["timeline"] or "")
+    parts = [new_prefix] if new_prefix else []
+    if address:
+        parts.append(f"Address: {address}")
+    if situation:
+        parts.append(f"Situation: {situation}")
+    if notes:
+        parts.append(f"Notes: {notes}")
+    db.update_lead(lead_id, {"timeline": ". ".join(parts)})
+
+
 def render_notes(lead_id: int, interactions: list[dict]) -> None:
     st.markdown("**Notes**")
     notes = [i for i in interactions if i["type"] == "note"]
@@ -574,10 +591,12 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
     c_top3.markdown(f"**Address:** {address_text}")
 
     c_edit1, c_edit2, c_edit3 = st.columns(3)
+    _status_opts = ["hot", "warm", "cold", "dead", "contract"]
+    _status_idx = _status_opts.index(lead["status"]) if lead["status"] in _status_opts else 0
     c_edit1.selectbox(
         "Status",
-        ["hot", "warm", "cold"],
-        index=["hot", "warm", "cold"].index(lead["status"]),
+        _status_opts,
+        index=_status_idx,
         key=f"status_{lead_id}",
         on_change=update_status,
         args=(lead_id, f"status_{lead_id}"),
@@ -595,8 +614,8 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
         "Timeline",
         value=timeline_text,
         key=f"timeline_{lead_id}",
-        on_change=auto_save_field,
-        args=(lead_id, "timeline", f"timeline_{lead_id}"),
+        on_change=save_timeline,
+        args=(lead_id, f"timeline_{lead_id}"),
     )
 
     left, right = st.columns([1.2, 1])
@@ -882,7 +901,6 @@ elif page == "call_list":
                 st.session_state[call_key] = st.session_state["completed_calls"].get(lid, False)
             row_right.checkbox(
                 "",
-                value=st.session_state["completed_calls"].get(lid, False),
                 key=call_key,
                 on_change=toggle_call_completed,
                 args=(lid,),
