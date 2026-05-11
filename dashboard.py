@@ -91,7 +91,14 @@ html, body, [data-testid="stAppViewContainer"] {
 .msg-time{font-size:.73rem;color:#808080;margin-bottom:2px;}
 h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {display:none !important;}
 [data-testid="stSidebar"] {background-color: #EDEAE5 !important;}
-[data-testid="stSidebar"] * {color: #2E2E2E !important;}
+[data-testid="stSidebar"], [data-testid="stSidebar"] p,
+[data-testid="stSidebar"] span, [data-testid="stSidebar"] a,
+[data-testid="stSidebar"] div {color: #2E2E2E !important;}
+input, textarea, [data-baseweb="select"] * {color: #2E2E2E !important;}
+[data-baseweb="input"] input, [data-baseweb="textarea"] textarea {
+  background-color: #ffffff !important;
+  color: #2E2E2E !important;
+}
 .tooltip-wrap{position:relative;display:inline-flex;align-items:center;gap:6px;}
 .tooltip-icon{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border:1px solid #8b8b8b;border-radius:50%;font-size:11px;line-height:1;color:#5d5d5d;cursor:default;}
 .tooltip-tip{visibility:hidden;opacity:0;transition:opacity .15s;position:absolute;z-index:20;left:20px;top:-6px;background:#222;color:#fff;padding:6px 8px;border-radius:6px;font-size:12px;white-space:nowrap;}
