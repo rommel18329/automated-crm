@@ -104,6 +104,22 @@ input, textarea, [data-baseweb="select"] * {color: #2E2E2E !important;}
 .tooltip-tip{visibility:hidden;opacity:0;transition:opacity .15s;position:absolute;z-index:20;left:20px;top:-6px;background:#222;color:#fff;padding:6px 8px;border-radius:6px;font-size:12px;white-space:nowrap;}
 .tooltip-wrap:hover .tooltip-tip{visibility:visible;opacity:1;}
 .quick-search-wrap {margin-top: -34px;}
+[data-testid="stSidebar"] [data-testid="stButton"] button {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  color: #444 !important;
+  font-size: 16px !important;
+  font-weight: 400 !important;
+  padding: 4px 0 !important;
+  text-align: left !important;
+  width: 100% !important;
+}
+[data-testid="stSidebar"] [data-testid="stButton"] button:hover {
+  color: #000 !important;
+  font-weight: 600 !important;
+  background: transparent !important;
+}
 [data-testid="stSidebar"] [data-baseweb="tab-list"]{
   gap:2px;
   display:flex;
@@ -808,19 +824,13 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     st.markdown("### 🌿 Navigation")
 
-    def nav_item(label: str, key: str) -> None:
-        is_active = st.session_state["page"] == key
-        class_name = "nav-item nav-active" if is_active else "nav-item"
-        st.markdown(
-            f"""
-            <div class="{class_name}">
-                <a href="/?page={key}" target="_self" style="text-decoration:none; color:inherit;">
-                    {label}
-                </a>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+    def nav_item(label: str, page_key: str) -> None:
+        is_active = st.session_state["page"] == page_key
+        if is_active:
+            st.markdown(f"<div class='nav-item nav-active'>{label}</div>", unsafe_allow_html=True)
+        else:
+            if st.button(label, key=f"nav_btn_{page_key}", use_container_width=True):
+                nav_to(page_key)
 
     nav_item("Dashboard", "dashboard")
     nav_item("Leads", "leads")
