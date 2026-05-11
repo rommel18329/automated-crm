@@ -25,7 +25,7 @@ div[data-testid="stButton"] button[kind="secondary"] {
 }
 
 div[data-testid="stButton"] button#home_dashboard_button {
-    font-size: 32px !important;
+    font-size: 24px !important;
     font-weight: 700 !important;
     text-align: left !important;
     color: black !important;
@@ -90,6 +90,15 @@ html, body, [data-testid="stAppViewContainer"] {
 .msg-bubble-out{background:#dff0ff;padding:8px 10px;border-radius:14px;max-width:78%;}
 .msg-time{font-size:.73rem;color:#808080;margin-bottom:2px;}
 h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {display:none !important;}
+[data-testid="stSidebar"] {background-color: #EDEAE5 !important;}
+[data-testid="stSidebar"], [data-testid="stSidebar"] p,
+[data-testid="stSidebar"] span, [data-testid="stSidebar"] a,
+[data-testid="stSidebar"] div {color: #2E2E2E !important;}
+input, textarea, [data-baseweb="select"] * {color: #2E2E2E !important;}
+[data-baseweb="input"] input, [data-baseweb="textarea"] textarea {
+  background-color: #ffffff !important;
+  color: #2E2E2E !important;
+}
 .tooltip-wrap{position:relative;display:inline-flex;align-items:center;gap:6px;}
 .tooltip-icon{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border:1px solid #8b8b8b;border-radius:50%;font-size:11px;line-height:1;color:#5d5d5d;cursor:default;}
 .tooltip-tip{visibility:hidden;opacity:0;transition:opacity .15s;position:absolute;z-index:20;left:20px;top:-6px;background:#222;color:#fff;padding:6px 8px;border-radius:6px;font-size:12px;white-space:nowrap;}
@@ -510,6 +519,105 @@ def auto_save_field(lead_id: int, field: str, key: str) -> None:
     db.update_lead(lead_id, {field: st.session_state[key]})
 
 
+def _build_display_result() -> dict:
+    """
+    Read-only dashboard data builder.
+    Uses DB-stored lead status as source of truth so manual overrides
+    (e.g. demoting a lead from hot → warm) are never overwritten on render.
+    engine.evaluate_all_leads() writes suggested_status back to DB on every
+    call — this version evaluates for signals/call-list/follow-ups without
+    any DB writes.
+    """
+    from collections import Counter
+
+    leads = db.fetch_leads()
+    all_ixns: dict = {l["id"]: db.fetch_interactions(l["id"]) for l in leads}
+    leads_with_eval = [
+        (lead, engine.evaluate_lead(lead, all_ixns.get(lead["id"], [])))
+        for lead in leads
+    ]
+
+    # Call list: DB-hot leads only, priority-sorted
+    hot_pairs = [(l, e) for l, e in leads_with_eval if l["status"] == "hot"]
+    sorted_hot = sorted(hot_pairs, key=lambda t: engine._priority_score(*t), reverse=True)
+    call_list = [
+        {
+            "lead_id": l["id"],
+            "name": l["name"],
+            "phone": l["phone"],
+            "priority_score": engine._priority_score(l, e),
+            "intent_signals": e.intent_signals,
+        }
+        for l, e in sorted_hot
+    ]
+
+    # Follow-up queue: non-hot DB leads that are due today or overdue
+    today_str = date.today().isoformat()
+    followups: list = []
+    for lead, evaluation in leads_with_eval:
+        if lead["status"] == "hot":
+            continue
+        next_action = lead.get("next_action_date") or today_str
+        if next_action > today_str:
+            continue
+        ixns = all_ixns.get(lead["id"], [])
+        ignored = engine.ignored_outbound_texts(ixns)
+        last_outbound = next((i for i in ixns if i["direction"] == "outbound"), None)
+        suggestion = generate_followup_message(
+            lead=lead,
+            last_message=last_outbound["content"] if last_outbound else "",
+            ignored_texts=ignored,
+            strong_intent=bool(evaluation.intent_signals),
+        )
+        followups.append({
+            "lead_id": lead["id"],
+            "lead_name": lead["name"],
+            "last_message": last_outbound["content"] if last_outbound else "",
+            "new_message": suggestion.message,
+            "objective": suggestion.objective,
+            "reasoning": suggestion.reasoning,
+            "strategy": suggestion.strategy,
+            "options": ["approve", "edit", "skip", "call instead"],
+            "touch_notice": evaluation.touch_message,
+            "ghosting_signal": evaluation.ghosting_signal,
+        })
+
+    counts = Counter(l["status"] for l in leads if l["status"] in ("hot", "warm", "cold"))
+    risk_leads = [
+        {"lead_id": l["id"], "name": l["name"], "risk": e.ghosting_signal}
+        for l, e in leads_with_eval if e.ghosting_signal
+    ]
+    return {
+        "summary": {
+            "hot": counts["hot"],
+            "warm": counts["warm"],
+            "cold": counts["cold"],
+            "follow_ups": len(followups),
+            "risk_leads": len(risk_leads),
+        },
+        "followup_queue": followups,
+        "call_list": call_list,
+        "risk_leads": risk_leads,
+    }
+
+
+def save_timeline(lead_id: int, key: str) -> None:
+    """Save the editable timeline prefix while preserving Address/Situation/Notes parts."""
+    new_prefix = st.session_state[key].strip()
+    lead = db.fetch_lead(lead_id)
+    if not lead:
+        return
+    _, address, situation, notes = parse_timeline_parts(lead["timeline"] or "")
+    parts = [new_prefix] if new_prefix else []
+    if address:
+        parts.append(f"Address: {address}")
+    if situation:
+        parts.append(f"Situation: {situation}")
+    if notes:
+        parts.append(f"Notes: {notes}")
+    db.update_lead(lead_id, {"timeline": ". ".join(parts)})
+
+
 def render_notes(lead_id: int, interactions: list[dict]) -> None:
     st.markdown("**Notes**")
     notes = [i for i in interactions if i["type"] == "note"]
@@ -574,10 +682,12 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
     c_top3.markdown(f"**Address:** {address_text}")
 
     c_edit1, c_edit2, c_edit3 = st.columns(3)
+    _status_opts = ["hot", "warm", "cold", "dead", "contract"]
+    _status_idx = _status_opts.index(lead["status"]) if lead["status"] in _status_opts else 0
     c_edit1.selectbox(
         "Status",
-        ["hot", "warm", "cold"],
-        index=["hot", "warm", "cold"].index(lead["status"]),
+        _status_opts,
+        index=_status_idx,
         key=f"status_{lead_id}",
         on_change=update_status,
         args=(lead_id, f"status_{lead_id}"),
@@ -595,8 +705,8 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
         "Timeline",
         value=timeline_text,
         key=f"timeline_{lead_id}",
-        on_change=auto_save_field,
-        args=(lead_id, "timeline", f"timeline_{lead_id}"),
+        on_change=save_timeline,
+        args=(lead_id, f"timeline_{lead_id}"),
     )
 
     left, right = st.columns([1.2, 1])
@@ -645,7 +755,7 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
 
 st.markdown(THEME_CSS, unsafe_allow_html=True)
 db.init_db()
-result = engine.evaluate_all_leads()
+result = _build_display_result()
 all_leads = get_all_leads()
 lead_lookup = {lead["id"]: lead for lead in all_leads}
 selected_id = st.session_state.get("selected_lead_id")
@@ -877,17 +987,11 @@ elif page == "call_list":
             if row_left.button(entry["name"], key=f"open_name_{lid}", type="tertiary", use_container_width=True):
                 nav_to("Leads", lid)
             row_left.caption(address_text)
-            call_key = f"call_complete_{lid}"
-            if call_key not in st.session_state:
-                st.session_state[call_key] = st.session_state["completed_calls"].get(lid, False)
-            row_right.checkbox(
-                "",
-                value=st.session_state["completed_calls"].get(lid, False),
-                key=call_key,
-                on_change=toggle_call_completed,
-                args=(lid,),
-                label_visibility="collapsed",
-            )
+            _checked = st.session_state["completed_calls"].get(lid, False)
+            _new = row_right.checkbox("", value=_checked, label_visibility="collapsed")
+            if _new != _checked:
+                st.session_state["completed_calls"][lid] = _new
+                st.rerun()
             completed, remaining = completion_counts(call_list)
             completed_calls_today = completed
             pct_complete = int((completed_calls_today / max(1, total_calls_today)) * 100)
