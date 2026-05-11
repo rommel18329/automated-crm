@@ -987,11 +987,16 @@ elif page == "call_list":
             if row_left.button(entry["name"], key=f"open_name_{lid}", type="tertiary", use_container_width=True):
                 nav_to("Leads", lid)
             row_left.caption(address_text)
-            _checked = st.session_state["completed_calls"].get(lid, False)
-            _new = row_right.checkbox("", value=_checked, label_visibility="collapsed")
-            if _new != _checked:
-                st.session_state["completed_calls"][lid] = _new
-                st.rerun()
+            _call_key = f"call_complete_{lid}"
+            if _call_key not in st.session_state:
+                st.session_state[_call_key] = st.session_state["completed_calls"].get(lid, False)
+            row_right.checkbox(
+                "",
+                key=_call_key,
+                on_change=toggle_call_completed,
+                args=(lid,),
+                label_visibility="collapsed",
+            )
             completed, remaining = completion_counts(call_list)
             completed_calls_today = completed
             pct_complete = int((completed_calls_today / max(1, total_calls_today)) * 100)
