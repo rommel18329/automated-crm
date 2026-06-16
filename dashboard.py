@@ -546,8 +546,20 @@ def render_imessage(items: list[dict], max_items: int | None = None) -> None:
         else:
             label = msg["content"]
 
+        # Audio player for recorded calls / voicemails
+        rec_url = msg.get("recording_url") or ""
+        audio_html = ""
+        if rec_url:
+            # Extract recording SID (last path segment, strip any extension)
+            rec_sid = rec_url.rstrip("/").split("/")[-1].split(".")[0]
+            audio_html = (
+                f"<br><audio controls style='width:100%;margin-top:6px;height:32px'>"
+                f"<source src='http://localhost:5001/recordings/{rec_sid}' type='audio/mpeg'>"
+                f"</audio>"
+            )
+
         st.markdown(
-            f"<div class='msg-row {row}'><div class='{bubble}'>{label}</div></div>",
+            f"<div class='msg-row {row}'><div class='{bubble}'>{label}{audio_html}</div></div>",
             unsafe_allow_html=True,
         )
 

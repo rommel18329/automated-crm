@@ -85,8 +85,42 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 timestamp TEXT NOT NULL,
                 FOREIGN KEY (lead_id) REFERENCES leads (id)
             );
+
+            CREATE TABLE IF NOT EXISTS daily_calls (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id   INTEGER NOT NULL,
+                call_date TEXT NOT NULL,
+                completed INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (lead_id) REFERENCES leads (id),
+                UNIQUE(lead_id, call_date)
+            );
+
+            CREATE TABLE IF NOT EXISTS followup_suggestions (
+                lead_id          INTEGER PRIMARY KEY,
+                message          TEXT NOT NULL,
+                flags            TEXT NOT NULL DEFAULT '[]',
+                tone             TEXT NOT NULL DEFAULT 'warm',
+                interaction_count INTEGER NOT NULL,
+                generated_at     TEXT NOT NULL,
+                FOREIGN KEY (lead_id) REFERENCES leads (id)
+            );
+
+            CREATE TABLE IF NOT EXISTS unmatched_inbox (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone          TEXT NOT NULL,
+                type           TEXT NOT NULL CHECK (type IN ('text','voicemail')),
+                content        TEXT NOT NULL,
+                recording_url  TEXT,
+                timestamp      TEXT NOT NULL,
+                handled        INTEGER NOT NULL DEFAULT 0
+            );
             """
         )
+        # Migration: add recording_url column to interactions if it doesn't exist yet
+        try:
+            conn.execute("ALTER TABLE interactions ADD COLUMN recording_url TEXT")
+        except Exception:
+            pass  # column already exists
 
 
 def seed_sample_data(db_path: Path = DB_PATH, replace_existing: bool = False) -> None:
@@ -493,12 +527,28 @@ def add_interaction(
     direction: str,
     db_path: Path = DB_PATH,
     ts: datetime | None = None,
+    recording_url: str | None = None,
 ) -> None:
     timestamp = (ts or datetime.utcnow()).isoformat(timespec="seconds")
     with get_conn(db_path) as conn:
         conn.execute(
-            "INSERT INTO interactions (lead_id, type, content, timestamp, direction) VALUES (?,?,?,?,?)",
-            (lead_id, type_, content, timestamp, direction),
+            "INSERT INTO interactions (lead_id, type, content, timestamp, direction, recording_url) VALUES (?,?,?,?,?,?)",
+            (lead_id, type_, content, timestamp, direction, recording_url),
+        )
+
+
+def update_call_recording(lead_id: int, recording_url: str, db_path: Path = DB_PATH) -> None:
+    """Attach a recording URL to the most recent call interaction for a lead
+    that doesn't already have one (used when Twilio's recordingStatusCallback fires)."""
+    with get_conn(db_path) as conn:
+        conn.execute(
+            """UPDATE interactions SET recording_url=?
+               WHERE id = (
+                   SELECT id FROM interactions
+                   WHERE lead_id=? AND type='call' AND recording_url IS NULL
+                   ORDER BY timestamp DESC LIMIT 1
+               )""",
+            (recording_url, lead_id),
         )
 
 
@@ -528,6 +578,178 @@ def update_lead(lead_id: int, fields: dict[str, Any], db_path: Path = DB_PATH) -
     params = list(fields.values()) + [lead_id]
     with get_conn(db_path) as conn:
         conn.execute(f"UPDATE leads SET {set_clause} WHERE id=?", params)
+
+
+def fetch_recent_inbound_texts(since_hours: int = 24, db_path: Path = DB_PATH) -> list[dict[str, Any]]:
+    """Return inbound texts received in the last N hours, with lead name."""
+    cutoff = (datetime.utcnow() - __import__("datetime").timedelta(hours=since_hours)).isoformat(timespec="seconds")
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            """SELECT i.id, i.lead_id, i.content, i.timestamp, l.name, l.status
+               FROM interactions i
+               JOIN leads l ON l.id = i.lead_id
+               WHERE i.type='text' AND i.direction='inbound' AND i.timestamp >= ?
+               ORDER BY i.timestamp DESC""",
+            (cutoff,),
+        ).fetchall()
+    return [_to_dict(r) for r in rows]
+
+
+def fetch_unacknowledged_missed_calls(db_path: Path = DB_PATH) -> list[dict[str, Any]]:
+    """Return missed inbound calls that haven't been followed up on yet
+    (no outbound call or text to that lead since the missed call). Stays
+    visible until you call or text them back — does not expire with time."""
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            """SELECT i.id, i.lead_id, i.content, i.timestamp, l.name, l.status, l.phone
+               FROM interactions i
+               JOIN leads l ON l.id = i.lead_id
+               WHERE i.type='note' AND i.direction='inbound'
+                 AND i.content LIKE 'Missed inbound call%'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM interactions o
+                     WHERE o.lead_id = i.lead_id
+                       AND o.direction='outbound'
+                       AND o.type IN ('call', 'text')
+                       AND o.timestamp > i.timestamp
+                 )
+               ORDER BY i.timestamp DESC""",
+        ).fetchall()
+    return [_to_dict(r) for r in rows]
+
+
+def add_unmatched_message(
+    phone: str,
+    type_: str,
+    content: str,
+    db_path: Path = DB_PATH,
+    recording_url: str | None = None,
+    ts: datetime | None = None,
+) -> int:
+    """Log a text or voicemail from a phone number that doesn't match any lead."""
+    timestamp = (ts or datetime.utcnow()).isoformat(timespec="seconds")
+    with get_conn(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO unmatched_inbox (phone, type, content, recording_url, timestamp) VALUES (?,?,?,?,?)",
+            (phone, type_, content, recording_url, timestamp),
+        )
+        return cur.lastrowid
+
+
+def fetch_unmatched_inbox(db_path: Path = DB_PATH, include_handled: bool = False) -> list[dict[str, Any]]:
+    with get_conn(db_path) as conn:
+        if include_handled:
+            rows = conn.execute(
+                "SELECT * FROM unmatched_inbox ORDER BY timestamp DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM unmatched_inbox WHERE handled=0 ORDER BY timestamp DESC"
+            ).fetchall()
+    return [_to_dict(r) for r in rows]
+
+
+def mark_unmatched_handled(unmatched_id: int, db_path: Path = DB_PATH) -> None:
+    with get_conn(db_path) as conn:
+        conn.execute("UPDATE unmatched_inbox SET handled=1 WHERE id=?", (unmatched_id,))
+
+
+def create_lead(
+    name: str,
+    phone: str,
+    db_path: Path = DB_PATH,
+    status: str = "cold",
+    motivation_score: int = 5,
+) -> int:
+    today = date.today().isoformat()
+    with get_conn(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO leads (
+                name, phone, status, motivation_score, timeline, timeline_days,
+                last_contact_date, next_action_date, touch_count, last_strategy_used,
+                conversation_stage, deal_probability
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (name, phone, status, motivation_score, "", None, today, today, 0, None, "initial_contact", 0),
+        )
+        return cur.lastrowid
+
+
+def convert_unmatched_to_lead(unmatched_id: int, name: str, db_path: Path = DB_PATH) -> int:
+    """Create a lead from an unmatched inbox entry, copy its message into the
+    lead's interaction history, and mark the unmatched entry handled."""
+    with get_conn(db_path) as conn:
+        row = conn.execute("SELECT * FROM unmatched_inbox WHERE id=?", (unmatched_id,)).fetchone()
+        if not row:
+            raise ValueError(f"No unmatched inbox entry with id={unmatched_id}")
+        entry = _to_dict(row)
+
+        lead_id = create_lead(name, entry["phone"], db_path)
+
+        ixn_type = "call" if entry["type"] == "voicemail" else "text"
+        content = entry["content"]
+        if entry["type"] == "voicemail" and entry.get("recording_url"):
+            content = f"Voicemail: {content} (recording: {entry['recording_url']})"
+
+        conn.execute(
+            "INSERT INTO interactions (lead_id, type, content, timestamp, direction) VALUES (?,?,?,?,?)",
+            (lead_id, ixn_type, content, entry["timestamp"], "inbound"),
+        )
+        conn.execute("UPDATE unmatched_inbox SET handled=1 WHERE id=?", (unmatched_id,))
+        return lead_id
+
+
+def get_followup_suggestion(lead_id: int, db_path: Path = DB_PATH) -> dict[str, Any] | None:
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM followup_suggestions WHERE lead_id=?", (lead_id,)
+        ).fetchone()
+    return _to_dict(row) if row else None
+
+
+def save_followup_suggestion(
+    lead_id: int,
+    message: str,
+    flags: list[str],
+    tone: str,
+    interaction_count: int,
+    db_path: Path = DB_PATH,
+) -> None:
+    import json as _json
+    with get_conn(db_path) as conn:
+        conn.execute(
+            """INSERT INTO followup_suggestions
+               (lead_id, message, flags, tone, interaction_count, generated_at)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(lead_id) DO UPDATE SET
+                   message=excluded.message, flags=excluded.flags,
+                   tone=excluded.tone, interaction_count=excluded.interaction_count,
+                   generated_at=excluded.generated_at""",
+            (lead_id, message, _json.dumps(flags), tone, interaction_count,
+             datetime.utcnow().isoformat(timespec="seconds")),
+        )
+
+
+def get_daily_call_completions(call_date: str, db_path: Path = DB_PATH) -> set[int]:
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT lead_id FROM daily_calls WHERE call_date=? AND completed=1",
+            (call_date,),
+        ).fetchall()
+    return {r["lead_id"] for r in rows}
+
+
+def set_daily_call_completion(
+    lead_id: int, call_date: str, completed: bool, db_path: Path = DB_PATH
+) -> None:
+    with get_conn(db_path) as conn:
+        conn.execute(
+            """INSERT INTO daily_calls (lead_id, call_date, completed)
+               VALUES (?, ?, ?)
+               ON CONFLICT(lead_id, call_date) DO UPDATE SET completed=excluded.completed""",
+            (lead_id, call_date, int(completed)),
+        )
 
 
 def performance_summary(db_path: Path = DB_PATH) -> dict[str, Any]:
