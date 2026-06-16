@@ -1524,42 +1524,52 @@ elif page == "messages":
     if not _all_calls:
         st.caption("No calls logged yet.")
     else:
-        with st.container(height=360):
-            for _c in _all_calls:
-                _cl = lead_lookup.get(_c["lead_id"])
-                _cl_name = _cl["name"] if _cl else f"Lead #{_c['lead_id']}"
-                _cd, _ct = fmt_date_time(_c["timestamp"])
-                _lcontent = _c["content"].lower()
-                if "missed" in _lcontent:
-                    _icon = "❌"
-                elif _c["direction"] == "inbound":
-                    _icon = "📲"
-                else:
-                    _icon = "📤"
-                _call_preview = (_c["content"][:80] + "…") if len(_c["content"]) > 80 else _c["content"]
-                _if_search = not msg_q or (
-                    msg_q in _cl_name.lower()
-                    or msg_q in _c["content"].lower()
-                )
-                if not _if_search:
-                    continue
+        for _c in _all_calls:
+            _cl = lead_lookup.get(_c["lead_id"])
+            _cl_name = _cl["name"] if _cl else f"Lead #{_c['lead_id']}"
+            _cd, _ct = fmt_date_time(_c["timestamp"])
+            _lcontent = _c["content"].lower()
+            if "missed" in _lcontent:
+                _icon = "❌"
+            elif "voicemail" in _lcontent:
+                _icon = "📨"
+            elif _c["direction"] == "inbound":
+                _icon = "📲"
+            else:
+                _icon = "📤"
+            _call_preview = (_c["content"][:100] + "…") if len(_c["content"]) > 100 else _c["content"]
+            _if_search = not msg_q or (
+                msg_q in _cl_name.lower()
+                or msg_q in _c["content"].lower()
+            )
+            if not _if_search:
+                continue
+
+            _rec_url = _c.get("recording_url") or ""
+            _has_rec = bool(_rec_url)
+
+            # Row: icon + name/preview + timestamp + open-thread button
+            _cr1, _cr2, _cr3 = st.columns([0.4, 6, 1.6])
+            _cr1.markdown(f"<div style='font-size:1.4rem;padding-top:4px'>{_icon}</div>", unsafe_allow_html=True)
+            with _cr2:
                 st.markdown(
-                    f"<div class='call-row'>"
-                    f"<span class='call-icon'>{_icon}</span>"
-                    f"<div class='call-meta'>"
-                    f"<div class='call-name'>{_cl_name}</div>"
-                    f"<div class='call-preview'>{_call_preview}</div>"
-                    f"</div>"
-                    f"<span class='call-ts'>{_cd}<br>{_ct}</span>"
-                    f"</div>",
+                    f"<div style='font-weight:600;font-size:.95rem'>{_cl_name}</div>"
+                    f"<div style='font-size:.82rem;color:#555'>{_call_preview}</div>",
                     unsafe_allow_html=True,
                 )
+                if _has_rec:
+                    _rec_sid = _rec_url.rstrip("/").split("/")[-1].split(".")[0]
+                    st.markdown(
+                        f"<audio controls style='width:100%;height:32px;margin-top:4px'>"
+                        f"<source src='http://localhost:5001/recordings/{_rec_sid}' type='audio/mpeg'>"
+                        f"</audio>",
+                        unsafe_allow_html=True,
+                    )
+            with _cr3:
+                st.caption(f"{_cd} {_ct}")
                 if _cl:
-                    _open_col1, _open_col2 = st.columns([2, 5])
-                    if _open_col1.button(
-                        "Open thread",
-                        key=f"msg_call_open_{_c['id']}",
-                        type="tertiary",
-                    ):
+                    if st.button("Open thread", key=f"msg_call_open_{_c['id']}", type="tertiary"):
                         st.session_state["msg_selected_lead"] = _cl["id"]
                         st.rerun()
+
+            st.divider()
