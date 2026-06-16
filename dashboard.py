@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import base64
 import time
 
@@ -8,7 +8,7 @@ import streamlit as st
 
 from crm_engine import db, engine
 from crm_engine.followup_engine import generate_followup_message
-from crm_engine.messaging_gateway import send_sms
+from crm_engine.messaging_gateway import send_sms, place_call
 
 st.set_page_config(page_title="Silverline Investment Group", layout="wide")
 st.markdown("""
@@ -86,9 +86,9 @@ html, body, [data-testid="stAppViewContainer"] {
 .msg-row{display:flex;margin:8px 0;}
 .msg-left{justify-content:flex-start;}
 .msg-right{justify-content:flex-end;}
-.msg-bubble-in{background:#fff;border:1px solid #eee;padding:8px 10px;border-radius:14px;max-width:78%;}
-.msg-bubble-out{background:#dff0ff;padding:8px 10px;border-radius:14px;max-width:78%;}
-.msg-time{font-size:.73rem;color:#808080;margin-bottom:2px;}
+.msg-bubble-in{background:#e5e5ea;padding:8px 12px;border-radius:18px 18px 18px 4px;max-width:75%;color:#000;font-size:0.95rem;line-height:1.4;}
+.msg-bubble-out{background:#0b93f6;padding:8px 12px;border-radius:18px 18px 4px 18px;max-width:75%;color:#fff;font-size:0.95rem;line-height:1.4;}
+.msg-time{font-size:.70rem;color:#8e8e93;margin-bottom:3px;text-align:center;width:100%;}
 h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {display:none !important;}
 [data-testid="stSidebar"] {background-color: #EDEAE5 !important;}
 [data-testid="stSidebar"], [data-testid="stSidebar"] p,
@@ -104,6 +104,22 @@ input, textarea, [data-baseweb="select"] * {color: #2E2E2E !important;}
 .tooltip-tip{visibility:hidden;opacity:0;transition:opacity .15s;position:absolute;z-index:20;left:20px;top:-6px;background:#222;color:#fff;padding:6px 8px;border-radius:6px;font-size:12px;white-space:nowrap;}
 .tooltip-wrap:hover .tooltip-tip{visibility:visible;opacity:1;}
 .quick-search-wrap {margin-top: -34px;}
+[data-testid="stSidebar"] [data-testid="stButton"] button {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  color: #444 !important;
+  font-size: 16px !important;
+  font-weight: 400 !important;
+  padding: 4px 0 !important;
+  text-align: left !important;
+  width: 100% !important;
+}
+[data-testid="stSidebar"] [data-testid="stButton"] button:hover {
+  color: #000 !important;
+  font-weight: 600 !important;
+  background: transparent !important;
+}
 [data-testid="stSidebar"] [data-baseweb="tab-list"]{
   gap:2px;
   display:flex;
@@ -143,10 +159,17 @@ input, textarea, [data-baseweb="select"] * {color: #2E2E2E !important;}
 .typing-dot:nth-child(2){animation-delay:.2s;}
 .typing-dot:nth-child(3){animation-delay:.4s;}
 @keyframes blink{0%,80%,100%{opacity:.3;}40%{opacity:1;}}
+.thread-sel{background:#e8f0ea!important;border-left:3px solid #6B8F71!important;border-radius:6px!important;font-weight:700!important;}
+.call-row{display:flex;align-items:flex-start;gap:10px;padding:8px 0;border-bottom:1px solid #eee;}
+.call-icon{font-size:1.3rem;flex-shrink:0;}
+.call-meta{flex:1;min-width:0;}
+.call-name{font-weight:600;font-size:.95rem;}
+.call-preview{font-size:.82rem;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.call-ts{font-size:.78rem;color:#888;white-space:nowrap;flex-shrink:0;}
 </style>
 """
 
-PAGES = ["Dashboard", "Leads", "Call List", "Follow-ups"]
+PAGES = ["Dashboard", "Leads", "Call List", "Follow-ups", "Messages"]
 
 
 def info_icon(text: str, tip: str) -> str:
@@ -243,6 +266,7 @@ def nav_to(page: str, lead_id: int | None = None) -> None:
     st.query_params["page"] = normalized
     if normalized == "leads" and lead_id is None:
         st.session_state["lead_list_collapsed"] = False
+        st.session_state.pop("selected_lead_id", None)
     if lead_id is not None:
         st.session_state["selected_lead_id"] = lead_id
         st.session_state["lead_list_collapsed"] = True
@@ -252,7 +276,6 @@ def nav_to(page: str, lead_id: int | None = None) -> None:
 def go_to_call_list() -> None:
     st.session_state["current_page"] = "call_list"
     st.session_state["page"] = "call_list"
-    st.rerun()
 
 
 def open_lead_from_search(lead_id: int) -> None:
@@ -260,7 +283,6 @@ def open_lead_from_search(lead_id: int) -> None:
     st.session_state["page"] = "leads"
     st.session_state["selected_lead_id"] = lead_id
     st.session_state["lead_list_collapsed"] = True
-    st.rerun()
 
 
 def render_global_search(leads: list[dict]) -> None:
@@ -291,7 +313,7 @@ def render_global_search(leads: list[dict]) -> None:
         for lead in matches:
             item, address_text = lead
             st.button(
-                f"{item['name']} · {address_text}",
+                item["name"],
                 key=f"quick_search_{item['id']}",
                 on_click=open_lead_from_search,
                 args=(item["id"],),
@@ -476,7 +498,9 @@ def advanced_metrics(leads: list[dict], interactions: list[dict]) -> dict[str, s
 
 
 def toggle_call_completed(lead_id: int) -> None:
-    st.session_state["completed_calls"][lead_id] = st.session_state.get(f"call_complete_{lead_id}", False)
+    completed = st.session_state.get(f"call_complete_{lead_id}", False)
+    st.session_state["completed_calls"][lead_id] = completed
+    db.set_daily_call_completion(lead_id, date.today().isoformat(), completed)
 
 
 def completion_counts(call_list: list[dict]) -> tuple[int, int]:
@@ -485,30 +509,54 @@ def completion_counts(call_list: list[dict]) -> tuple[int, int]:
     return completed, remaining
 
 
-def render_imessage(items: list[dict], max_items: int = 10) -> None:
-    for msg in items[:max_items]:
-        d, t = fmt_date_time(msg["timestamp"])
-        ts = f"{d} • {t}"
+def render_imessage(items: list[dict], max_items: int | None = None) -> None:
+    if max_items is None:
+        max_items = len(items)
+    # Show the most recent max_items (items are sorted oldest→newest)
+    recent = items[-max_items:]
+    last_ts = None
+    for msg in recent:
+        try:
+            msg_dt = datetime.fromisoformat(msg["timestamp"])
+        except Exception:
+            msg_dt = None
+
+        # Show centered timestamp when gap > 5 min or first message
+        if msg_dt:
+            show_ts = (last_ts is None) or ((msg_dt - last_ts).total_seconds() > 300)
+            last_ts = msg_dt
+        else:
+            show_ts = True
+
+        if show_ts and msg_dt:
+            d, t = fmt_date_time(msg["timestamp"])
+            ts_label = f"{d} • {t}"
+            st.markdown(
+                f"<div style='text-align:center;font-size:0.70rem;color:#8e8e93;"
+                f"margin:8px 0 4px 0'>{ts_label}</div>",
+                unsafe_allow_html=True,
+            )
+
         outgoing = msg["direction"] == "outbound"
         bubble = "msg-bubble-out" if outgoing else "msg-bubble-in"
         row = "msg-right" if outgoing else "msg-left"
         if msg["type"] == "call":
             prefix = "Outbound Call" if outgoing else "Inbound Call"
-            label = f"{prefix} — {msg['content']}"
+            label = f"{prefix} - {msg['content']}"
         else:
             label = msg["content"]
+
         st.markdown(
-            f"<div class='msg-row {row}'><div><div class='msg-time'>{ts}</div><div class='{bubble}'>{label}</div></div></div>",
+            f"<div class='msg-row {row}'><div class='{bubble}'>{label}</div></div>",
             unsafe_allow_html=True,
         )
 
 
 def lead_conversation_items(lead_id: int) -> list[dict]:
     interactions = db.fetch_interactions(lead_id)
-    return [
-        i for i in interactions
-        if i["type"] == "call" or (i["type"] == "text" and "suggested message approved" in i["content"].lower())
-    ]
+    # Calls and texts only — notes live in the Notes panel, not the conversation
+    items = [i for i in interactions if i["type"] in ("call", "text")]
+    return sorted(items, key=lambda x: x["timestamp"])
 
 
 def update_status(lead_id: int, key: str) -> None:
@@ -563,20 +611,13 @@ def _build_display_result() -> dict:
         ixns = all_ixns.get(lead["id"], [])
         ignored = engine.ignored_outbound_texts(ixns)
         last_outbound = next((i for i in ixns if i["direction"] == "outbound"), None)
-        suggestion = generate_followup_message(
-            lead=lead,
-            last_message=last_outbound["content"] if last_outbound else "",
-            ignored_texts=ignored,
-            strong_intent=bool(evaluation.intent_signals),
-        )
+        # No AI call here — suggestions are generated lazily on the Follow-ups page
         followups.append({
             "lead_id": lead["id"],
             "lead_name": lead["name"],
             "last_message": last_outbound["content"] if last_outbound else "",
-            "new_message": suggestion.message,
-            "objective": suggestion.objective,
-            "reasoning": suggestion.reasoning,
-            "strategy": suggestion.strategy,
+            "ignored_texts": ignored,
+            "strong_intent": bool(evaluation.intent_signals),
             "options": ["approve", "edit", "skip", "call instead"],
             "touch_notice": evaluation.touch_message,
             "ghosting_signal": evaluation.ghosting_signal,
@@ -601,6 +642,22 @@ def _build_display_result() -> dict:
     }
 
 
+def save_address(lead_id: int, key: str) -> None:
+    new_address = st.session_state[key].strip()
+    lead = db.fetch_lead(lead_id)
+    if not lead:
+        return
+    timeline_prefix, _, situation, notes = parse_timeline_parts(lead["timeline"] or "")
+    parts = [timeline_prefix] if timeline_prefix else []
+    if new_address:
+        parts.append(f"Address: {new_address}")
+    if situation:
+        parts.append(f"Situation: {situation}")
+    if notes:
+        parts.append(f"Notes: {notes}")
+    db.update_lead(lead_id, {"timeline": ". ".join(parts)})
+
+
 def save_timeline(lead_id: int, key: str) -> None:
     """Save the editable timeline prefix while preserving Address/Situation/Notes parts."""
     new_prefix = st.session_state[key].strip()
@@ -620,23 +677,46 @@ def save_timeline(lead_id: int, key: str) -> None:
 
 def render_notes(lead_id: int, interactions: list[dict]) -> None:
     st.markdown("**Notes**")
-    notes = [i for i in interactions if i["type"] == "note"]
+    notes = sorted(
+        [i for i in interactions if i["type"] == "note"],
+        key=lambda x: x["timestamp"],
+        reverse=True,
+    )
     if not notes:
         st.caption("No notes yet")
 
-    for note in notes[:12]:
+    for note in notes:
         nid = note["id"]
         edit_key = f"edit_note_{nid}"
+        # Format the stored timestamp as a readable date header
+        try:
+            dt = datetime.fromisoformat(note["timestamp"])
+            note_date = dt.strftime("%m/%d/%Y")
+            note_time = dt.strftime("%I:%M %p").lstrip("0")
+        except Exception:
+            note_date = note["timestamp"][:10]
+            note_time = ""
+
         if st.session_state.get(edit_key):
-            new_val = st.text_input("", value=note["content"], key=f"note_input_{nid}")
+            new_val = st.text_area("", value=note["content"], key=f"note_input_{nid}", height=100)
             if st.button("Save", key=f"note_save_{nid}"):
                 with db.get_conn() as conn:
                     conn.execute("UPDATE interactions SET content=? WHERE id=?", (new_val, nid))
                 st.session_state[edit_key] = False
                 st.rerun()
         else:
+            st.markdown(
+                f"<div style='font-size:0.75rem;color:#888;margin-bottom:2px'>"
+                f"📅 {note_date}"
+                f"{(' · ' + note_time) if note_time else ''}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
             row_left, row_edit, row_del = st.columns([14, 1, 1])
-            row_left.markdown(f"<div class='note-bubble'>{note['content']}</div>", unsafe_allow_html=True)
+            row_left.markdown(
+                f"<div class='note-bubble' style='white-space:pre-wrap'>{note['content']}</div>",
+                unsafe_allow_html=True,
+            )
             row_edit.markdown("<div class='note-actions'>", unsafe_allow_html=True)
             if row_edit.button("✏️", key=f"note_edit_{nid}", help="Edit", type="tertiary"):
                 st.session_state[edit_key] = True
@@ -654,6 +734,7 @@ def render_notes(lead_id: int, interactions: list[dict]) -> None:
                     st.rerun()
                 if n.button("Cancel", key=f"note_cancel_{nid}"):
                     st.session_state[f"confirm_del_{nid}"] = False
+            st.markdown("<hr style='margin:4px 0;border-color:#eee'>", unsafe_allow_html=True)
 
     with st.form(key=f"note_form_{lead_id}", clear_on_submit=True):
         new_note = st.text_input("Add note", key=f"new_note_{lead_id}")
@@ -676,12 +757,11 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
     timeline_text, address_text, situation_text, _ = parse_timeline_parts(lead["timeline"])
 
     st.markdown(f"### {lead['name']}")
-    c_top1, c_top2, c_top3 = st.columns(3)
+    c_top1, c_top2 = st.columns(2)
     c_top1.markdown(f"**Phone:** {lead['phone']}")
     c_top2.markdown(f"**Stage:** {human_stage(lead['conversation_stage'])}")
-    c_top3.markdown(f"**Address:** {address_text}")
 
-    c_edit1, c_edit2, c_edit3 = st.columns(3)
+    c_edit1, c_edit2, c_edit3, c_edit4 = st.columns(4)
     _status_opts = ["hot", "warm", "cold", "dead", "contract"]
     _status_idx = _status_opts.index(lead["status"]) if lead["status"] in _status_opts else 0
     c_edit1.selectbox(
@@ -708,12 +788,20 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
         on_change=save_timeline,
         args=(lead_id, f"timeline_{lead_id}"),
     )
+    c_edit4.text_input(
+        "Address",
+        value=address_text,
+        key=f"address_{lead_id}",
+        on_change=save_address,
+        args=(lead_id, f"address_{lead_id}"),
+    )
 
     left, right = st.columns([1.2, 1])
     with left:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("**Conversation**")
-        render_imessage(conversation, max_items=10)
+        st.markdown(f"**Conversation** ({len(conversation)} messages)")
+        with st.container(height=420):
+            render_imessage(conversation, max_items=len(conversation))
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -739,6 +827,32 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
                 db.add_interaction(lead_id, "note", f"{fmt_stamp(ts)} — Offer made", "outbound", ts=ts)
             db.update_lead(lead_id, {"touch_count": lead["touch_count"] + 1, "last_contact_date": ts.date().isoformat()})
             st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("**Send a Text**")
+        manual_msg_key = f"manual_text_{lead_id}"
+        st.text_area("Message", key=manual_msg_key, height=80, label_visibility="collapsed",
+                     placeholder="Type a custom message to send right now…")
+        send_col1, send_col2 = st.columns([1, 1])
+        if send_col1.button("Send Text", key=f"manual_send_{lead_id}"):
+            text_to_send = st.session_state.get(manual_msg_key, "").strip()
+            if text_to_send:
+                result = send_sms(lead_id, text_to_send)
+                if result.get("sent"):
+                    st.session_state.pop(manual_msg_key, None)
+                    st.success("Sent!")
+                else:
+                    st.error(f"Send failed: {result.get('error', 'unknown error')}")
+                st.rerun()
+            else:
+                st.warning("Type a message first.")
+        if send_col2.button("Call This Lead", key=f"click_to_call_{lead_id}"):
+            result = place_call(lead_id)
+            if result.get("called"):
+                st.success("Calling your phone now — answer it to connect.")
+            else:
+                st.error(f"Call failed: {result.get('error', 'unknown error')}")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with right:
@@ -773,7 +887,11 @@ if "page" in query_params:
 if "lead_list_collapsed" not in st.session_state:
     st.session_state["lead_list_collapsed"] = False
 if "completed_calls" not in st.session_state:
-    st.session_state["completed_calls"] = {}
+    today_iso = date.today().isoformat()
+    st.session_state["completed_calls"] = {
+        lid: True
+        for lid in db.get_daily_call_completions(today_iso)
+    }
 head_left, head_right = st.columns([4, 1.7])
 with head_left:
     st.empty()
@@ -808,24 +926,17 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     st.markdown("### 🌿 Navigation")
 
-    def nav_item(label: str, key: str) -> None:
-        is_active = st.session_state["page"] == key
-        class_name = "nav-item nav-active" if is_active else "nav-item"
-        st.markdown(
-            f"""
-            <div class="{class_name}">
-                <a href="/?page={key}" target="_self" style="text-decoration:none; color:inherit;">
-                    {label}
-                </a>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+    def nav_item(label: str, page_key: str) -> None:
+        is_active = st.session_state["page"] == page_key
+        btn_style = "primary" if is_active else "secondary"
+        if st.button(label, key=f"nav_btn_{page_key}", use_container_width=True, type=btn_style):
+            nav_to(page_key)
 
     nav_item("Dashboard", "dashboard")
     nav_item("Leads", "leads")
     nav_item("Call List", "call_list")
     nav_item("Follow-ups", "followups")
+    nav_item("Messages", "messages")
 
 st.divider()
 page = st.session_state["page"]
@@ -840,6 +951,76 @@ if page == "dashboard":
     overdue_items = overdue_followups(all_leads)
     overdue_count = len(overdue_items)
     waiting_approval = followups_waiting_approval(result["followup_queue"], all_interactions)
+
+    # ── New replies banner ────────────────────────────────────────────────────
+    recent_replies = db.fetch_recent_inbound_texts(since_hours=24)
+    if recent_replies:
+        # Dedupe by lead
+        seen_leads: dict[int, dict] = {}
+        for r in recent_replies:
+            if r["lead_id"] not in seen_leads:
+                seen_leads[r["lead_id"]] = r
+        reply_leads = list(seen_leads.values())
+        reply_word = "reply" if len(reply_leads) == 1 else "replies"
+        st.markdown(
+            f"<div style='background:#edf7ed;border-left:4px solid #4caf50;"
+            f"padding:10px 14px;border-radius:6px;margin-bottom:12px'>"
+            f"<b>💬 {len(reply_leads)} new {reply_word} in the last 24 hours</b>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        reply_cols = st.columns(min(len(reply_leads), 4))
+        for i, r in enumerate(reply_leads[:4]):
+            with reply_cols[i]:
+                preview = r["content"][:40] + ("..." if len(r["content"]) > 40 else "")
+                label = r["name"] + "\n" + preview
+                if st.button(label, key="reply_badge_" + str(r["lead_id"])):
+                    nav_to("leads", r["lead_id"])
+
+    # ── Missed calls banner ───────────────────────────────────────────────────
+    recent_missed_calls = db.fetch_unacknowledged_missed_calls()
+    if recent_missed_calls:
+        call_word = "call" if len(recent_missed_calls) == 1 else "calls"
+        st.markdown(
+            f"<div style='background:#fdecea;border-left:4px solid #e53935;"
+            f"padding:10px 14px;border-radius:6px;margin-bottom:12px'>"
+            f"<b>📞 {len(recent_missed_calls)} missed {call_word} you haven't followed up on</b>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        missed_cols = st.columns(min(len(recent_missed_calls), 4))
+        for i, c in enumerate(recent_missed_calls[:4]):
+            with missed_cols[i]:
+                d, t = fmt_date_time(c["timestamp"])
+                label = f"{c['name']}\n{c['phone']}\n{d} {t}"
+                if st.button(label, key="missed_call_badge_" + str(c["id"])):
+                    nav_to("leads", c["lead_id"])
+
+    # ── Unmatched inbox (texts/voicemails from unknown numbers) ──────────────
+    unmatched = db.fetch_unmatched_inbox()
+    if unmatched:
+        word = "message" if len(unmatched) == 1 else "messages"
+        with st.expander(f"📥 {len(unmatched)} unmatched {word} from unknown numbers", expanded=False):
+            for entry in unmatched:
+                d, t = fmt_date_time(entry["timestamp"])
+                icon = "🎙️" if entry["type"] == "voicemail" else "💬"
+                st.markdown(f"{icon} **{entry['phone']}** · {d} {t}")
+                st.caption(entry["content"])
+                u_col1, u_col2, u_col3 = st.columns([2, 1, 1])
+                name_key = f"unmatched_name_{entry['id']}"
+                u_col1.text_input("Name", key=name_key, placeholder="Add as lead — enter name", label_visibility="collapsed")
+                if u_col2.button("Add as lead", key=f"unmatched_convert_{entry['id']}"):
+                    new_name = st.session_state.get(name_key, "").strip()
+                    if new_name:
+                        new_lead_id = db.convert_unmatched_to_lead(entry["id"], new_name)
+                        st.success(f"Created lead: {new_name}")
+                        nav_to("Leads", new_lead_id)
+                    else:
+                        st.warning("Enter a name first.")
+                if u_col3.button("Dismiss", key=f"unmatched_dismiss_{entry['id']}"):
+                    db.mark_unmatched_handled(entry["id"])
+                    st.rerun()
+                st.markdown("---")
 
     st.markdown("### Today’s Priorities")
     pcols = st.columns(5)
@@ -866,18 +1047,29 @@ if page == "dashboard":
         nav_to("Leads")
 
     summary = result["summary"]
-    cols = st.columns(5)
-    for c, (label, value) in zip(
-        cols,
-        [
-            ("Hot", summary["hot"]),
-            ("Warm", summary["warm"]),
-            ("Cold", summary["cold"]),
-            ("Follow-ups (Today)", len(result["followup_queue"])),
-            ("Risk leads", summary["risk_leads"]),
-        ],
-    ):
+    warm_followups = sum(1 for i in result["followup_queue"]
+                        if lead_lookup.get(i["lead_id"], {}).get("status") == "warm")
+    cold_followups = sum(1 for i in result["followup_queue"]
+                        if lead_lookup.get(i["lead_id"], {}).get("status") == "cold")
+
+    cols = st.columns(6)
+    metric_items = [
+        ("Hot",               summary["hot"],    "leads", "hot"),
+        ("Warm",              summary["warm"],   "leads", "warm"),
+        ("Cold",              summary["cold"],   "leads", "cold"),
+        ("Warm Follow-ups",   warm_followups,    "followups", None),
+        ("Cold Follow-ups",   cold_followups,    "followups", None),
+        ("Risk Leads",        summary["risk_leads"], "leads", None),
+    ]
+    for c, (label, value, page, status_filter) in zip(cols, metric_items):
         c.markdown(f"<div class='metric'><div>{label}</div><h3>{value}</h3></div>", unsafe_allow_html=True)
+        btn_key = f"metric_btn_{label.replace(' ', '_').lower()}"
+        if c.button("View", key=btn_key):
+            if status_filter:
+                st.session_state["lead_status_filter"] = [status_filter]
+            else:
+                st.session_state.pop("lead_status_filter", None)
+            nav_to(page)
 
     st.markdown("### Call List")
     st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -927,7 +1119,13 @@ if page == "dashboard":
 elif page == "leads":
     st.subheader("Leads")
     q = st.text_input("Search", placeholder="Type name or phone...").strip().lower()
-    status_filter = st.multiselect("Optional filters", ["hot", "warm", "cold"], default=[])
+    preset_filter = st.session_state.pop("lead_status_filter", None)
+    status_filter = st.multiselect(
+        "Filter by status",
+        ["hot", "warm", "cold"],
+        default=preset_filter or [],
+        key="lead_status_multiselect",
+    )
     matches = [
         l for l in all_leads
         if (not status_filter or l["status"] in status_filter)
@@ -950,8 +1148,7 @@ elif page == "leads":
                 st.rerun()
             with st.container(height=620):
                 for lead in matches:
-                    _, address_text, _, _ = parse_timeline_parts(lead["timeline"])
-                    if st.button(f"{lead['name']}\n{address_text}", key=f"lead_{lead['id']}"):
+                    if st.button(lead["name"], key=f"lead_{lead['id']}"):
                         st.session_state["selected_lead_id"] = lead["id"]
                         st.session_state["lead_list_collapsed"] = True
                         st.rerun()
@@ -982,23 +1179,50 @@ elif page == "call_list":
         for entry in call_list:
             lid = entry["lead_id"]
             lead = lead_lookup.get(lid)
-            _, address_text, situation, _ = parse_timeline_parts(lead["timeline"] if lead else "")
-            row_left, row_right = st.columns([5, 1])
-            if row_left.button(entry["name"], key=f"open_name_{lid}", type="tertiary", use_container_width=True):
-                nav_to("Leads", lid)
-            row_left.caption(address_text)
-            _checked = st.session_state["completed_calls"].get(lid, False)
-            _new = row_right.checkbox("", value=_checked, label_visibility="collapsed")
-            if _new != _checked:
-                st.session_state["completed_calls"][lid] = _new
-                st.rerun()
-            completed, remaining = completion_counts(call_list)
-            completed_calls_today = completed
-            pct_complete = int((completed_calls_today / max(1, total_calls_today)) * 100)
-            st.caption(f"Address: {address_text}")
-            st.caption(situation)
-            labels = human_intent_labels(entry.get("intent_signals", []))
-            st.markdown("".join([f"<span class='pill'>{x}</span>" for x in labels]), unsafe_allow_html=True)
+            _, address_text, _, _ = parse_timeline_parts(lead["timeline"] if lead else "")
+            # Strip junk from address (remove "Notes: ..." and "Folder=..." parts)
+            clean_address = address_text.split(". Notes:")[0].split(". Folder")[0].strip()
+
+            _call_key = f"call_complete_{lid}"
+            if _call_key not in st.session_state:
+                st.session_state[_call_key] = st.session_state["completed_calls"].get(lid, False)
+            is_done = st.session_state["completed_calls"].get(lid, False)
+
+            name_col, check_col = st.columns([11, 1])
+            with name_col:
+                # Name + phone on same line
+                st.markdown(
+                    f"<div style='display:flex;align-items:baseline;gap:12px'>"
+                    f"<span style='font-size:1.05rem;font-weight:600;"
+                    f"{'color:#aaa;text-decoration:line-through' if is_done else 'color:#1a1a1a'}'>"
+                    f"{entry['name']}</span>"
+                    f"<span style='font-size:0.9rem;color:#555'>{lead['phone'] if lead else ''}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                if clean_address:
+                    st.markdown(
+                        f"<div style='font-size:0.82rem;color:#777;margin:1px 0 4px 0'>"
+                        f"📍 {clean_address}</div>",
+                        unsafe_allow_html=True,
+                    )
+                labels = human_intent_labels(entry.get("intent_signals", []))
+                if labels:
+                    st.markdown(
+                        "".join([f"<span class='pill'>{x}</span>" for x in labels]),
+                        unsafe_allow_html=True,
+                    )
+                if st.button("Open lead", key=f"open_name_{lid}", type="tertiary"):
+                    nav_to("Leads", lid)
+
+            with check_col:
+                st.checkbox(
+                    "",
+                    key=_call_key,
+                    on_change=toggle_call_completed,
+                    args=(lid,),
+                    label_visibility="collapsed",
+                )
             st.divider()
 
     completed, remaining = completion_counts(call_list)
@@ -1038,54 +1262,292 @@ elif page == "followups":
         for item, lead in items:
             if item["lead_id"] > 0:
                 conversation = lead_conversation_items(item["lead_id"])
-                history = conversation[-10:]
+                history = conversation
             else:
                 history = []
             _, address, situation, _ = parse_timeline_parts(lead["timeline"])
+            lid = item["lead_id"]
+            msg_key = f"f_msg_{lid}"
+            regen_key = f"f_regen_flag_{lid}"
+            flags_key = f"f_flags_{lid}"
+            ctx_key = f"f_ctx_{lid}"
+
+            def _run_generation(target_lead, target_item, target_msg_key, target_flags_key, force=False, extra_context=""):
+                import json as _json
+                ixns_g = db.fetch_interactions(target_lead["id"])
+                ixn_count = len(ixns_g)
+
+                # Use cached suggestion if interactions haven't changed (unless forced)
+                if not force:
+                    cached = db.get_followup_suggestion(target_lead["id"])
+                    if cached and cached["interaction_count"] == ixn_count:
+                        st.session_state[target_msg_key] = cached["message"]
+                        st.session_state[target_flags_key] = _json.loads(cached["flags"])
+                        return
+
+                draft = generate_followup_message(
+                    lead=target_lead,
+                    last_message=target_item["last_message"],
+                    ignored_texts=target_item["ignored_texts"],
+                    strong_intent=target_item["strong_intent"],
+                    conversation=ixns_g,
+                    extra_context=extra_context,
+                )
+                st.session_state[target_msg_key] = draft.message
+                st.session_state[target_flags_key] = draft.flags
+                db.save_followup_suggestion(
+                    target_lead["id"], draft.message, draft.flags,
+                    draft.tone, ixn_count,
+                )
+
+            # Handle regenerate (force=True skips cache)
+            if st.session_state.pop(regen_key, False):
+                with st.spinner("Regenerating..."):
+                    _run_generation(lead, item, msg_key, flags_key, force=True,
+                                    extra_context=st.session_state.get(ctx_key, ""))
+
+            # Lazy-generate on first view (uses cache if available)
+            if msg_key not in st.session_state:
+                with st.spinner(f"Analyzing {item['lead_name']}..."):
+                    _run_generation(lead, item, msg_key, flags_key)
+
+            flags = st.session_state.get(flags_key, [])
+
             st.markdown("<div class='card'>", unsafe_allow_html=True)
-            if item["lead_id"] > 0 and st.button(f"{item['lead_name']}", key=f"f_name_{item['lead_id']}", type="tertiary"):
-                nav_to("Leads", item["lead_id"])
-            if item["lead_id"] <= 0:
+            if lid > 0 and st.button(f"{item['lead_name']}", key=f"f_name_{lid}", type="tertiary"):
+                nav_to("Leads", lid)
+            if lid <= 0:
                 st.markdown(f"**{item['lead_name']}**")
-            st.caption(f"Phone: {lead.get('phone', 'N/A')}")
-            st.caption(f"Address: {address}")
-            st.write("Situation:", situation or "Not recorded")
-            with st.container(height=120):
-                if history:
-                    render_imessage(history, max_items=10)
-                else:
-                    st.caption("No messages yet")
+            st.caption(f"Phone: {lead.get('phone', 'N/A')}  ·  {address}")
 
-            key = f"f_msg_{item['lead_id']}"
-            if key not in st.session_state:
-                st.session_state[key] = item["new_message"]
-            st.text_area("Suggestion", key=key, height=80)
-
-            c1, c2, c3 = st.columns(3)
-            if c1.button("Approve", key=f"f_app_{item['lead_id']}"):
-                if item["lead_id"] > 0:
-                    typing_box = st.empty()
-                    ts_now = datetime.utcnow().isoformat(timespec="seconds")
-                    typing_box.markdown(
-                        f"<div class='msg-row msg-left'><div><div class='msg-time'>{fmt_date_time(ts_now)[0]} • {fmt_date_time(ts_now)[1]}</div><div class='msg-bubble-in'><span class='typing-dot'>.</span><span class='typing-dot'>.</span><span class='typing-dot'>.</span></div></div></div>",
+            if flags:
+                for flag in flags:
+                    st.markdown(
+                        f"<div style='font-size:0.82rem;padding:4px 8px;margin:2px 0;"
+                        f"background:#fafafa;border-left:3px solid #b0976a;"
+                        f"border-radius:4px'>{flag}</div>",
                         unsafe_allow_html=True,
                     )
-                    time.sleep(0.25)
-                    typing_box.empty()
+
+            with st.container(height=180):
+                if history:
+                    render_imessage(history, max_items=len(history))
+                else:
+                    st.caption("No conversation yet")
+
+            st.text_area("Suggested text", key=msg_key, height=75)
+
+            c1, c2, c_ctx, c3 = st.columns([2, 1, 3, 1])
+            _SNOOZE_DAYS = {"warm": 5, "cold": 30}
+
+            if c1.button("Approve & Send", key=f"f_app_{lid}"):
+                if lid > 0:
                     ts = datetime.utcnow()
-                    send_sms(item["lead_id"], st.session_state[key])
-                    approved_text = st.session_state[key]
+                    approved_text = st.session_state[msg_key]
+                    send_sms(lid, approved_text)  # logs the text interaction internally
                     user_value = st.session_state.get("user", "RJ")
                     user_dot = "🔴" if user_value == "RJ" else "🟢"
-                    db.add_interaction(item["lead_id"], "text", f"Suggested message approved: {user_dot} {user_value}: approved message \"{approved_text}\"", "outbound", ts=ts)
-                    db.add_interaction(item["lead_id"], "note", f"{user_value}: approved message \"{approved_text}\"", "outbound", ts=ts)
-                    st.session_state[key] = ""
+                    db.add_interaction(lid, "note", f"{user_dot} {user_value} approved & sent follow-up", "outbound", ts=ts)
+                    # Snooze: hide lead until next follow-up window
+                    lead_status = lead.get("status", "warm")
+                    snooze = _SNOOZE_DAYS.get(lead_status, 5)
+                    next_date = (date.today() + timedelta(days=snooze)).isoformat()
+                    db.update_lead(lid, {"next_action_date": next_date})
+                    st.session_state.pop(msg_key, None)
+                    st.session_state.pop(flags_key, None)
                     autoplay_audio()
-                    st.success("Message sent.")
+                    st.success(f"Sent! Snoozed {snooze} days.")
                 st.rerun()
-            if c2.button("Edit", key=f"f_edit_{item['lead_id']}"):
-                st.info("Edit in suggestion box.")
-            if c3.button("Regenerate", key=f"f_regen_{item['lead_id']}"):
-                st.session_state[key] = st.session_state[key] + " Just checking if a quick call would be easier."
-                st.rerun()
+            if c2.button("Edit", key=f"f_edit_{lid}"):
+                st.info("Edit the text above, then hit Approve & Send.")
+
+            c_ctx.text_input(
+                "Context",
+                key=ctx_key,
+                placeholder="e.g. she just called about the shed price",
+                label_visibility="collapsed",
+            )
+
+            def _request_regen(lead_id=lid):
+                st.session_state[f"f_regen_flag_{lead_id}"] = True
+
+            c3.button("Regenerate", key=f"f_regen_{lid}", on_click=_request_regen)
             st.markdown("</div>", unsafe_allow_html=True)
+
+elif page == "messages":
+    # ── header ────────────────────────────────────────────────────────────────
+    hdr_left, hdr_right = st.columns([6, 1])
+    hdr_left.subheader("💬 Messages & Calls")
+    if hdr_right.button("🔄 Refresh", key="msg_refresh_btn"):
+        st.rerun()
+
+    # ── search bar ────────────────────────────────────────────────────────────
+    msg_q = st.text_input(
+        "Search",
+        placeholder="Search by name, phone, or message content...",
+        label_visibility="collapsed",
+        key="msg_search_q",
+    ).strip().lower()
+
+    # ── build thread list from all_interactions ───────────────────────────────
+    _texts_by_lead: dict[int, list[dict]] = {}
+    for _ixn in all_interactions:
+        if _ixn["type"] == "text":
+            _texts_by_lead.setdefault(_ixn["lead_id"], []).append(_ixn)
+
+    _threads: list[dict] = []
+    for _lid, _txts in _texts_by_lead.items():
+        _lead = lead_lookup.get(_lid)
+        if not _lead:
+            continue
+        _latest = max(_txts, key=lambda x: x["timestamp"])
+        _threads.append({
+            "lead_id": _lid,
+            "lead_name": _lead["name"],
+            "phone": _lead["phone"],
+            "status": _lead["status"],
+            "last_text": _latest["content"],
+            "last_ts": _latest["timestamp"],
+            "direction": _latest["direction"],
+        })
+    _threads.sort(key=lambda t: t["last_ts"], reverse=True)
+
+    if msg_q:
+        _threads = [
+            t for t in _threads
+            if msg_q in t["lead_name"].lower()
+            or msg_q in t["phone"].lower()
+            or msg_q in t["last_text"].lower()
+        ]
+
+    # ── session state for selected conversation ───────────────────────────────
+    if "msg_selected_lead" not in st.session_state:
+        st.session_state["msg_selected_lead"] = None
+
+    # ── two-column layout: thread list | conversation ─────────────────────────
+    thread_col, convo_col = st.columns([1, 2.4])
+
+    with thread_col:
+        st.markdown("**Conversations**")
+        with st.container(height=540):
+            if not _threads:
+                st.caption("No text conversations yet.")
+            for _t in _threads:
+                _is_sel = st.session_state["msg_selected_lead"] == _t["lead_id"]
+                _preview = (_t["last_text"][:48] + "…") if len(_t["last_text"]) > 48 else _t["last_text"]
+                _d, _tm = fmt_date_time(_t["last_ts"])
+                _dir_icon = "← " if _t["direction"] == "inbound" else "→ "
+                _btn_type = "secondary" if _is_sel else "tertiary"
+                _label = ("● " if _is_sel else "") + _t["lead_name"]
+                if st.button(_label, key=f"msg_thread_{_t['lead_id']}", use_container_width=True, type=_btn_type):
+                    st.session_state["msg_selected_lead"] = _t["lead_id"]
+                    st.rerun()
+                st.caption(f"{_dir_icon}{_preview}  ·  {_d} {_tm}")
+
+    with convo_col:
+        _sel_lid = st.session_state.get("msg_selected_lead")
+        if _sel_lid is None:
+            st.info("← Select a conversation to open it.")
+        else:
+            _sel_lead = lead_lookup.get(_sel_lid)
+            if not _sel_lead:
+                st.warning("Lead not found.")
+            else:
+                # Conversation header
+                _ch_left, _ch_right = st.columns([4, 1])
+                _ch_left.markdown(f"**{_sel_lead['name']}** · `{_sel_lead['phone']}`")
+                if _ch_right.button("Open Lead →", key=f"msg_open_lead_{_sel_lid}", type="secondary"):
+                    nav_to("Leads", _sel_lid)
+
+                # All texts + calls for this lead, oldest-first for iMessage display
+                _convo_ixns = db.fetch_interactions(_sel_lid)
+                _convo_items = [i for i in _convo_ixns if i["type"] in ("text", "call")]
+                _convo_asc = list(reversed(_convo_items))  # fetch returns newest-first; reverse for display
+
+                with st.container(height=420):
+                    if _convo_asc:
+                        render_imessage(_convo_asc, max_items=len(_convo_asc))
+                    else:
+                        st.caption("No messages yet.")
+
+                # Compose row
+                st.markdown("---")
+                _compose_key = f"msg_compose_{_sel_lid}"
+                _msg_text = st.text_area(
+                    "Compose",
+                    key=_compose_key,
+                    height=72,
+                    placeholder="iMessage  ✉",
+                    label_visibility="collapsed",
+                )
+                _sc1, _sc2 = st.columns([3, 1])
+                if _sc1.button("Send ↑", key=f"msg_send_{_sel_lid}", type="primary", use_container_width=True):
+                    if (_msg_text or "").strip():
+                        _res = send_sms(_sel_lid, _msg_text.strip())
+                        if _res.get("sent"):
+                            st.session_state[_compose_key] = ""
+                            st.toast(f"✓ Sent to {_sel_lead['name']}")
+                        else:
+                            st.error(f"Send failed: {_res.get('error')}")
+                        st.rerun()
+                    else:
+                        st.warning("Type a message first.")
+                if _sc2.button("📞 Call", key=f"msg_call_{_sel_lid}", use_container_width=True):
+                    _cr = place_call(_sel_lid)
+                    if _cr.get("called"):
+                        st.toast("📞 Calling — your phone will ring first, then bridges to lead.")
+                    else:
+                        st.error(f"Call failed: {_cr.get('error')}")
+
+    # ── Recent Calls panel ────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### 📞 Recent Calls")
+
+    _all_calls = sorted(
+        [i for i in all_interactions if i["type"] == "call"],
+        key=lambda x: x["timestamp"],
+        reverse=True,
+    )[:60]
+
+    if not _all_calls:
+        st.caption("No calls logged yet.")
+    else:
+        with st.container(height=360):
+            for _c in _all_calls:
+                _cl = lead_lookup.get(_c["lead_id"])
+                _cl_name = _cl["name"] if _cl else f"Lead #{_c['lead_id']}"
+                _cd, _ct = fmt_date_time(_c["timestamp"])
+                _lcontent = _c["content"].lower()
+                if "missed" in _lcontent:
+                    _icon = "❌"
+                elif _c["direction"] == "inbound":
+                    _icon = "📲"
+                else:
+                    _icon = "📤"
+                _call_preview = (_c["content"][:80] + "…") if len(_c["content"]) > 80 else _c["content"]
+                _if_search = not msg_q or (
+                    msg_q in _cl_name.lower()
+                    or msg_q in _c["content"].lower()
+                )
+                if not _if_search:
+                    continue
+                st.markdown(
+                    f"<div class='call-row'>"
+                    f"<span class='call-icon'>{_icon}</span>"
+                    f"<div class='call-meta'>"
+                    f"<div class='call-name'>{_cl_name}</div>"
+                    f"<div class='call-preview'>{_call_preview}</div>"
+                    f"</div>"
+                    f"<span class='call-ts'>{_cd}<br>{_ct}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                if _cl:
+                    _open_col1, _open_col2 = st.columns([2, 5])
+                    if _open_col1.button(
+                        "Open thread",
+                        key=f"msg_call_open_{_c['id']}",
+                        type="tertiary",
+                    ):
+                        st.session_state["msg_selected_lead"] = _cl["id"]
+                        st.rerun()
