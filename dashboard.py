@@ -1523,7 +1523,7 @@ elif page == "messages":
                     if (_msg_text or "").strip():
                         _res = send_sms(_sel_lid, _msg_text.strip())
                         if _res.get("sent"):
-                            st.session_state[_compose_key] = ""
+                            st.session_state.pop(_compose_key, None)
                             st.toast(f"✓ Sent to {_sel_lead['name']}")
                         else:
                             st.error(f"Send failed: {_res.get('error')}")
