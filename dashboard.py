@@ -8,7 +8,7 @@ import streamlit as st
 
 from crm_engine import db, engine
 from crm_engine.followup_engine import generate_followup_message
-from crm_engine.messaging_gateway import send_sms
+from crm_engine.messaging_gateway import send_sms, place_call
 
 st.set_page_config(page_title="Silverline Investment Group", layout="wide")
 st.markdown("""
@@ -159,10 +159,17 @@ input, textarea, [data-baseweb="select"] * {color: #2E2E2E !important;}
 .typing-dot:nth-child(2){animation-delay:.2s;}
 .typing-dot:nth-child(3){animation-delay:.4s;}
 @keyframes blink{0%,80%,100%{opacity:.3;}40%{opacity:1;}}
+.thread-sel{background:#e8f0ea!important;border-left:3px solid #6B8F71!important;border-radius:6px!important;font-weight:700!important;}
+.call-row{display:flex;align-items:flex-start;gap:10px;padding:8px 0;border-bottom:1px solid #eee;}
+.call-icon{font-size:1.3rem;flex-shrink:0;}
+.call-meta{flex:1;min-width:0;}
+.call-name{font-weight:600;font-size:.95rem;}
+.call-preview{font-size:.82rem;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.call-ts{font-size:.78rem;color:#888;white-space:nowrap;flex-shrink:0;}
 </style>
 """
 
-PAGES = ["Dashboard", "Leads", "Call List", "Follow-ups"]
+PAGES = ["Dashboard", "Leads", "Call List", "Follow-ups", "Messages"]
 
 
 def info_icon(text: str, tip: str) -> str:
@@ -836,6 +843,7 @@ with st.sidebar:
     nav_item("Leads", "leads")
     nav_item("Call List", "call_list")
     nav_item("Follow-ups", "followups")
+    nav_item("Messages", "messages")
 
 st.divider()
 page = st.session_state["page"]
@@ -1104,3 +1112,181 @@ elif page == "followups":
                 st.session_state[key] = st.session_state[key] + " Just checking if a quick call would be easier."
                 st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
+
+elif page == "messages":
+    # ── header ────────────────────────────────────────────────────────────────
+    hdr_left, hdr_right = st.columns([6, 1])
+    hdr_left.subheader("💬 Messages & Calls")
+    if hdr_right.button("🔄 Refresh", key="msg_refresh_btn"):
+        st.rerun()
+
+    # ── search bar ────────────────────────────────────────────────────────────
+    msg_q = st.text_input(
+        "Search",
+        placeholder="Search by name, phone, or message content...",
+        label_visibility="collapsed",
+        key="msg_search_q",
+    ).strip().lower()
+
+    # ── build thread list from all_interactions ───────────────────────────────
+    _texts_by_lead: dict[int, list[dict]] = {}
+    for _ixn in all_interactions:
+        if _ixn["type"] == "text":
+            _texts_by_lead.setdefault(_ixn["lead_id"], []).append(_ixn)
+
+    _threads: list[dict] = []
+    for _lid, _txts in _texts_by_lead.items():
+        _lead = lead_lookup.get(_lid)
+        if not _lead:
+            continue
+        _latest = max(_txts, key=lambda x: x["timestamp"])
+        _threads.append({
+            "lead_id": _lid,
+            "lead_name": _lead["name"],
+            "phone": _lead["phone"],
+            "status": _lead["status"],
+            "last_text": _latest["content"],
+            "last_ts": _latest["timestamp"],
+            "direction": _latest["direction"],
+        })
+    _threads.sort(key=lambda t: t["last_ts"], reverse=True)
+
+    if msg_q:
+        _threads = [
+            t for t in _threads
+            if msg_q in t["lead_name"].lower()
+            or msg_q in t["phone"].lower()
+            or msg_q in t["last_text"].lower()
+        ]
+
+    # ── session state for selected conversation ───────────────────────────────
+    if "msg_selected_lead" not in st.session_state:
+        st.session_state["msg_selected_lead"] = None
+
+    # ── two-column layout: thread list | conversation ─────────────────────────
+    thread_col, convo_col = st.columns([1, 2.4])
+
+    with thread_col:
+        st.markdown("**Conversations**")
+        with st.container(height=540):
+            if not _threads:
+                st.caption("No text conversations yet.")
+            for _t in _threads:
+                _is_sel = st.session_state["msg_selected_lead"] == _t["lead_id"]
+                _preview = (_t["last_text"][:48] + "…") if len(_t["last_text"]) > 48 else _t["last_text"]
+                _d, _tm = fmt_date_time(_t["last_ts"])
+                _dir_icon = "← " if _t["direction"] == "inbound" else "→ "
+                _btn_type = "secondary" if _is_sel else "tertiary"
+                _label = ("● " if _is_sel else "") + _t["lead_name"]
+                if st.button(_label, key=f"msg_thread_{_t['lead_id']}", use_container_width=True, type=_btn_type):
+                    st.session_state["msg_selected_lead"] = _t["lead_id"]
+                    st.rerun()
+                st.caption(f"{_dir_icon}{_preview}  ·  {_d} {_tm}")
+
+    with convo_col:
+        _sel_lid = st.session_state.get("msg_selected_lead")
+        if _sel_lid is None:
+            st.info("← Select a conversation to open it.")
+        else:
+            _sel_lead = lead_lookup.get(_sel_lid)
+            if not _sel_lead:
+                st.warning("Lead not found.")
+            else:
+                # Conversation header
+                _ch_left, _ch_right = st.columns([4, 1])
+                _ch_left.markdown(f"**{_sel_lead['name']}** · `{_sel_lead['phone']}`")
+                if _ch_right.button("Open Lead →", key=f"msg_open_lead_{_sel_lid}", type="secondary"):
+                    nav_to("Leads", _sel_lid)
+
+                # All texts + calls for this lead, oldest-first for iMessage display
+                _convo_ixns = db.fetch_interactions(_sel_lid)
+                _convo_items = [i for i in _convo_ixns if i["type"] in ("text", "call")]
+                _convo_asc = list(reversed(_convo_items))  # fetch returns newest-first; reverse for display
+
+                with st.container(height=420):
+                    if _convo_asc:
+                        render_imessage(_convo_asc, max_items=len(_convo_asc))
+                    else:
+                        st.caption("No messages yet.")
+
+                # Compose row
+                st.markdown("---")
+                _compose_key = f"msg_compose_{_sel_lid}"
+                _msg_text = st.text_area(
+                    "Compose",
+                    key=_compose_key,
+                    height=72,
+                    placeholder="iMessage  ✉",
+                    label_visibility="collapsed",
+                )
+                _sc1, _sc2 = st.columns([3, 1])
+                if _sc1.button("Send ↑", key=f"msg_send_{_sel_lid}", type="primary", use_container_width=True):
+                    if (_msg_text or "").strip():
+                        _res = send_sms(_sel_lid, _msg_text.strip())
+                        if _res.get("sent"):
+                            st.session_state[_compose_key] = ""
+                            st.toast(f"✓ Sent to {_sel_lead['name']}")
+                        else:
+                            st.error(f"Send failed: {_res.get('error')}")
+                        st.rerun()
+                    else:
+                        st.warning("Type a message first.")
+                if _sc2.button("📞 Call", key=f"msg_call_{_sel_lid}", use_container_width=True):
+                    _cr = place_call(_sel_lid)
+                    if _cr.get("called"):
+                        st.toast("📞 Calling — your phone will ring first, then bridges to lead.")
+                    else:
+                        st.error(f"Call failed: {_cr.get('error')}")
+
+    # ── Recent Calls panel ────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### 📞 Recent Calls")
+
+    _all_calls = sorted(
+        [i for i in all_interactions if i["type"] == "call"],
+        key=lambda x: x["timestamp"],
+        reverse=True,
+    )[:60]
+
+    if not _all_calls:
+        st.caption("No calls logged yet.")
+    else:
+        with st.container(height=360):
+            for _c in _all_calls:
+                _cl = lead_lookup.get(_c["lead_id"])
+                _cl_name = _cl["name"] if _cl else f"Lead #{_c['lead_id']}"
+                _cd, _ct = fmt_date_time(_c["timestamp"])
+                _lcontent = _c["content"].lower()
+                if "missed" in _lcontent:
+                    _icon = "❌"
+                elif _c["direction"] == "inbound":
+                    _icon = "📲"
+                else:
+                    _icon = "📤"
+                _call_preview = (_c["content"][:80] + "…") if len(_c["content"]) > 80 else _c["content"]
+                _if_search = not msg_q or (
+                    msg_q in _cl_name.lower()
+                    or msg_q in _c["content"].lower()
+                )
+                if not _if_search:
+                    continue
+                st.markdown(
+                    f"<div class='call-row'>"
+                    f"<span class='call-icon'>{_icon}</span>"
+                    f"<div class='call-meta'>"
+                    f"<div class='call-name'>{_cl_name}</div>"
+                    f"<div class='call-preview'>{_call_preview}</div>"
+                    f"</div>"
+                    f"<span class='call-ts'>{_cd}<br>{_ct}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                if _cl:
+                    _open_col1, _open_col2 = st.columns([2, 5])
+                    if _open_col1.button(
+                        f"Open thread",
+                        key=f"msg_call_open_{_c['id']}",
+                        type="tertiary",
+                    ):
+                        st.session_state["msg_selected_lead"] = _cl["id"]
+                        st.rerun()
