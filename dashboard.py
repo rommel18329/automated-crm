@@ -948,7 +948,30 @@ with st.sidebar:
     nav_item("Leads", "leads")
     nav_item("Call List", "call_list")
     nav_item("Follow-ups", "followups")
-    nav_item("Messages", "messages")
+
+    # Messages nav item with unread badge
+    _last_seen = st.session_state.get("messages_last_seen_ts") or (
+        datetime.utcnow() - timedelta(hours=24)
+    ).isoformat()
+    _unread_count = sum(
+        1 for _i in all_interactions
+        if _i["direction"] == "inbound"
+        and _i["type"] in ("text", "call")
+        and _i["timestamp"] > _last_seen
+    )
+    _msg_nav_col, _msg_badge_col = st.columns([5, 1])
+    with _msg_nav_col:
+        nav_item("Messages", "messages")
+    with _msg_badge_col:
+        if _unread_count > 0:
+            _badge_label = str(_unread_count) if _unread_count < 100 else "99+"
+            st.markdown(
+                f"<div style='background:#ff3b30;color:#fff;border-radius:50%;"
+                f"min-width:20px;height:20px;display:flex;align-items:center;"
+                f"justify-content:center;font-size:11px;font-weight:700;"
+                f"padding:0 4px;margin-top:6px'>{_badge_label}</div>",
+                unsafe_allow_html=True,
+            )
 
 st.divider()
 page = st.session_state["page"]
@@ -1387,6 +1410,9 @@ elif page == "followups":
             st.markdown("</div>", unsafe_allow_html=True)
 
 elif page == "messages":
+    # Mark all current inbound messages as seen (clears the badge)
+    st.session_state["messages_last_seen_ts"] = datetime.utcnow().isoformat()
+
     # ── header ────────────────────────────────────────────────────────────────
     hdr_left, hdr_right = st.columns([6, 1])
     hdr_left.subheader("💬 Messages & Calls")
