@@ -116,6 +116,41 @@ def init_db(db_path: Path = DB_PATH) -> None:
             );
             """
         )
+        # Migration: add 'investor' to status CHECK (requires table recreation in SQLite)
+        _schema_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='leads'"
+        ).fetchone()
+        if _schema_row and "'investor'" not in _schema_row[0]:
+            conn.executescript("""
+                DROP TABLE IF EXISTS leads_migration;
+                CREATE TABLE leads_migration (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    phone TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('cold','warm','hot','dead','contract','investor')),
+                    motivation_score INTEGER NOT NULL CHECK (motivation_score BETWEEN 1 AND 10),
+                    timeline TEXT NOT NULL DEFAULT '',
+                    timeline_days INTEGER,
+                    last_contact_date TEXT,
+                    next_action_date TEXT,
+                    touch_count INTEGER NOT NULL DEFAULT 0,
+                    last_strategy_used TEXT,
+                    conversation_stage TEXT NOT NULL CHECK (
+                        conversation_stage IN ('not_contacted','initial_contact','qualifying','negotiating','closing')
+                    ) DEFAULT 'not_contacted',
+                    deal_probability INTEGER NOT NULL DEFAULT 0 CHECK (deal_probability BETWEEN 0 AND 100)
+                );
+                INSERT INTO leads_migration SELECT * FROM leads;
+                DROP TABLE leads;
+                ALTER TABLE leads_migration RENAME TO leads;
+            """)
+
+        # Migration: add buy_box column to leads
+        try:
+            conn.execute("ALTER TABLE leads ADD COLUMN buy_box TEXT")
+        except Exception:
+            pass
+
         # Migration: add recording_url column to interactions if it doesn't exist yet
         try:
             conn.execute("ALTER TABLE interactions ADD COLUMN recording_url TEXT")

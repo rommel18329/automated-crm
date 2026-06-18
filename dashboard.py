@@ -564,6 +564,152 @@ def render_imessage(items: list[dict], max_items: int | None = None) -> None:
         )
 
 
+_US_STATES = [
+    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA",
+    "KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
+    "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT",
+    "VA","WA","WV","WI","WY",
+]
+_DEAL_TYPES = ["Wholesale", "Fix & Flip", "Buy & Hold", "New Construction", "Land"]
+_CONDITIONS = ["Any", "Distressed only", "Light rehab OK", "Move-in ready"]
+
+
+def _parse_buy_box(lead: dict) -> dict:
+    import json as _j
+    try:
+        return _j.loads(lead.get("buy_box") or "{}")
+    except Exception:
+        return {}
+
+
+def render_buy_box(lead_id: int, lead: dict) -> None:
+    import json as _j
+    bb = _parse_buy_box(lead)
+    editing = st.session_state.get(f"bb_edit_{lead_id}", not bool(bb))
+
+    if not editing:
+        # ── View card ────────────────────────────────────────────────────
+        pts = bb.get("property_types", [])
+        pt_pills = "".join(
+            f"<span class='pill' style='background:#dff0ff;color:#1a5a8a'>{p.title()}</span>"
+            for p in pts
+        )
+        state_pills = "".join(f"<span class='pill'>{s}</span>" for s in bb.get("states", []))
+        deal_pills = "".join(
+            f"<span class='pill' style='background:#fff3e0;color:#7a4f00'>{d}</span>"
+            for d in bb.get("deal_types", [])
+        )
+        pmin = bb.get("price_min", 0)
+        pmax = bb.get("price_max", 0)
+        price_line = ""
+        if pmin or pmax:
+            price_line = (
+                f"<div style='margin:4px 0'>💰 "
+                f"<b>${pmin:,}</b> – <b>${pmax:,}</b></div>"
+            )
+        cond = bb.get("condition", "Any")
+        cond_line = f"<div style='margin:4px 0'>🏚️ {cond}</div>" if cond != "Any" else ""
+        beds = bb.get("beds_min", 0)
+        baths = bb.get("baths_min", 0)
+        bed_bath = ""
+        if "residential" in pts and (beds or baths):
+            parts = []
+            if beds: parts.append(f"🛏️ {beds}+ beds")
+            if baths: parts.append(f"🛁 {baths}+ baths")
+            bed_bath = "<div style='margin:4px 0'>" + " &nbsp;·&nbsp; ".join(parts) + "</div>"
+        notes = bb.get("notes", "")
+        notes_line = f"<div style='margin:4px 0;font-size:.85rem;color:#555'>📝 {notes}</div>" if notes else ""
+
+        st.markdown(
+            f"<div style='background:#f4f1ec;border:1px solid #ddd;border-radius:12px;padding:14px 16px'>"
+            f"<div style='margin-bottom:6px'>{pt_pills}</div>"
+            f"<div style='margin-bottom:6px'>📍 {state_pills}</div>"
+            f"<div style='margin-bottom:6px'>💼 {deal_pills}</div>"
+            f"{price_line}{cond_line}{bed_bath}{notes_line}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        if st.button("✏️ Edit Buy Box", key=f"bb_edit_btn_{lead_id}", type="secondary"):
+            st.session_state[f"bb_edit_{lead_id}"] = True
+            st.rerun()
+        return
+
+    # ── Edit form ─────────────────────────────────────────────────────────
+    st.markdown("**States**")
+    states = st.multiselect(
+        "States", _US_STATES, default=bb.get("states", []),
+        key=f"bb_states_{lead_id}", label_visibility="collapsed",
+    )
+
+    st.markdown("**Property Type**")
+    _pt_c1, _pt_c2 = st.columns(2)
+    res_checked = _pt_c1.checkbox(
+        "🏠 Residential", value="residential" in bb.get("property_types", []),
+        key=f"bb_res_{lead_id}",
+    )
+    com_checked = _pt_c2.checkbox(
+        "🏢 Commercial", value="commercial" in bb.get("property_types", []),
+        key=f"bb_com_{lead_id}",
+    )
+
+    st.markdown("**Deal Types**")
+    _dt_cols = st.columns(len(_DEAL_TYPES))
+    deal_sel = []
+    for _i, _dt in enumerate(_DEAL_TYPES):
+        if _dt_cols[_i].checkbox(_dt, value=_dt in bb.get("deal_types", []), key=f"bb_dt_{lead_id}_{_i}"):
+            deal_sel.append(_dt)
+
+    st.markdown("**Price Range**")
+    _pr1, _pr2 = st.columns(2)
+    price_min = _pr1.number_input("Min $", value=int(bb.get("price_min", 0)), step=5000,
+                                  min_value=0, key=f"bb_pmin_{lead_id}")
+    price_max = _pr2.number_input("Max $", value=int(bb.get("price_max", 0)), step=5000,
+                                  min_value=0, key=f"bb_pmax_{lead_id}")
+
+    condition = st.selectbox(
+        "Condition", _CONDITIONS,
+        index=_CONDITIONS.index(bb.get("condition", "Any")) if bb.get("condition") in _CONDITIONS else 0,
+        key=f"bb_cond_{lead_id}",
+    )
+
+    if res_checked:
+        _bd1, _bd2 = st.columns(2)
+        beds_min = _bd1.number_input("Min Beds", value=int(bb.get("beds_min", 0)),
+                                     min_value=0, step=1, key=f"bb_beds_{lead_id}")
+        baths_min = _bd2.number_input("Min Baths", value=int(bb.get("baths_min", 0)),
+                                      min_value=0, step=1, key=f"bb_baths_{lead_id}")
+    else:
+        beds_min = bb.get("beds_min", 0)
+        baths_min = bb.get("baths_min", 0)
+
+    notes = st.text_area("Additional criteria / notes", value=bb.get("notes", ""),
+                         height=60, key=f"bb_notes_{lead_id}")
+
+    _sv1, _sv2 = st.columns([2, 5])
+    if _sv1.button("Save Buy Box", key=f"bb_save_{lead_id}", type="primary"):
+        property_types = []
+        if res_checked: property_types.append("residential")
+        if com_checked: property_types.append("commercial")
+        new_bb = {
+            "states": states,
+            "property_types": property_types,
+            "deal_types": deal_sel,
+            "price_min": int(price_min),
+            "price_max": int(price_max),
+            "condition": condition,
+            "beds_min": int(beds_min),
+            "baths_min": int(baths_min),
+            "notes": notes.strip(),
+        }
+        db.update_lead(lead_id, {"buy_box": _j.dumps(new_bb)})
+        st.session_state[f"bb_edit_{lead_id}"] = False
+        st.toast("Buy box saved.")
+        st.rerun()
+    if bb and _sv2.button("Cancel", key=f"bb_cancel_{lead_id}", type="secondary"):
+        st.session_state[f"bb_edit_{lead_id}"] = False
+        st.rerun()
+
+
 def lead_conversation_items(lead_id: int) -> list[dict]:
     interactions = db.fetch_interactions(lead_id)
     # Calls and texts only — notes live in the Notes panel, not the conversation
@@ -615,7 +761,7 @@ def _build_display_result() -> dict:
     today_str = date.today().isoformat()
     followups: list = []
     for lead, evaluation in leads_with_eval:
-        if lead["status"] == "hot":
+        if lead["status"] in ("hot", "dead", "contract", "investor"):
             continue
         next_action = lead.get("next_action_date") or today_str
         if next_action > today_str:
@@ -774,7 +920,7 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
     c_top2.markdown(f"**Stage:** {human_stage(lead['conversation_stage'])}")
 
     c_edit1, c_edit2, c_edit3, c_edit4 = st.columns(4)
-    _status_opts = ["hot", "warm", "cold", "dead", "contract"]
+    _status_opts = ["hot", "warm", "cold", "dead", "contract", "investor"]
     _status_idx = _status_opts.index(lead["status"]) if lead["status"] in _status_opts else 0
     c_edit1.selectbox(
         "Status",
@@ -807,6 +953,13 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
         on_change=save_address,
         args=(lead_id, f"address_{lead_id}"),
     )
+
+    # Buy Box — only shown for investor leads
+    if lead["status"] == "investor":
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("### 🏠 Buy Box")
+        render_buy_box(lead_id, lead)
+        st.markdown("</div>", unsafe_allow_html=True)
 
     left, right = st.columns([1.2, 1])
     with left:
