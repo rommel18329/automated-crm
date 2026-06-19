@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from .ai_message_generator import generate_message
+from .ai_message_generator import generate_message, MessageResult
 
 
 STRATEGY_ROTATION = ["casual follow-up", "value-based", "pattern break", "call attempt", "reset tone"]
@@ -14,14 +14,17 @@ class FollowupDraft:
     objective: str
     strategy: str
     reasoning: str
+    flags: list[str] = field(default_factory=list)
+    tone: str = "warm"
+    coaching: str = ""
 
 
 def _choose_objective(strong_intent: bool, ignored_texts: int) -> str:
     if strong_intent:
-        return "move to call"
+        return "move to close — they have shown buying signals, make next step easy"
     if ignored_texts >= 2:
-        return "re-engage"
-    return "get reply"
+        return "re-engage — pattern break, low pressure"
+    return "advance conversation — get a reply that reveals their current thinking"
 
 
 def _choose_strategy(last_strategy: str | None, ignored_texts: int) -> str:
@@ -33,17 +36,34 @@ def _choose_strategy(last_strategy: str | None, ignored_texts: int) -> str:
     return STRATEGY_ROTATION[(idx + 1) % len(STRATEGY_ROTATION)]
 
 
-def generate_followup_message(lead: dict, last_message: str, ignored_texts: int, strong_intent: bool) -> FollowupDraft:
+def generate_followup_message(
+    lead: dict,
+    last_message: str,
+    ignored_texts: int,
+    strong_intent: bool,
+    conversation: list[dict] | None = None,
+    extra_context: str = "",
+) -> FollowupDraft:
     objective = _choose_objective(strong_intent, ignored_texts)
     strategy = _choose_strategy(lead.get("last_strategy_used"), ignored_texts)
-    msg = generate_message(
+
+    result: MessageResult = generate_message(
         lead=lead,
+        conversation=conversation or [],
         objective=objective,
         strategy=strategy,
-        last_message=last_message,
+        extra_context=extra_context,
     )
+
     reasoning = (
-        f"Objective={objective}; strategy={strategy}; "
-        "AI generated message in approval mode using lead context and conversation context."
+        f"Objective: {objective} | Strategy: {strategy} | Tone: {result.tone}"
     )
-    return FollowupDraft(message=msg, objective=objective, strategy=strategy, reasoning=reasoning)
+    return FollowupDraft(
+        message=result.message,
+        objective=objective,
+        strategy=strategy,
+        reasoning=reasoning,
+        flags=result.flags,
+        tone=result.tone,
+        coaching=result.coaching,
+    )

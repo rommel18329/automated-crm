@@ -9,6 +9,7 @@ import streamlit as st
 from crm_engine import db, engine
 from crm_engine.followup_engine import generate_followup_message
 from crm_engine.messaging_gateway import send_sms, place_call
+from crm_engine.dialer_import import parse_contacts
 
 st.set_page_config(page_title="Silverline Investment Group", layout="wide")
 st.markdown("""
@@ -169,7 +170,7 @@ input, textarea, [data-baseweb="select"] * {color: #2E2E2E !important;}
 </style>
 """
 
-PAGES = ["Dashboard", "Leads", "Call List", "Follow-ups", "Messages"]
+PAGES = ["Dashboard", "Leads", "Call List", "Dialer", "Follow-ups", "Messages"]
 
 
 def info_icon(text: str, tip: str) -> str:
@@ -245,13 +246,27 @@ def human_intent_labels(signals: list[str]) -> list[str]:
     return [label_map.get(s, s.replace("_", " ").title()) for s in signals]
 
 
+_IL_AREA_CODES = {
+    "217","224","309","312","331","618","630","708","773","779","815","847"
+}
+_FROM_OPTS = {"515": "+15154618235", "773": "+17732503445"}
+
+def _auto_caller_id(phone: str) -> str:
+    """Return '773' for IL area codes, '515' otherwise."""
+    digits = "".join(c for c in (phone or "") if c.isdigit())
+    area = digits[:3] if len(digits) == 10 else digits[1:4]
+    return "773" if area in _IL_AREA_CODES else "515"
+
+
 def fmt_stamp(dt: datetime) -> str:
     return dt.strftime("%m-%d • %I:%M %p").replace(" 0", " ")
 
 
 def fmt_date_time(iso_value: str) -> tuple[str, str]:
     dt = datetime.fromisoformat(iso_value)
-    return dt.strftime("%m-%d"), dt.strftime("%I:%M %p").lstrip("0")
+    current_year = datetime.now().year
+    date_str = dt.strftime("%m-%d") if dt.year == current_year else dt.strftime("%m-%d-%Y")
+    return date_str, dt.strftime("%I:%M %p").lstrip("0")
 
 
 def nav_to(page: str, lead_id: int | None = None) -> None:
@@ -1012,10 +1027,18 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
                 st.rerun()
             else:
                 st.warning("Type a message first.")
-        if send_col2.button("Call This Lead", key=f"click_to_call_{lead_id}"):
-            result = place_call(lead_id)
+        _auto_cid = _auto_caller_id(lead.get("phone", ""))
+        _cid_pick = send_col2.radio(
+            "Call from", ["515", "773"],
+            index=0 if _auto_cid == "515" else 1,
+            horizontal=True,
+            key=f"cid_pick_{lead_id}",
+            label_visibility="collapsed",
+        )
+        if send_col2.button("📞 Call This Lead", key=f"click_to_call_{lead_id}"):
+            result = place_call(lead_id, from_number=_FROM_OPTS[_cid_pick])
             if result.get("called"):
-                st.success("Calling your phone now — answer it to connect.")
+                st.success(f"Calling from {_cid_pick} — your phone rings first, then bridges to lead.")
             else:
                 st.error(f"Call failed: {result.get('error', 'unknown error')}")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1100,6 +1123,7 @@ with st.sidebar:
     nav_item("Dashboard", "dashboard")
     nav_item("Leads", "leads")
     nav_item("Call List", "call_list")
+    nav_item("Dialer", "dialer")
     nav_item("Follow-ups", "followups")
 
     # Messages nav item with unread badge
@@ -1310,7 +1334,7 @@ elif page == "leads":
     preset_filter = st.session_state.pop("lead_status_filter", None)
     status_filter = st.multiselect(
         "Filter by status",
-        ["hot", "warm", "cold"],
+        ["hot", "warm", "cold", "investor", "dead", "contract"],
         default=preset_filter or [],
         key="lead_status_multiselect",
     )
@@ -1459,8 +1483,9 @@ elif page == "followups":
             regen_key = f"f_regen_flag_{lid}"
             flags_key = f"f_flags_{lid}"
             ctx_key = f"f_ctx_{lid}"
+            coaching_key = f"f_coaching_{lid}"
 
-            def _run_generation(target_lead, target_item, target_msg_key, target_flags_key, force=False, extra_context=""):
+            def _run_generation(target_lead, target_item, target_msg_key, target_flags_key, target_coaching_key, force=False, extra_context=""):
                 import json as _json
                 ixns_g = db.fetch_interactions(target_lead["id"])
                 ixn_count = len(ixns_g)
@@ -1483,6 +1508,10 @@ elif page == "followups":
                 )
                 st.session_state[target_msg_key] = draft.message
                 st.session_state[target_flags_key] = draft.flags
+                if draft.coaching:
+                    st.session_state[target_coaching_key] = draft.coaching
+                else:
+                    st.session_state.pop(target_coaching_key, None)
                 db.save_followup_suggestion(
                     target_lead["id"], draft.message, draft.flags,
                     draft.tone, ixn_count,
@@ -1491,13 +1520,13 @@ elif page == "followups":
             # Handle regenerate (force=True skips cache)
             if st.session_state.pop(regen_key, False):
                 with st.spinner("Regenerating..."):
-                    _run_generation(lead, item, msg_key, flags_key, force=True,
+                    _run_generation(lead, item, msg_key, flags_key, coaching_key, force=True,
                                     extra_context=st.session_state.get(ctx_key, ""))
 
             # Lazy-generate on first view (uses cache if available)
             if msg_key not in st.session_state:
                 with st.spinner(f"Analyzing {item['lead_name']}..."):
-                    _run_generation(lead, item, msg_key, flags_key)
+                    _run_generation(lead, item, msg_key, flags_key, coaching_key)
 
             flags = st.session_state.get(flags_key, [])
 
@@ -1516,6 +1545,17 @@ elif page == "followups":
                         f"border-radius:4px'>{flag}</div>",
                         unsafe_allow_html=True,
                     )
+
+            _coaching = st.session_state.get(coaching_key, "")
+            if _coaching:
+                st.markdown(
+                    f"<div style='font-size:0.83rem;padding:8px 12px;margin:6px 0 4px 0;"
+                    f"background:#eef6ff;border-left:3px solid #2563eb;"
+                    f"border-radius:4px;color:#1e3a5f'>"
+                    f"<span style='font-weight:600;font-size:0.75rem;letter-spacing:0.04em;"
+                    f"text-transform:uppercase;opacity:0.7'>Coach</span><br>{_coaching}</div>",
+                    unsafe_allow_html=True,
+                )
 
             with st.container(height=180):
                 if history:
@@ -1683,10 +1723,18 @@ elif page == "messages":
                         st.rerun()
                     else:
                         st.warning("Type a message first.")
+                _msg_auto_cid = _auto_caller_id(_sel_lead.get("phone", ""))
+                _msg_cid = _sc2.radio(
+                    "From", ["515", "773"],
+                    index=0 if _msg_auto_cid == "515" else 1,
+                    horizontal=True,
+                    key=f"msg_cid_{_sel_lid}",
+                    label_visibility="collapsed",
+                )
                 if _sc2.button("📞 Call", key=f"msg_call_{_sel_lid}", use_container_width=True):
-                    _cr = place_call(_sel_lid)
+                    _cr = place_call(_sel_lid, from_number=_FROM_OPTS[_msg_cid])
                     if _cr.get("called"):
-                        st.toast("📞 Calling — your phone will ring first, then bridges to lead.")
+                        st.toast(f"📞 Calling from {_msg_cid} — your phone rings first.")
                     else:
                         st.error(f"Call failed: {_cr.get('error')}")
 
@@ -1752,3 +1800,139 @@ elif page == "messages":
                         st.rerun()
 
             st.divider()
+
+elif page == "dialer":
+    st.subheader("📞 Dialer")
+
+    # ── Session state ─────────────────────────────────────────────────────────
+    st.session_state.setdefault("dialer_queue", [])       # list of lead_ids this session
+    st.session_state.setdefault("dialer_idx", 0)          # position in queue
+    st.session_state.setdefault("dialer_on_call", False)  # True after Call, until disposed
+    st.session_state.setdefault("dialer_preview", None)   # parsed contacts awaiting confirm
+    st.session_state.setdefault("dialer_warnings", [])
+
+    # Prune any leads that were deleted out from under us
+    queue = [lid for lid in st.session_state["dialer_queue"] if lid in lead_lookup]
+    st.session_state["dialer_queue"] = queue
+
+    # label -> (interaction note, days until next call or None for no auto re-call)
+    DISPOSITIONS = {
+        "No Answer":      ("Call — no answer", 1),
+        "Voicemail":      ("Call — left voicemail", 3),
+        "Wrong Number":   ("Call — wrong number", None),
+        "Not Interested": ("Call — not interested", None),
+        "Callback":       ("Call — wants callback", 1),
+        "Connected":      ("Call — connected, talked", 3),
+    }
+
+    def _dispose(lead_id: int, label: str) -> None:
+        note, days = DISPOSITIONS[label]
+        who = st.session_state.get("user", "RJ")
+        db.add_interaction(lead_id, "call", f"{note} ({who})", "outbound")
+        fields = {"last_contact_date": date.today().isoformat()}
+        if days is not None:
+            fields["next_action_date"] = (date.today() + timedelta(days=days)).isoformat()
+        db.update_lead(lead_id, fields)
+        st.session_state["dialer_on_call"] = False
+        if st.session_state["dialer_idx"] < len(queue) - 1:
+            st.session_state["dialer_idx"] += 1   # auto-advance after disposing
+        st.rerun()
+
+    # ── Import a list ─────────────────────────────────────────────────────────
+    with st.expander("➕ Import a list to dial", expanded=not queue):
+        raw = st.text_area(
+            "Paste anything — names, numbers, addresses. Messy is fine; AI cleans it up.",
+            key="dialer_raw_input", height=160,
+            placeholder="John Smith 773-555-0100 123 Main St\n(515) 555-0199 Jane Doe ...",
+        )
+        if st.button("🤖 Parse with AI", key="dialer_parse"):
+            with st.spinner("Claude is extracting contacts..."):
+                contacts, warnings = parse_contacts(raw)
+            st.session_state["dialer_preview"] = contacts
+            st.session_state["dialer_warnings"] = warnings
+            st.rerun()
+
+        preview = st.session_state.get("dialer_preview")
+        if preview is not None:
+            for w in st.session_state.get("dialer_warnings", []):
+                st.caption("⚠️ " + w)
+            if preview:
+                st.markdown(f"**{len(preview)} contacts found — double-check, then add:**")
+                st.dataframe(
+                    [{"Name": c.name, "Phone": c.phone, "Address": c.address} for c in preview],
+                    use_container_width=True, hide_index=True,
+                )
+                if st.button(f"✅ Add {len(preview)} to dialer", key="dialer_confirm", type="primary"):
+                    new_ids = []
+                    for c in preview:
+                        lid = db.create_lead(c.name, c.phone)
+                        if c.address:
+                            db.update_lead(lid, {"timeline": f"Address: {c.address}"})
+                        new_ids.append(lid)
+                    st.session_state["dialer_queue"] = queue + new_ids
+                    st.session_state["dialer_idx"] = len(queue)   # jump to first new lead
+                    st.session_state["dialer_on_call"] = False
+                    st.session_state["dialer_preview"] = None
+                    st.session_state["dialer_warnings"] = []
+                    st.success(f"Added {len(new_ids)} leads to the dialer.")
+                    st.rerun()
+            else:
+                st.info("No dialable contacts found in that paste.")
+
+    # ── The dial card ─────────────────────────────────────────────────────────
+    if not queue:
+        st.info("Nobody in the dialer yet. Import a list above to start.")
+    else:
+        idx = min(st.session_state["dialer_idx"], len(queue) - 1)
+        st.session_state["dialer_idx"] = idx
+        lead_id = queue[idx]
+        lead = lead_lookup[lead_id]
+        _, address_text, _, _ = parse_timeline_parts(lead.get("timeline", ""))
+
+        st.progress((idx + 1) / len(queue))
+        st.caption(f"Lead {idx + 1} of {len(queue)}")
+
+        st.markdown(
+            "<div style='border:1px solid #ddd;border-radius:10px;padding:16px 20px;"
+            "background:#fafbfa;margin:8px 0'>"
+            f"<div style='font-size:1.4rem;font-weight:700;color:#1a1a1a'>{lead['name']}</div>"
+            f"<div style='font-size:1.1rem;color:#444;margin-top:2px'>{lead['phone']}</div>"
+            + (f"<div style='font-size:0.9rem;color:#777;margin-top:4px'>📍 {address_text}</div>"
+               if address_text else "")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+        cid = _auto_caller_id(lead["phone"])
+
+        if not st.session_state["dialer_on_call"]:
+            cc1, cc2, cc3, cc4 = st.columns([2, 1, 1, 1])
+            if cc1.button(f"📞 CALL  (from {cid})", key=f"dial_call_{lead_id}",
+                          type="primary", use_container_width=True):
+                res = place_call(lead_id, from_number=_FROM_OPTS[cid])
+                if res.get("called"):
+                    st.session_state["dialer_on_call"] = True
+                    st.toast(f"📞 Calling from {cid} — your phone rings first, then bridges.")
+                    st.rerun()
+                else:
+                    st.error(f"Call failed: {res.get('error', 'unknown error')}")
+            if cc2.button("⏮ Prev", key="dial_prev", disabled=idx == 0,
+                          use_container_width=True):
+                st.session_state["dialer_idx"] = max(0, idx - 1)
+                st.rerun()
+            if cc3.button("Skip ⏭", key="dial_skip", disabled=idx >= len(queue) - 1,
+                          use_container_width=True):
+                st.session_state["dialer_idx"] = min(len(queue) - 1, idx + 1)
+                st.rerun()
+            if cc4.button("Open lead", key="dial_open", use_container_width=True):
+                nav_to("Leads", lead_id)
+        else:
+            st.markdown("**On call — pick the outcome when you hang up:**")
+            d_cols = st.columns(3)
+            for i, label in enumerate(DISPOSITIONS):
+                if d_cols[i % 3].button(label, key=f"dial_disp_{label}",
+                                        use_container_width=True):
+                    _dispose(lead_id, label)
+            if st.button("✖ Cancel (didn't actually call)", key="dial_cancel"):
+                st.session_state["dialer_on_call"] = False
+                st.rerun()
