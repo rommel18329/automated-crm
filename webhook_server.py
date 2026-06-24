@@ -46,6 +46,10 @@ API_SECRET = os.getenv("TWILIO_API_SECRET", "")
 # In-memory map: CallSid → lead_id, used to attach recordings to the right lead
 _call_sid_to_lead: dict[str, int] = {}
 
+# Shared state for the persistent softphone popup.
+# Streamlit POSTs here when the user clicks CALL; the popup polls for changes.
+_dialer_current: dict = {}   # {lead_id, caller_id, lead_name, lead_phone, ts}
+
 
 def normalize_phone(raw: str) -> str | None:
     digits = re.sub(r"\D", "", raw or "")
@@ -343,170 +347,258 @@ def voice_browser_connect():
     return Response(twiml, mimetype="text/xml")
 
 
+@app.route("/dialer/current", methods=["GET", "POST"])
+def dialer_current():
+    """Shared state between Streamlit and the softphone popup.
+    POST: Streamlit writes {lead_id, caller_id, lead_name, lead_phone, ts}.
+    GET:  The popup polls this to detect new leads to dial."""
+    global _dialer_current
+    if request.method == "POST":
+        _dialer_current = request.get_json(force=True) or {}
+        resp = jsonify({"ok": True})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp
+    resp = jsonify(_dialer_current)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
 @app.route("/softphone")
 def softphone_page():
-    """Serve the browser softphone UI. Loaded in an iframe by the Streamlit dialer."""
-    lead_id = request.args.get("lead_id", "")
-    caller_id = request.args.get("caller_id", "")
-    lead_name = request.args.get("lead_name", "")
-    lead_phone = request.args.get("lead_phone", "")
-    autoconnect = request.args.get("autoconnect", "0") == "1"
-
-    html = f"""<!DOCTYPE html>
+    """Persistent browser softphone. Opened once as a popup, stays alive across
+    leads. Polls /dialer/current for new leads; Twilio Device stays registered
+    between calls so subsequent dials connect in ~500ms."""
+    html = """<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CRM Softphone</title>
 <style>
-  * {{ margin:0; padding:0; box-sizing:border-box; }}
-  body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-         background:#fafbfa; padding:12px; }}
-  .status {{ text-align:center; padding:10px; font-size:14px; color:#555;
-             border-radius:8px; margin-bottom:10px; background:#f0f0f0; }}
-  .status.connecting {{ background:#fff3cd; color:#856404; }}
-  .status.ringing {{ background:#fff3cd; color:#856404; }}
-  .status.connected {{ background:#d4edda; color:#155724; }}
-  .status.ended {{ background:#f0f0f0; color:#555; }}
-  .status.error {{ background:#f8d7da; color:#721c24; }}
-  .lead-info {{ text-align:center; margin-bottom:12px; }}
-  .lead-name {{ font-size:16px; font-weight:700; color:#1a1a1a; }}
-  .lead-phone {{ font-size:13px; color:#666; }}
-  .timer {{ text-align:center; font-size:24px; font-weight:700; color:#1a1a1a;
-            margin:8px 0; font-variant-numeric:tabular-nums; }}
-  .buttons {{ display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }}
-  .btn {{ padding:10px 20px; border:none; border-radius:8px; font-size:14px;
-          font-weight:600; cursor:pointer; transition:all 0.15s; }}
-  .btn:hover {{ transform:scale(1.03); }}
-  .btn:disabled {{ opacity:0.4; cursor:not-allowed; transform:none; }}
-  .btn-call {{ background:#28a745; color:#fff; }}
-  .btn-hangup {{ background:#dc3545; color:#fff; }}
-  .btn-mute {{ background:#6c757d; color:#fff; }}
-  .btn-mute.active {{ background:#ffc107; color:#000; }}
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+         background:#fafbfa; padding:16px; min-width:320px; }
+  h3 { font-size:15px; color:#888; margin-bottom:12px; text-align:center; }
+  .status { text-align:center; padding:10px; font-size:14px; color:#555;
+            border-radius:8px; margin-bottom:10px; background:#f0f0f0; }
+  .status.connecting { background:#fff3cd; color:#856404; }
+  .status.ringing    { background:#fff3cd; color:#856404; }
+  .status.connected  { background:#d4edda; color:#155724; }
+  .status.ended      { background:#f0f0f0; color:#555; }
+  .status.error      { background:#f8d7da; color:#721c24; }
+  .status.ready      { background:#e3f2fd; color:#0d47a1; }
+  .lead-info { text-align:center; margin-bottom:8px; }
+  .lead-name { font-size:18px; font-weight:700; color:#1a1a1a; }
+  .lead-phone { font-size:14px; color:#666; }
+  .timer { text-align:center; font-size:28px; font-weight:700; color:#1a1a1a;
+           margin:8px 0; font-variant-numeric:tabular-nums; }
+  .buttons { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; margin-top:10px; }
+  .btn { padding:10px 22px; border:none; border-radius:8px; font-size:14px;
+         font-weight:600; cursor:pointer; transition:all 0.15s; }
+  .btn:hover { transform:scale(1.03); }
+  .btn:disabled { opacity:0.4; cursor:not-allowed; transform:none; }
+  .btn-call   { background:#28a745; color:#fff; }
+  .btn-hangup { background:#dc3545; color:#fff; }
+  .btn-mute   { background:#6c757d; color:#fff; }
+  .btn-mute.active { background:#ffc107; color:#000; }
+  .log { margin-top:14px; font-size:12px; color:#999; max-height:80px;
+         overflow-y:auto; border-top:1px solid #eee; padding-top:6px; }
+  .log div { padding:1px 0; }
 </style>
 </head><body>
+<h3>📞 CRM Softphone</h3>
 <div class="lead-info">
-  <div class="lead-name">{lead_name}</div>
-  <div class="lead-phone">{lead_phone}</div>
+  <div class="lead-name" id="leadName">Waiting for lead...</div>
+  <div class="lead-phone" id="leadPhone"></div>
 </div>
 <div class="timer" id="timer">00:00</div>
-<div class="status" id="status">Loading softphone...</div>
+<div class="status" id="status">Starting up...</div>
 <div class="buttons">
   <button class="btn btn-call" id="btnCall" disabled>📞 Call</button>
   <button class="btn btn-mute" id="btnMute" disabled>🔇 Mute</button>
   <button class="btn btn-hangup" id="btnHangup" disabled>📕 Hang Up</button>
 </div>
+<div class="log" id="log"></div>
 
 <script src="https://sdk.twilio.com/js/client/releases/1.14/twilio.min.js"></script>
 <script>
-(function() {{
-  const statusEl = document.getElementById('status');
-  const timerEl  = document.getElementById('timer');
-  const btnCall  = document.getElementById('btnCall');
-  const btnMute  = document.getElementById('btnMute');
-  const btnHangup= document.getElementById('btnHangup');
+(function() {
+  const statusEl  = document.getElementById('status');
+  const timerEl   = document.getElementById('timer');
+  const nameEl    = document.getElementById('leadName');
+  const phoneEl   = document.getElementById('leadPhone');
+  const btnCall   = document.getElementById('btnCall');
+  const btnMute   = document.getElementById('btnMute');
+  const btnHangup = document.getElementById('btnHangup');
+  const logEl     = document.getElementById('log');
 
   let connection = null;
   let muted = false;
   let timerInterval = null;
   let callStart = null;
+  let deviceReady = false;
+  let lastDialTs = null;       // ts of the last lead we dialed (prevents re-dial)
+  let currentLead = null;      // {lead_id, caller_id, lead_name, lead_phone, ts}
+  let pollInterval = null;
 
-  function setStatus(text, cls) {{
+  function logMsg(msg) {
+    const d = document.createElement('div');
+    const now = new Date().toLocaleTimeString();
+    d.textContent = now + ' — ' + msg;
+    logEl.prepend(d);
+    while (logEl.children.length > 30) logEl.removeChild(logEl.lastChild);
+  }
+
+  function setStatus(text, cls) {
     statusEl.textContent = text;
     statusEl.className = 'status ' + (cls || '');
-  }}
+  }
 
-  function updateTimer() {{
+  function updateTimer() {
     if (!callStart) return;
     const secs = Math.floor((Date.now() - callStart) / 1000);
     const m = String(Math.floor(secs / 60)).padStart(2, '0');
     const s = String(secs % 60).padStart(2, '0');
     timerEl.textContent = m + ':' + s;
-  }}
+  }
 
-  function startTimer() {{
+  function startTimer() {
     callStart = Date.now();
     timerInterval = setInterval(updateTimer, 1000);
     updateTimer();
-  }}
+  }
 
-  function stopTimer() {{
+  function stopTimer() {
     clearInterval(timerInterval);
     timerInterval = null;
-  }}
+  }
 
-  function makeCall() {{
-    if (connection) return;
+  function dialLead(lead) {
+    if (connection) {
+      logMsg('Already on a call, ignoring new dial request');
+      return;
+    }
+    currentLead = lead;
+    lastDialTs = lead.ts;
+    nameEl.textContent = lead.lead_name || '(unknown)';
+    phoneEl.textContent = lead.lead_phone || '';
+    timerEl.textContent = '00:00';
     setStatus('Connecting...', 'connecting');
     btnCall.disabled = true;
     btnHangup.disabled = false;
     btnMute.disabled = false;
-    connection = Twilio.Device.connect({{
-      lead_id: '{lead_id}',
-      caller_id: '{caller_id}'
-    }});
-  }}
+    logMsg('Dialing ' + (lead.lead_name || lead.lead_phone));
+    connection = Twilio.Device.connect({
+      lead_id: String(lead.lead_id),
+      caller_id: lead.caller_id || ''
+    });
+  }
 
-  function hangUp() {{
+  function hangUp() {
     Twilio.Device.disconnectAll();
-  }}
+  }
 
-  function toggleMute() {{
+  function toggleMute() {
     if (!connection) return;
     muted = !muted;
     connection.mute(muted);
     btnMute.textContent = muted ? '🔊 Unmute' : '🔇 Mute';
     btnMute.classList.toggle('active', muted);
-  }}
+  }
 
-  btnCall.addEventListener('click', makeCall);
+  // Manual call button — re-dial the current lead
+  btnCall.addEventListener('click', function() {
+    if (currentLead) dialLead(currentLead);
+  });
   btnHangup.addEventListener('click', hangUp);
   btnMute.addEventListener('click', toggleMute);
 
-  // Fetch token and init
+  // ── Poll /dialer/current for new leads ────────────────────────────────
+  function pollForLead() {
+    fetch('/dialer/current')
+      .then(r => r.json())
+      .then(data => {
+        if (!data || !data.lead_id || !data.ts) return;
+        if (data.ts === lastDialTs) return;   // already dialed this one
+        if (connection) return;                // on a call, don't interrupt
+        if (!deviceReady) return;              // not ready yet
+        dialLead(data);
+      })
+      .catch(() => {});  // silent — poll failures are expected on network blips
+  }
+
+  // Poll every 500ms — fast enough to feel instant from the user's perspective
+  pollInterval = setInterval(pollForLead, 500);
+
+  // ── Init Twilio Device ────────────────────────────────────────────────
   setStatus('Fetching token...', '');
+  logMsg('Fetching access token...');
   fetch('/voice/token')
     .then(r => r.json())
-    .then(data => {{
-      if (data.error) {{
+    .then(data => {
+      if (data.error) {
         setStatus(data.error, 'error');
+        logMsg('ERROR: ' + data.error);
         return;
-      }}
-      Twilio.Device.setup(data.token, {{ debug: false }});
-    }})
-    .catch(err => setStatus('Token fetch failed: ' + err, 'error'));
+      }
+      Twilio.Device.setup(data.token, { debug: false });
+      logMsg('Token received, setting up device...');
+    })
+    .catch(err => {
+      setStatus('Token fetch failed: ' + err, 'error');
+      logMsg('ERROR: ' + err);
+    });
 
-  Twilio.Device.ready(function() {{
-    setStatus('Ready to call', '');
+  Twilio.Device.ready(function() {
+    deviceReady = true;
+    setStatus('Ready — waiting for lead from CRM', 'ready');
     btnCall.disabled = false;
-    {'setTimeout(makeCall, 300);' if autoconnect else ''}
-  }});
+    logMsg('Device ready. Click CALL in the CRM to start dialing.');
+  });
 
-  Twilio.Device.connect(function(conn) {{
+  Twilio.Device.connect(function(conn) {
     connection = conn;
     setStatus('Connected', 'connected');
     startTimer();
-  }});
+    logMsg('Call connected');
+  });
 
-  Twilio.Device.disconnect(function() {{
+  Twilio.Device.disconnect(function() {
     connection = null;
     muted = false;
     stopTimer();
-    setStatus('Call ended', 'ended');
+    setStatus('Call ended — click disposition in CRM, then next lead auto-dials', 'ended');
     btnCall.disabled = false;
     btnHangup.disabled = true;
     btnMute.disabled = true;
     btnMute.textContent = '🔇 Mute';
     btnMute.classList.remove('active');
-  }});
+    logMsg('Call ended');
+  });
 
-  Twilio.Device.error(function(err) {{
+  Twilio.Device.error(function(err) {
     setStatus('Error: ' + err.message, 'error');
+    logMsg('ERROR: ' + err.message);
     connection = null;
     stopTimer();
     btnCall.disabled = false;
     btnHangup.disabled = true;
     btnMute.disabled = true;
-  }});
-}})();
+  });
+
+  // ── Token refresh (Twilio tokens expire after ~1hr) ───────────────────
+  setInterval(function() {
+    if (connection) return;  // don't refresh mid-call
+    fetch('/voice/token')
+      .then(r => r.json())
+      .then(data => {
+        if (data.token) {
+          Twilio.Device.setup(data.token, { debug: false });
+          logMsg('Token refreshed');
+        }
+      })
+      .catch(() => {});
+  }, 50 * 60 * 1000);  // every 50 minutes
+})();
 </script>
 </body></html>"""
     return Response(html, mimetype="text/html")

@@ -2023,36 +2023,59 @@ elif page == "dialer":
         st.session_state.setdefault("dialer_call_mode", "browser" if _browser_ready else "phone")
 
         if not st.session_state["dialer_on_call"]:
-            _mode_col, _note_col = st.columns([2, 3])
-            with _mode_col:
-                _call_mode = st.radio(
-                    "Call mode",
-                    ["Browser (headset/mic)", "Phone (bridges to your cell)"],
-                    key="dialer_call_mode_radio", horizontal=True,
-                    index=0 if st.session_state["dialer_call_mode"] == "browser" else 1,
-                )
-                st.session_state["dialer_call_mode"] = (
-                    "browser" if "Browser" in _call_mode else "phone"
-                )
-            with _note_col:
-                if st.session_state["dialer_call_mode"] == "browser":
-                    if not _browser_ready:
-                        st.warning("Browser calling not set up. Run `python setup_twilio_app.py` first, then restart the webhook server.")
-                    else:
-                        st.caption("Calls go through your browser mic/speakers — no phone needed.")
+            _call_mode = st.radio(
+                "Call mode",
+                ["Browser (headset/mic)", "Phone (bridges to your cell)"],
+                key="dialer_call_mode_radio", horizontal=True,
+                index=0 if st.session_state["dialer_call_mode"] == "browser" else 1,
+            )
+            st.session_state["dialer_call_mode"] = (
+                "browser" if "Browser" in _call_mode else "phone"
+            )
+            _browser_tip = ("Fastest — 1 Twilio leg, ~500ms after first call. "
+                            "Softphone popup stays open between leads so the "
+                            "Twilio connection never drops. Best with a headset. "
+                            "No cell phone needed.")
+            _phone_tip = ("Slower — 2 Twilio legs, ~4-6s total. Twilio calls your cell "
+                          "first (~2-3s), you answer, then it dials the lead (~2-3s). "
+                          "Better audio quality on cell, but adds delay between leads.")
+            if st.session_state["dialer_call_mode"] == "browser":
+                if not _browser_ready:
+                    st.warning("Browser calling not set up. Run `python setup_twilio_app.py` first, then restart the webhook server.")
                 else:
-                    st.caption("Your cell rings first, then bridges to the lead.")
+                    _sp_col1, _sp_col2 = st.columns([3, 1])
+                    _sp_col1.markdown(
+                        info_icon("⚡ ~500ms connect (Device stays warm)", _browser_tip),
+                        unsafe_allow_html=True,
+                    )
+                    _softphone_url = f"{_base_url}/softphone"
+                    _sp_col2.markdown(
+                        f"<a href='{_softphone_url}' target='_crm_softphone' "
+                        f"onclick=\"window.open('{_softphone_url}','_crm_softphone',"
+                        f"'width=380,height=400,resizable=yes');return false;\" "
+                        f"style='display:inline-block;background:#28a745;color:#fff;"
+                        f"padding:6px 14px;border-radius:6px;font-size:13px;"
+                        f"font-weight:600;text-decoration:none;text-align:center;"
+                        f"width:100%'>Open Softphone</a>",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.markdown(
+                    info_icon("🐢 Slower — ~4-6s (two-leg bridge)", _phone_tip),
+                    unsafe_allow_html=True,
+                )
 
             for i, p in enumerate(phones, 1):
                 pcid = _auto_caller_id(p)
-                _call_label = (f"📞 Call Phone {i}: {p}  (from {pcid})"
-                               if st.session_state["dialer_call_mode"] == "phone"
-                               else f"📞 Browser Call Phone {i}: {p}  (from {pcid})")
+                _is_browser = st.session_state["dialer_call_mode"] == "browser"
+                _call_label = (f"📞 Browser Call Phone {i}: {p}  (from {pcid})"
+                               if _is_browser
+                               else f"📞 Call Phone {i}: {p}  (from {pcid})")
                 if st.button(_call_label,
                              key=f"dial_call_{lead_id}_{i}",
                              type="primary" if i == 1 else "secondary",
                              use_container_width=True):
-                    if st.session_state["dialer_call_mode"] == "phone":
+                    if not _is_browser:
                         res = place_call(lead_id, from_number=_FROM_OPTS[pcid], to_number=p)
                         if res.get("called"):
                             st.session_state["dialer_on_call"] = True
@@ -2065,9 +2088,21 @@ elif page == "dialer":
                         if not _browser_ready:
                             st.error("Browser calling not set up. Run `python setup_twilio_app.py`.")
                         else:
+                            import requests as _req
+                            _ts = datetime.utcnow().isoformat()
+                            _req.post(
+                                f"{_base_url}/dialer/current",
+                                json={
+                                    "lead_id": lead_id,
+                                    "caller_id": _FROM_OPTS[pcid],
+                                    "lead_name": lead["name"],
+                                    "lead_phone": p,
+                                    "ts": _ts,
+                                },
+                                timeout=3,
+                            )
                             st.session_state["dialer_on_call"] = True
                             st.session_state["dialer_call_phone"] = p
-                            st.session_state["dialer_browser_caller_id"] = _FROM_OPTS[pcid]
                             st.rerun()
 
             nc1, nc2, nc3 = st.columns(3)
@@ -2083,27 +2118,6 @@ elif page == "dialer":
                 nav_to("Leads", lead_id)
         else:
             # ── On-call view ──────────────────────────────────────────────
-            if st.session_state["dialer_call_mode"] == "browser" and _browser_ready:
-                _sp_caller_id = st.session_state.get("dialer_browser_caller_id", _FROM_OPTS["515"])
-                _sp_name = urllib.parse.quote(lead["name"], safe="")
-                _sp_phone = urllib.parse.quote(
-                    st.session_state.get("dialer_call_phone", lead["phone"]), safe="")
-                _sp_url = (
-                    f"{_base_url}/softphone"
-                    f"?lead_id={lead_id}"
-                    f"&caller_id={urllib.parse.quote(_sp_caller_id, safe='')}"
-                    f"&lead_name={_sp_name}"
-                    f"&lead_phone={_sp_phone}"
-                    f"&autoconnect=1"
-                )
-                st.markdown(
-                    f'<iframe src="{_sp_url}" allow="microphone" '
-                    f'style="width:100%;height:220px;border:1px solid #ddd;'
-                    f'border-radius:10px;background:#fafbfa" '
-                    f'frameborder="0"></iframe>',
-                    unsafe_allow_html=True,
-                )
-
             st.markdown("**Pick the outcome when you hang up:**")
             d_cols = st.columns(3)
             for i, label in enumerate(DISPOSITIONS):
