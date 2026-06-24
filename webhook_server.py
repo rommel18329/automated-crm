@@ -18,8 +18,11 @@ import os
 import re
 import sys
 import logging
+import uuid
+import threading
 from datetime import datetime
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import requests as _http
 from flask import Flask, request, Response, jsonify
@@ -42,6 +45,16 @@ AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWIML_APP_SID = os.getenv("TWILIO_TWIML_APP_SID", "")
 API_KEY = os.getenv("TWILIO_API_KEY", "")
 API_SECRET = os.getenv("TWILIO_API_SECRET", "")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")
+FROM_IL_NUMBER = os.getenv("TWILIO_FROM_IL_NUMBER", "")
+
+IL_AREA_CODES = {"217","224","309","312","331","618","630","708","773","779","815","847"}
+
+def pick_from_number(to_phone: str) -> str:
+    digits = re.sub(r"\D", "", to_phone or "")
+    area = digits[:3] if len(digits) == 10 else digits[1:4] if len(digits) == 11 else ""
+    return FROM_IL_NUMBER if (area in IL_AREA_CODES and FROM_IL_NUMBER) else FROM_NUMBER
 
 # In-memory map: CallSid → lead_id, used to attach recordings to the right lead
 _call_sid_to_lead: dict[str, int] = {}
@@ -49,6 +62,12 @@ _call_sid_to_lead: dict[str, int] = {}
 # Shared state for the persistent softphone popup.
 # Streamlit POSTs here when the user clicks CALL; the popup polls for changes.
 _dialer_current: dict = {}   # {lead_id, caller_id, lead_name, lead_phone, ts}
+
+# Multi-line batch state.  batch_id -> dict with:
+#   conference, lead_ids, call_sids{lead_id: sid}, winner(lead_id),
+#   winner_name, winner_phone, dropped[], resolved_count, total, status
+_multi_batches: dict[str, dict] = {}
+_batch_lock = threading.Lock()
 
 
 def normalize_phone(raw: str) -> str | None:
@@ -302,7 +321,23 @@ def voice_token():
 @app.route("/voice/browser-connect", methods=["POST"])
 def voice_browser_connect():
     """TwiML endpoint called by Twilio when the browser softphone dials out.
-    Reads lead_id + caller_id from the custom params and bridges to the lead."""
+
+    Two modes:
+    - Single-line: lead_id + caller_id → direct dial.
+    - Multi-line:  conference name → join the conference and wait for a lead to answer.
+    """
+    conference = request.form.get("conference", "")
+    if conference:
+        log.info(f"Browser joining conference: {conference}")
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Response><Dial>'
+            f'<Conference startConferenceOnEnter="true" endConferenceOnExit="true"'
+            f' waitUrl="" beep="false">{conference}</Conference>'
+            '</Dial></Response>'
+        )
+        return Response(twiml, mimetype="text/xml")
+
     lead_id_raw = request.form.get("lead_id", "")
     caller_id = request.form.get("caller_id", "") or os.getenv("TWILIO_FROM_NUMBER", "")
     call_sid = request.form.get("CallSid", "")
@@ -347,6 +382,184 @@ def voice_browser_connect():
     return Response(twiml, mimetype="text/xml")
 
 
+@app.route("/dialer/multi-start", methods=["POST"])
+def dialer_multi_start():
+    """Fire N simultaneous outbound calls. First answer wins and joins
+    the conference where the browser softphone is waiting."""
+    data = request.get_json(force=True) or {}
+    lead_ids = data.get("lead_ids", [])
+    if not lead_ids:
+        return jsonify({"error": "No leads"}), 400
+
+    batch_id = uuid.uuid4().hex[:12]
+    conference = f"multi_{batch_id}"
+    batch = {
+        "batch_id": batch_id,
+        "conference": conference,
+        "lead_ids": lead_ids,
+        "call_sids": {},
+        "winner": None,
+        "winner_name": "",
+        "winner_phone": "",
+        "dropped": [],
+        "resolved_count": 0,
+        "total": len(lead_ids),
+        "status": "ringing",
+    }
+
+    with _batch_lock:
+        _multi_batches[batch_id] = batch
+
+    def _fire_calls():
+        from twilio.rest import Client as TwilioClient
+        twilio = TwilioClient(ACCOUNT_SID, AUTH_TOKEN)
+
+        def _one_call(lid):
+            lead = db.fetch_lead(lid, DB_PATH)
+            if not lead:
+                return
+            phone = to_e164(lead["phone"])
+            from_ = pick_from_number(lead["phone"])
+            try:
+                call = twilio.calls.create(
+                    to=phone,
+                    from_=from_,
+                    url=f"{PUBLIC_BASE_URL}/voice/multi-answer/{batch_id}/{lid}",
+                    status_callback=f"{PUBLIC_BASE_URL}/voice/multi-status/{batch_id}/{lid}",
+                    status_callback_event=["completed", "busy", "no-answer", "failed", "canceled"],
+                    timeout=25,
+                )
+                with _batch_lock:
+                    batch["call_sids"][lid] = call.sid
+                log.info(f"Multi-dial [{batch_id}] → {lead['name']} ({phone}) SID={call.sid}")
+            except Exception as exc:
+                log.warning(f"Multi-dial [{batch_id}] call to {lid} failed: {exc}")
+                with _batch_lock:
+                    batch["resolved_count"] += 1
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            pool.map(_one_call, lead_ids)
+
+    threading.Thread(target=_fire_calls, daemon=True).start()
+
+    # Tell the softphone to join the conference
+    global _dialer_current
+    _dialer_current = {
+        "mode": "multi",
+        "batch_id": batch_id,
+        "conference": conference,
+        "lines": len(lead_ids),
+        "ts": datetime.utcnow().isoformat(),
+    }
+
+    resp = jsonify({"batch_id": batch_id, "lines": len(lead_ids)})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/voice/multi-answer/<batch_id>/<int:lead_id>", methods=["POST"])
+def voice_multi_answer(batch_id: str, lead_id: int):
+    """A lead answered. If first → join the conference. Otherwise → hangup."""
+    with _batch_lock:
+        batch = _multi_batches.get(batch_id)
+        if not batch:
+            return Response('<?xml version="1.0"?><Response><Hangup/></Response>',
+                            mimetype="text/xml")
+
+        if batch["winner"] is not None:
+            # Someone already won — hang up this call
+            log.info(f"Multi [{batch_id}] lead {lead_id} answered but {batch['winner']} already won")
+            return Response('<?xml version="1.0"?><Response><Hangup/></Response>',
+                            mimetype="text/xml")
+
+        # First answer — this lead wins
+        batch["winner"] = lead_id
+        batch["status"] = "connected"
+        lead = db.fetch_lead(lead_id, DB_PATH)
+        batch["winner_name"] = lead["name"] if lead else ""
+        batch["winner_phone"] = lead["phone"] if lead else ""
+        conference = batch["conference"]
+        call_sid = request.form.get("CallSid", "")
+
+    # Log the call interaction
+    if lead:
+        db.add_interaction(
+            lead_id, "call",
+            f"Outbound call (multi-line dialer) to {lead['name']}",
+            "outbound", DB_PATH, ts=datetime.utcnow(),
+        )
+        if call_sid:
+            _call_sid_to_lead[call_sid] = lead_id
+
+    # Kill all other ringing calls in a background thread
+    def _kill_others():
+        from twilio.rest import Client as TwilioClient
+        twilio = TwilioClient(ACCOUNT_SID, AUTH_TOKEN)
+        with _batch_lock:
+            sids = {lid: sid for lid, sid in batch["call_sids"].items() if lid != lead_id}
+        for lid, sid in sids.items():
+            try:
+                twilio.calls(sid).update(status="completed")
+                log.info(f"Multi [{batch_id}] killed call to lead {lid} (SID={sid})")
+            except Exception:
+                pass
+            with _batch_lock:
+                batch["dropped"].append(lid)
+
+    threading.Thread(target=_kill_others, daemon=True).start()
+
+    log.info(f"Multi [{batch_id}] WINNER: lead {lead_id} ({batch['winner_name']})")
+    caller_id = pick_from_number(batch["winner_phone"])
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Response><Dial callerId="' + caller_id + '"'
+        ' record="record-from-ringing-dual"'
+        ' recordingStatusCallback="/voice/recording"'
+        ' recordingStatusCallbackMethod="POST">'
+        f'<Conference startConferenceOnEnter="true" endConferenceOnExit="true"'
+        f' waitUrl="" beep="false">{conference}</Conference>'
+        '</Dial></Response>'
+    )
+    return Response(twiml, mimetype="text/xml")
+
+
+@app.route("/voice/multi-status/<batch_id>/<int:lead_id>", methods=["POST"])
+def voice_multi_status(batch_id: str, lead_id: int):
+    """Status callback for each outbound call in a multi-line batch."""
+    call_status = request.form.get("CallStatus", "")
+    log.info(f"Multi [{batch_id}] lead {lead_id} status: {call_status}")
+
+    with _batch_lock:
+        batch = _multi_batches.get(batch_id)
+        if batch:
+            batch["resolved_count"] += 1
+            if batch["resolved_count"] >= batch["total"] and batch["winner"] is None:
+                batch["status"] = "no_answer"
+                log.info(f"Multi [{batch_id}] all lines resolved — no one answered")
+    return ("", 204)
+
+
+@app.route("/dialer/batch/<batch_id>")
+def dialer_batch(batch_id: str):
+    """Get the current state of a multi-line batch (polled by the softphone)."""
+    with _batch_lock:
+        batch = _multi_batches.get(batch_id)
+    if not batch:
+        return jsonify({"error": "Batch not found"}), 404
+    resp = jsonify({
+        "batch_id": batch["batch_id"],
+        "status": batch["status"],
+        "winner": batch["winner"],
+        "winner_name": batch["winner_name"],
+        "winner_phone": batch["winner_phone"],
+        "total": batch["total"],
+        "resolved_count": batch["resolved_count"],
+        "dropped": batch["dropped"],
+    })
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
 @app.route("/dialer/current", methods=["GET", "POST"])
 def dialer_current():
     """Shared state between Streamlit and the softphone popup.
@@ -365,9 +578,7 @@ def dialer_current():
 
 @app.route("/softphone")
 def softphone_page():
-    """Persistent browser softphone. Opened once as a popup, stays alive across
-    leads. Polls /dialer/current for new leads; Twilio Device stays registered
-    between calls so subsequent dials connect in ~500ms."""
+    """Persistent browser softphone with multi-line support."""
     html = """<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
@@ -386,6 +597,9 @@ def softphone_page():
   .status.ended      { background:#f0f0f0; color:#555; }
   .status.error      { background:#f8d7da; color:#721c24; }
   .status.ready      { background:#e3f2fd; color:#0d47a1; }
+  .status.no-answer  { background:#fff3cd; color:#856404; }
+  .status.ringing    { animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.7;} }
   .lead-info { text-align:center; margin-bottom:8px; }
   .lead-name { font-size:18px; font-weight:700; color:#1a1a1a; }
   .lead-phone { font-size:14px; color:#666; }
@@ -436,9 +650,9 @@ def softphone_page():
   let timerInterval = null;
   let callStart = null;
   let deviceReady = false;
-  let lastDialTs = null;       // ts of the last lead we dialed (prevents re-dial)
-  let currentLead = null;      // {lead_id, caller_id, lead_name, lead_phone, ts}
-  let pollInterval = null;
+  let lastDialTs = null;
+  let currentBatchId = null;
+  let batchPollInterval = null;
 
   function logMsg(msg) {
     const d = document.createElement('div');
@@ -472,12 +686,9 @@ def softphone_page():
     timerInterval = null;
   }
 
-  function dialLead(lead) {
-    if (connection) {
-      logMsg('Already on a call, ignoring new dial request');
-      return;
-    }
-    currentLead = lead;
+  // ── Single-line dial ──────────────────────────────────────────────────
+  function dialSingle(lead) {
+    if (connection) return;
     lastDialTs = lead.ts;
     nameEl.textContent = lead.lead_name || '(unknown)';
     phoneEl.textContent = lead.lead_phone || '';
@@ -493,8 +704,51 @@ def softphone_page():
     });
   }
 
+  // ── Multi-line dial ───────────────────────────────────────────────────
+  function joinMulti(data) {
+    if (connection) return;
+    lastDialTs = data.ts;
+    currentBatchId = data.batch_id;
+    nameEl.textContent = data.lines + ' lines ringing...';
+    phoneEl.textContent = '';
+    timerEl.textContent = '00:00';
+    setStatus('Ringing ' + data.lines + ' leads — waiting for first answer', 'ringing');
+    btnCall.disabled = true;
+    btnHangup.disabled = false;
+    btnMute.disabled = false;
+    logMsg('Multi-line: joining conference ' + data.conference);
+    connection = Twilio.Device.connect({ conference: data.conference });
+
+    if (batchPollInterval) clearInterval(batchPollInterval);
+    batchPollInterval = setInterval(function() {
+      fetch('/dialer/batch/' + currentBatchId)
+        .then(function(r) { return r.json(); })
+        .then(function(b) {
+          if (b.status === 'connected' && b.winner_name) {
+            nameEl.textContent = b.winner_name;
+            phoneEl.textContent = b.winner_phone || '';
+            setStatus('Connected — ' + b.winner_name, 'connected');
+            logMsg('Connected to ' + b.winner_name);
+            startTimer();
+            clearInterval(batchPollInterval);
+            batchPollInterval = null;
+          } else if (b.status === 'no_answer') {
+            nameEl.textContent = 'No one answered';
+            phoneEl.textContent = '';
+            setStatus('All ' + b.total + ' lines — no answer', 'no-answer');
+            logMsg('No one answered (' + b.total + ' leads)');
+            clearInterval(batchPollInterval);
+            batchPollInterval = null;
+            Twilio.Device.disconnectAll();
+          }
+        })
+        .catch(function() {});
+    }, 500);
+  }
+
   function hangUp() {
     Twilio.Device.disconnectAll();
+    if (batchPollInterval) { clearInterval(batchPollInterval); batchPollInterval = null; }
   }
 
   function toggleMute() {
@@ -505,36 +759,33 @@ def softphone_page():
     btnMute.classList.toggle('active', muted);
   }
 
-  // Manual call button — re-dial the current lead
-  btnCall.addEventListener('click', function() {
-    if (currentLead) dialLead(currentLead);
-  });
+  btnCall.addEventListener('click', function() { pollForLead(); });
   btnHangup.addEventListener('click', hangUp);
   btnMute.addEventListener('click', toggleMute);
 
-  // ── Poll /dialer/current for new leads ────────────────────────────────
+  // ── Poll /dialer/current for new leads / multi-batches ────────────────
   function pollForLead() {
     fetch('/dialer/current')
-      .then(r => r.json())
-      .then(data => {
-        if (!data || !data.lead_id || !data.ts) return;
-        if (data.ts === lastDialTs) return;   // already dialed this one
-        if (connection) return;                // on a call, don't interrupt
-        if (!deviceReady) return;              // not ready yet
-        dialLead(data);
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (!data || !data.ts) return;
+        if (data.ts === lastDialTs) return;
+        if (connection) return;
+        if (!deviceReady) return;
+        if (data.mode === 'multi') { joinMulti(data); }
+        else if (data.lead_id) { dialSingle(data); }
       })
-      .catch(() => {});  // silent — poll failures are expected on network blips
+      .catch(function() {});
   }
 
-  // Poll every 500ms — fast enough to feel instant from the user's perspective
-  pollInterval = setInterval(pollForLead, 500);
+  setInterval(pollForLead, 500);
 
   // ── Init Twilio Device ────────────────────────────────────────────────
   setStatus('Fetching token...', '');
   logMsg('Fetching access token...');
   fetch('/voice/token')
-    .then(r => r.json())
-    .then(data => {
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
       if (data.error) {
         setStatus(data.error, 'error');
         logMsg('ERROR: ' + data.error);
@@ -543,7 +794,7 @@ def softphone_page():
       Twilio.Device.setup(data.token, { debug: false });
       logMsg('Token received, setting up device...');
     })
-    .catch(err => {
+    .catch(function(err) {
       setStatus('Token fetch failed: ' + err, 'error');
       logMsg('ERROR: ' + err);
     });
@@ -557,16 +808,19 @@ def softphone_page():
 
   Twilio.Device.connect(function(conn) {
     connection = conn;
-    setStatus('Connected', 'connected');
-    startTimer();
-    logMsg('Call connected');
+    if (!currentBatchId) {
+      setStatus('Connected', 'connected');
+      startTimer();
+      logMsg('Call connected');
+    }
   });
 
   Twilio.Device.disconnect(function() {
     connection = null;
+    currentBatchId = null;
     muted = false;
     stopTimer();
-    setStatus('Call ended — click disposition in CRM, then next lead auto-dials', 'ended');
+    setStatus('Call ended — dispose in CRM, next auto-dials', 'ended');
     btnCall.disabled = false;
     btnHangup.disabled = true;
     btnMute.disabled = true;
@@ -579,18 +833,19 @@ def softphone_page():
     setStatus('Error: ' + err.message, 'error');
     logMsg('ERROR: ' + err.message);
     connection = null;
+    currentBatchId = null;
     stopTimer();
     btnCall.disabled = false;
     btnHangup.disabled = true;
     btnMute.disabled = true;
   });
 
-  // ── Token refresh (Twilio tokens expire after ~1hr) ───────────────────
+  // ── Token refresh ─────────────────────────────────────────────────────
   setInterval(function() {
-    if (connection) return;  // don't refresh mid-call
+    if (connection) return;
     fetch('/voice/token')
-      .then(r => r.json())
-      .then(data => {
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
         if (data.token) {
           Twilio.Device.setup(data.token, { debug: false });
           logMsg('Token refreshed');

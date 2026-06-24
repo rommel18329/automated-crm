@@ -2017,10 +2017,12 @@ elif page == "dialer":
             unsafe_allow_html=True,
         )
 
-        # ── Call mode ──────────────────────────────────────────────────────
+        # ── Call mode + line count ────────────────────────────────────────
         _base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
         _browser_ready = bool(os.getenv("TWILIO_TWIML_APP_SID"))
         st.session_state.setdefault("dialer_call_mode", "browser" if _browser_ready else "phone")
+        st.session_state.setdefault("dialer_lines", 3)
+        st.session_state.setdefault("dialer_batch_id", None)
 
         if not st.session_state["dialer_on_call"]:
             _call_mode = st.radio(
@@ -2065,45 +2067,75 @@ elif page == "dialer":
                     unsafe_allow_html=True,
                 )
 
-            for i, p in enumerate(phones, 1):
-                pcid = _auto_caller_id(p)
-                _is_browser = st.session_state["dialer_call_mode"] == "browser"
-                _call_label = (f"📞 Browser Call Phone {i}: {p}  (from {pcid})"
-                               if _is_browser
-                               else f"📞 Call Phone {i}: {p}  (from {pcid})")
-                if st.button(_call_label,
-                             key=f"dial_call_{lead_id}_{i}",
-                             type="primary" if i == 1 else "secondary",
+            _is_browser = st.session_state["dialer_call_mode"] == "browser"
+            _lines = st.session_state["dialer_lines"]
+
+            if _is_browser and _browser_ready:
+                _lines = st.slider("Lines (simultaneous calls)", 1, 10,
+                                   value=st.session_state["dialer_lines"],
+                                   key="dialer_lines_slider")
+                st.session_state["dialer_lines"] = _lines
+
+            if _is_browser and _lines > 1 and _browser_ready:
+                _remaining = queue[idx:]
+                _batch_size = min(_lines, len(_remaining))
+                _batch_ids = _remaining[:_batch_size]
+                if st.button(f"📞 Dial {_batch_size} lines now",
+                             key="dial_multi", type="primary",
                              use_container_width=True):
-                    if not _is_browser:
-                        res = place_call(lead_id, from_number=_FROM_OPTS[pcid], to_number=p)
-                        if res.get("called"):
-                            st.session_state["dialer_on_call"] = True
-                            st.session_state["dialer_call_phone"] = p
-                            st.toast(f"📞 Calling {p} from {pcid} — your phone rings first.")
-                            st.rerun()
-                        else:
-                            st.error(f"Call failed: {res.get('error', 'unknown error')}")
+                    import requests as _req
+                    resp = _req.post(
+                        f"{_base_url}/dialer/multi-start",
+                        json={"lead_ids": _batch_ids},
+                        timeout=10,
+                    )
+                    if resp.ok:
+                        rdata = resp.json()
+                        st.session_state["dialer_on_call"] = True
+                        st.session_state["dialer_batch_id"] = rdata["batch_id"]
+                        st.session_state["dialer_batch_leads"] = _batch_ids
+                        st.rerun()
                     else:
-                        if not _browser_ready:
-                            st.error("Browser calling not set up. Run `python setup_twilio_app.py`.")
+                        st.error(f"Multi-dial failed: {resp.text}")
+            else:
+                for i, p in enumerate(phones, 1):
+                    pcid = _auto_caller_id(p)
+                    _call_label = (f"📞 Browser Call Phone {i}: {p}  (from {pcid})"
+                                   if _is_browser
+                                   else f"📞 Call Phone {i}: {p}  (from {pcid})")
+                    if st.button(_call_label,
+                                 key=f"dial_call_{lead_id}_{i}",
+                                 type="primary" if i == 1 else "secondary",
+                                 use_container_width=True):
+                        if not _is_browser:
+                            res = place_call(lead_id, from_number=_FROM_OPTS[pcid], to_number=p)
+                            if res.get("called"):
+                                st.session_state["dialer_on_call"] = True
+                                st.session_state["dialer_call_phone"] = p
+                                st.toast(f"📞 Calling {p} from {pcid} — your phone rings first.")
+                                st.rerun()
+                            else:
+                                st.error(f"Call failed: {res.get('error', 'unknown error')}")
                         else:
-                            import requests as _req
-                            _ts = datetime.utcnow().isoformat()
-                            _req.post(
-                                f"{_base_url}/dialer/current",
-                                json={
-                                    "lead_id": lead_id,
-                                    "caller_id": _FROM_OPTS[pcid],
-                                    "lead_name": lead["name"],
-                                    "lead_phone": p,
-                                    "ts": _ts,
-                                },
-                                timeout=3,
-                            )
-                            st.session_state["dialer_on_call"] = True
-                            st.session_state["dialer_call_phone"] = p
-                            st.rerun()
+                            if not _browser_ready:
+                                st.error("Browser calling not set up. Run `python setup_twilio_app.py`.")
+                            else:
+                                import requests as _req
+                                _ts = datetime.utcnow().isoformat()
+                                _req.post(
+                                    f"{_base_url}/dialer/current",
+                                    json={
+                                        "lead_id": lead_id,
+                                        "caller_id": _FROM_OPTS[pcid],
+                                        "lead_name": lead["name"],
+                                        "lead_phone": p,
+                                        "ts": _ts,
+                                    },
+                                    timeout=3,
+                                )
+                                st.session_state["dialer_on_call"] = True
+                                st.session_state["dialer_call_phone"] = p
+                                st.rerun()
 
             nc1, nc2, nc3 = st.columns(3)
             if nc1.button("⏮ Prev", key="dial_prev", disabled=idx == 0,
@@ -2118,12 +2150,58 @@ elif page == "dialer":
                 nav_to("Leads", lead_id)
         else:
             # ── On-call view ──────────────────────────────────────────────
+            _batch_id = st.session_state.get("dialer_batch_id")
+            _winner_id = None
+            _winner_name = ""
+            if _batch_id:
+                try:
+                    import requests as _req
+                    _br = _req.get(f"{_base_url}/dialer/batch/{_batch_id}", timeout=3).json()
+                    _winner_id = _br.get("winner")
+                    _winner_name = _br.get("winner_name", "")
+                    _batch_status = _br.get("status", "")
+                    if _batch_status == "ringing":
+                        st.info(f"Multi-line ringing... ({_br.get('total', '?')} leads) — check softphone")
+                    elif _batch_status == "connected" and _winner_name:
+                        st.success(f"Connected to: **{_winner_name}** ({_br.get('winner_phone', '')})")
+                    elif _batch_status == "no_answer":
+                        st.warning("No one answered this batch.")
+                except Exception:
+                    pass
+
             st.markdown("**Pick the outcome when you hang up:**")
             d_cols = st.columns(3)
             for i, label in enumerate(DISPOSITIONS):
                 if d_cols[i % 3].button(label, key=f"dial_disp_{label}",
                                         use_container_width=True):
-                    _dispose(lead_id, label)
-            if st.button("✖ Cancel (didn't actually call)", key="dial_cancel"):
+                    if _batch_id and _winner_id:
+                        _dispose(_winner_id, label)
+                        _batch_leads = st.session_state.get("dialer_batch_leads", [])
+                        _dropped = [lid for lid in _batch_leads if lid != _winner_id]
+                        if _dropped:
+                            _q = st.session_state["dialer_queue"]
+                            _q.extend(_dropped)
+                        st.session_state["dialer_batch_id"] = None
+                        st.session_state["dialer_batch_leads"] = []
+                    else:
+                        _dispose(lead_id, label)
+
+            _cancel_col1, _cancel_col2 = st.columns(2)
+            if _cancel_col1.button("✖ Cancel (didn't actually call)", key="dial_cancel"):
+                if _batch_id:
+                    _batch_leads = st.session_state.get("dialer_batch_leads", [])
+                    _q = st.session_state["dialer_queue"]
+                    _q.extend(_batch_leads)
+                    st.session_state["dialer_batch_id"] = None
+                    st.session_state["dialer_batch_leads"] = []
                 st.session_state["dialer_on_call"] = False
                 st.rerun()
+            if _batch_id and _batch_status == "no_answer":
+                if _cancel_col2.button("⏭ Skip batch — next", key="dial_skip_batch"):
+                    _batch_leads = st.session_state.get("dialer_batch_leads", [])
+                    _q = st.session_state["dialer_queue"]
+                    _q.extend(_batch_leads)
+                    st.session_state["dialer_batch_id"] = None
+                    st.session_state["dialer_batch_leads"] = []
+                    st.session_state["dialer_on_call"] = False
+                    st.rerun()
