@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 import requests as _http
-from flask import Flask, request, Response
+from flask import Flask, request, Response, jsonify
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -39,6 +39,9 @@ DB_PATH = PROJECT_ROOT / "crm.db"
 MY_CELL_NUMBER = os.getenv("MY_CELL_NUMBER", "")
 ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWIML_APP_SID = os.getenv("TWILIO_TWIML_APP_SID", "")
+API_KEY = os.getenv("TWILIO_API_KEY", "")
+API_SECRET = os.getenv("TWILIO_API_SECRET", "")
 
 # In-memory map: CallSid → lead_id, used to attach recordings to the right lead
 _call_sid_to_lead: dict[str, int] = {}
@@ -163,7 +166,10 @@ def voice_connect(lead_id: int):
         )
 
     from_number = os.getenv("TWILIO_FROM_NUMBER", "")
-    lead_e164 = to_e164(lead["phone"])
+    # The dialer can request a specific alternate number via ?to=; otherwise
+    # fall back to the lead's primary stored phone.
+    to_override = request.args.get("to", "")
+    lead_e164 = to_e164(to_override) if to_override else to_e164(lead["phone"])
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<Response>'
@@ -270,6 +276,240 @@ def serve_recording(recording_sid):
     except Exception as exc:
         log.warning(f"Failed to proxy recording {recording_sid}: {exc}")
         return Response("Recording unavailable", status=502)
+
+
+@app.route("/voice/token")
+def voice_token():
+    """Generate a short-lived Twilio access token so the browser can make calls."""
+    if not API_KEY or not API_SECRET or not TWIML_APP_SID:
+        return jsonify({"error": "Browser calling not set up. Run setup_twilio_app.py first."}), 500
+
+    from twilio.jwt.access_token import AccessToken
+    from twilio.jwt.access_token.grants import VoiceGrant
+
+    token = AccessToken(ACCOUNT_SID, API_KEY, API_SECRET, identity="crm-dialer")
+    token.add_grant(VoiceGrant(outgoing_application_sid=TWIML_APP_SID))
+    jwt = token.to_jwt()
+    resp = jsonify({"token": jwt})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/voice/browser-connect", methods=["POST"])
+def voice_browser_connect():
+    """TwiML endpoint called by Twilio when the browser softphone dials out.
+    Reads lead_id + caller_id from the custom params and bridges to the lead."""
+    lead_id_raw = request.form.get("lead_id", "")
+    caller_id = request.form.get("caller_id", "") or os.getenv("TWILIO_FROM_NUMBER", "")
+    call_sid = request.form.get("CallSid", "")
+
+    if not lead_id_raw:
+        return Response(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Response><Say>No lead specified.</Say></Response>',
+            mimetype="text/xml",
+        )
+
+    lead = db.fetch_lead(int(lead_id_raw), DB_PATH)
+    if not lead:
+        return Response(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Response><Say>Lead not found.</Say></Response>',
+            mimetype="text/xml",
+        )
+
+    lead_e164 = to_e164(lead["phone"])
+
+    db.add_interaction(
+        lead["id"], "call",
+        f"Outbound call (browser dialer) to {lead['name']}",
+        "outbound", DB_PATH, ts=datetime.utcnow(),
+    )
+    if call_sid:
+        _call_sid_to_lead[call_sid] = lead["id"]
+
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Response>'
+        f'<Dial callerId="{caller_id}"'
+        ' record="record-from-ringing-dual"'
+        ' recordingStatusCallback="/voice/recording"'
+        ' recordingStatusCallbackMethod="POST">'
+        f'{lead_e164}'
+        '</Dial>'
+        '</Response>'
+    )
+    log.info(f"Browser call → {lead['name']} ({lead_e164}) from {caller_id}")
+    return Response(twiml, mimetype="text/xml")
+
+
+@app.route("/softphone")
+def softphone_page():
+    """Serve the browser softphone UI. Loaded in an iframe by the Streamlit dialer."""
+    lead_id = request.args.get("lead_id", "")
+    caller_id = request.args.get("caller_id", "")
+    lead_name = request.args.get("lead_name", "")
+    lead_phone = request.args.get("lead_phone", "")
+    autoconnect = request.args.get("autoconnect", "0") == "1"
+
+    html = f"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+         background:#fafbfa; padding:12px; }}
+  .status {{ text-align:center; padding:10px; font-size:14px; color:#555;
+             border-radius:8px; margin-bottom:10px; background:#f0f0f0; }}
+  .status.connecting {{ background:#fff3cd; color:#856404; }}
+  .status.ringing {{ background:#fff3cd; color:#856404; }}
+  .status.connected {{ background:#d4edda; color:#155724; }}
+  .status.ended {{ background:#f0f0f0; color:#555; }}
+  .status.error {{ background:#f8d7da; color:#721c24; }}
+  .lead-info {{ text-align:center; margin-bottom:12px; }}
+  .lead-name {{ font-size:16px; font-weight:700; color:#1a1a1a; }}
+  .lead-phone {{ font-size:13px; color:#666; }}
+  .timer {{ text-align:center; font-size:24px; font-weight:700; color:#1a1a1a;
+            margin:8px 0; font-variant-numeric:tabular-nums; }}
+  .buttons {{ display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }}
+  .btn {{ padding:10px 20px; border:none; border-radius:8px; font-size:14px;
+          font-weight:600; cursor:pointer; transition:all 0.15s; }}
+  .btn:hover {{ transform:scale(1.03); }}
+  .btn:disabled {{ opacity:0.4; cursor:not-allowed; transform:none; }}
+  .btn-call {{ background:#28a745; color:#fff; }}
+  .btn-hangup {{ background:#dc3545; color:#fff; }}
+  .btn-mute {{ background:#6c757d; color:#fff; }}
+  .btn-mute.active {{ background:#ffc107; color:#000; }}
+</style>
+</head><body>
+<div class="lead-info">
+  <div class="lead-name">{lead_name}</div>
+  <div class="lead-phone">{lead_phone}</div>
+</div>
+<div class="timer" id="timer">00:00</div>
+<div class="status" id="status">Loading softphone...</div>
+<div class="buttons">
+  <button class="btn btn-call" id="btnCall" disabled>📞 Call</button>
+  <button class="btn btn-mute" id="btnMute" disabled>🔇 Mute</button>
+  <button class="btn btn-hangup" id="btnHangup" disabled>📕 Hang Up</button>
+</div>
+
+<script src="https://sdk.twilio.com/js/client/releases/1.14/twilio.min.js"></script>
+<script>
+(function() {{
+  const statusEl = document.getElementById('status');
+  const timerEl  = document.getElementById('timer');
+  const btnCall  = document.getElementById('btnCall');
+  const btnMute  = document.getElementById('btnMute');
+  const btnHangup= document.getElementById('btnHangup');
+
+  let connection = null;
+  let muted = false;
+  let timerInterval = null;
+  let callStart = null;
+
+  function setStatus(text, cls) {{
+    statusEl.textContent = text;
+    statusEl.className = 'status ' + (cls || '');
+  }}
+
+  function updateTimer() {{
+    if (!callStart) return;
+    const secs = Math.floor((Date.now() - callStart) / 1000);
+    const m = String(Math.floor(secs / 60)).padStart(2, '0');
+    const s = String(secs % 60).padStart(2, '0');
+    timerEl.textContent = m + ':' + s;
+  }}
+
+  function startTimer() {{
+    callStart = Date.now();
+    timerInterval = setInterval(updateTimer, 1000);
+    updateTimer();
+  }}
+
+  function stopTimer() {{
+    clearInterval(timerInterval);
+    timerInterval = null;
+  }}
+
+  function makeCall() {{
+    if (connection) return;
+    setStatus('Connecting...', 'connecting');
+    btnCall.disabled = true;
+    btnHangup.disabled = false;
+    btnMute.disabled = false;
+    connection = Twilio.Device.connect({{
+      lead_id: '{lead_id}',
+      caller_id: '{caller_id}'
+    }});
+  }}
+
+  function hangUp() {{
+    Twilio.Device.disconnectAll();
+  }}
+
+  function toggleMute() {{
+    if (!connection) return;
+    muted = !muted;
+    connection.mute(muted);
+    btnMute.textContent = muted ? '🔊 Unmute' : '🔇 Mute';
+    btnMute.classList.toggle('active', muted);
+  }}
+
+  btnCall.addEventListener('click', makeCall);
+  btnHangup.addEventListener('click', hangUp);
+  btnMute.addEventListener('click', toggleMute);
+
+  // Fetch token and init
+  setStatus('Fetching token...', '');
+  fetch('/voice/token')
+    .then(r => r.json())
+    .then(data => {{
+      if (data.error) {{
+        setStatus(data.error, 'error');
+        return;
+      }}
+      Twilio.Device.setup(data.token, {{ debug: false }});
+    }})
+    .catch(err => setStatus('Token fetch failed: ' + err, 'error'));
+
+  Twilio.Device.ready(function() {{
+    setStatus('Ready to call', '');
+    btnCall.disabled = false;
+    {'setTimeout(makeCall, 300);' if autoconnect else ''}
+  }});
+
+  Twilio.Device.connect(function(conn) {{
+    connection = conn;
+    setStatus('Connected', 'connected');
+    startTimer();
+  }});
+
+  Twilio.Device.disconnect(function() {{
+    connection = null;
+    muted = false;
+    stopTimer();
+    setStatus('Call ended', 'ended');
+    btnCall.disabled = false;
+    btnHangup.disabled = true;
+    btnMute.disabled = true;
+    btnMute.textContent = '🔇 Mute';
+    btnMute.classList.remove('active');
+  }});
+
+  Twilio.Device.error(function(err) {{
+    setStatus('Error: ' + err.message, 'error');
+    connection = null;
+    stopTimer();
+    btnCall.disabled = false;
+    btnHangup.disabled = true;
+    btnMute.disabled = true;
+  }});
+}})();
+</script>
+</body></html>"""
+    return Response(html, mimetype="text/html")
 
 
 @app.route("/health")

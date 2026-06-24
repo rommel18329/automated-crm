@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 import base64
+import io
+import os
+import re
 import time
+import urllib.parse
 
 import streamlit as st
 
@@ -256,6 +260,22 @@ def _auto_caller_id(phone: str) -> str:
     digits = "".join(c for c in (phone or "") if c.isdigit())
     area = digits[:3] if len(digits) == 10 else digits[1:4]
     return "773" if area in _IL_AREA_CODES else "515"
+
+
+def lead_phones(lead: dict) -> list[str]:
+    """All dialable numbers for a lead, in order (primary first, then any
+    'Phones:' list the dialer stored in the timeline note). Deduped, max 5."""
+    phones: list[str] = []
+    primary = (lead.get("phone") or "").strip()
+    if primary:
+        phones.append(primary)
+    m = re.search(r"Phones:\s*([0-9,\s\-()]+)", lead.get("timeline", "") or "")
+    if m:
+        for chunk in m.group(1).split(","):
+            p = chunk.strip()
+            if p and p not in phones:
+                phones.append(p)
+    return phones[:5]
 
 
 def fmt_stamp(dt: datetime) -> str:
@@ -1334,13 +1354,23 @@ elif page == "leads":
     preset_filter = st.session_state.pop("lead_status_filter", None)
     status_filter = st.multiselect(
         "Filter by status",
-        ["hot", "warm", "cold", "investor", "dead", "contract"],
+        ["hot", "warm", "cold", "investor", "dead", "contract", "uncontacted"],
         default=preset_filter or [],
         key="lead_status_multiselect",
     )
+
+    def _status_match(l: dict) -> bool:
+        # "Uncontacted" = raw call leads (never dialed). Keep them OUT of the
+        # worked-status buckets so the cold/warm/hot pools stay clean.
+        if not status_filter:
+            return True
+        if l.get("conversation_stage") == "not_contacted":
+            return "uncontacted" in status_filter
+        return l["status"] in status_filter
+
     matches = [
         l for l in all_leads
-        if (not status_filter or l["status"] in status_filter)
+        if _status_match(l)
         and (not q or q in l["name"].lower() or q in l["phone"].lower())
     ]
     focus_ids = st.session_state.pop("lead_focus_ids", [])
@@ -1830,6 +1860,10 @@ elif page == "dialer":
         who = st.session_state.get("user", "RJ")
         db.add_interaction(lead_id, "call", f"{note} ({who})", "outbound")
         fields = {"last_contact_date": date.today().isoformat()}
+        # A call lead "graduates" into a normal lead once it's actually dialed.
+        lead = lead_lookup.get(lead_id)
+        if lead and lead.get("conversation_stage") == "not_contacted":
+            fields["conversation_stage"] = "initial_contact"
         if days is not None:
             fields["next_action_date"] = (date.today() + timedelta(days=days)).isoformat()
         db.update_lead(lead_id, fields)
@@ -1840,17 +1874,48 @@ elif page == "dialer":
 
     # ── Import a list ─────────────────────────────────────────────────────────
     with st.expander("➕ Import a list to dial", expanded=not queue):
-        raw = st.text_area(
-            "Paste anything — names, numbers, addresses. Messy is fine; AI cleans it up.",
-            key="dialer_raw_input", height=160,
-            placeholder="John Smith 773-555-0100 123 Main St\n(515) 555-0199 Jane Doe ...",
+        _imp_mode = st.radio(
+            "Import mode",
+            ["Auto (table first, AI fallback)", "Table parse only (free)", "AI cleanup (uses Claude)"],
+            key="dialer_import_mode", horizontal=True,
         )
-        if st.button("🤖 Parse with AI", key="dialer_parse"):
-            with st.spinner("Claude is extracting contacts..."):
-                contacts, warnings = parse_contacts(raw)
-            st.session_state["dialer_preview"] = contacts
-            st.session_state["dialer_warnings"] = warnings
-            st.rerun()
+        _mode_map = {"Auto (table first, AI fallback)": "auto",
+                     "Table parse only (free)": "table",
+                     "AI cleanup (uses Claude)": "ai"}
+        _selected_mode = _mode_map[_imp_mode]
+
+        _imp_tab1, _imp_tab2 = st.tabs(["📁 Upload file", "📋 Paste text"])
+
+        with _imp_tab1:
+            uploaded = st.file_uploader(
+                "Drag & drop or browse — CSV, XLSX, or TXT",
+                type=["csv", "tsv", "txt", "xlsx"], key="dialer_file_upload",
+            )
+            if uploaded and st.button("Parse file", key="dialer_parse_file"):
+                with st.spinner("Parsing file..."):
+                    if uploaded.name.endswith(".xlsx"):
+                        import pandas as pd
+                        df = pd.read_excel(uploaded)
+                        file_text = df.to_csv(index=False)
+                    else:
+                        file_text = uploaded.read().decode("utf-8", errors="replace")
+                    contacts, warnings = parse_contacts(file_text, mode=_selected_mode)
+                st.session_state["dialer_preview"] = contacts
+                st.session_state["dialer_warnings"] = warnings
+                st.rerun()
+
+        with _imp_tab2:
+            raw = st.text_area(
+                "Paste anything — names, numbers, addresses. Messy is fine.",
+                key="dialer_raw_input", height=160,
+                placeholder="John Smith 773-555-0100 123 Main St\n(515) 555-0199 Jane Doe ...",
+            )
+            if st.button("Parse text", key="dialer_parse"):
+                with st.spinner("Parsing contacts..."):
+                    contacts, warnings = parse_contacts(raw, mode=_selected_mode)
+                st.session_state["dialer_preview"] = contacts
+                st.session_state["dialer_warnings"] = warnings
+                st.rerun()
 
         preview = st.session_state.get("dialer_preview")
         if preview is not None:
@@ -1859,22 +1924,65 @@ elif page == "dialer":
             if preview:
                 st.markdown(f"**{len(preview)} contacts found — double-check, then add:**")
                 st.dataframe(
-                    [{"Name": c.name, "Phone": c.phone, "Address": c.address} for c in preview],
+                    [{"Name": c.name, "Phones": ", ".join(c.phones), "Address": c.address}
+                     for c in preview],
                     use_container_width=True, hide_index=True,
                 )
                 if st.button(f"✅ Add {len(preview)} to dialer", key="dialer_confirm", type="primary"):
-                    new_ids = []
+                    # Index every number already in the CRM so we never create a
+                    # duplicate call lead for someone already on file (double-dial risk).
+                    existing_nums: dict[str, int] = {}
+                    for l in all_leads:
+                        for p in lead_phones(l):
+                            existing_nums.setdefault(p, l["id"])
+
+                    FUTURE = "2999-12-31"  # park call leads out of the follow-up queue until dialed
+                    new_ids: list[int] = []
+                    seen_nums: set[str] = set()
+                    skipped_existing = skipped_dupe = 0
                     for c in preview:
-                        lid = db.create_lead(c.name, c.phone)
-                        if c.address:
+                        # Dedupe across ALL of this contact's numbers — against the
+                        # CRM and against earlier rows in this same import.
+                        if any(p in existing_nums for p in c.phones):
+                            skipped_existing += 1
+                            continue
+                        if any(p in seen_nums for p in c.phones):
+                            skipped_dupe += 1
+                            continue
+                        # New "call lead": coldest tier, uncontacted, no auto follow-ups
+                        # until it is actually dialed (then _dispose graduates it).
+                        lid = db.create_lead(
+                            c.name, c.phone,
+                            conversation_stage="not_contacted",
+                            next_action_date=FUTURE,
+                        )
+                        # Store address + the full ordered phone list so the dialer
+                        # can call every number on file. The Situation/Notes scaffold
+                        # keeps parse_timeline_parts able to read the address cleanly
+                        # (the phone list lands in the Notes channel).
+                        if len(c.phones) > 1:
+                            tl = (f"Address: {c.address}. Situation: . "
+                                  f"Notes: Phones: {', '.join(c.phones)}")
+                            db.update_lead(lid, {"timeline": tl})
+                        elif c.address:
                             db.update_lead(lid, {"timeline": f"Address: {c.address}"})
+                        for p in c.phones:
+                            seen_nums.add(p)
                         new_ids.append(lid)
                     st.session_state["dialer_queue"] = queue + new_ids
                     st.session_state["dialer_idx"] = len(queue)   # jump to first new lead
                     st.session_state["dialer_on_call"] = False
                     st.session_state["dialer_preview"] = None
                     st.session_state["dialer_warnings"] = []
-                    st.success(f"Added {len(new_ids)} leads to the dialer.")
+                    msg = f"Added {len(new_ids)} new call leads to the dialer."
+                    extras = []
+                    if skipped_existing:
+                        extras.append(f"{skipped_existing} already in CRM")
+                    if skipped_dupe:
+                        extras.append(f"{skipped_dupe} duplicate in paste")
+                    if extras:
+                        msg += "  Skipped " + ", ".join(extras) + "."
+                    st.success(msg)
                     st.rerun()
             else:
                 st.info("No dialable contacts found in that paste.")
@@ -1892,42 +2000,111 @@ elif page == "dialer":
         st.progress((idx + 1) / len(queue))
         st.caption(f"Lead {idx + 1} of {len(queue)}")
 
+        phones = lead_phones(lead)
+        phone_lines = "".join(
+            f"<div style='font-size:1.05rem;color:#444;margin-top:2px'>"
+            f"<b>Phone {i}:</b> {p}</div>"
+            for i, p in enumerate(phones, 1)
+        )
         st.markdown(
             "<div style='border:1px solid #ddd;border-radius:10px;padding:16px 20px;"
             "background:#fafbfa;margin:8px 0'>"
             f"<div style='font-size:1.4rem;font-weight:700;color:#1a1a1a'>{lead['name']}</div>"
-            f"<div style='font-size:1.1rem;color:#444;margin-top:2px'>{lead['phone']}</div>"
+            + phone_lines
             + (f"<div style='font-size:0.9rem;color:#777;margin-top:4px'>📍 {address_text}</div>"
                if address_text else "")
             + "</div>",
             unsafe_allow_html=True,
         )
 
-        cid = _auto_caller_id(lead["phone"])
+        # ── Call mode ──────────────────────────────────────────────────────
+        _base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+        _browser_ready = bool(os.getenv("TWILIO_TWIML_APP_SID"))
+        st.session_state.setdefault("dialer_call_mode", "browser" if _browser_ready else "phone")
 
         if not st.session_state["dialer_on_call"]:
-            cc1, cc2, cc3, cc4 = st.columns([2, 1, 1, 1])
-            if cc1.button(f"📞 CALL  (from {cid})", key=f"dial_call_{lead_id}",
-                          type="primary", use_container_width=True):
-                res = place_call(lead_id, from_number=_FROM_OPTS[cid])
-                if res.get("called"):
-                    st.session_state["dialer_on_call"] = True
-                    st.toast(f"📞 Calling from {cid} — your phone rings first, then bridges.")
-                    st.rerun()
+            _mode_col, _note_col = st.columns([2, 3])
+            with _mode_col:
+                _call_mode = st.radio(
+                    "Call mode",
+                    ["Browser (headset/mic)", "Phone (bridges to your cell)"],
+                    key="dialer_call_mode_radio", horizontal=True,
+                    index=0 if st.session_state["dialer_call_mode"] == "browser" else 1,
+                )
+                st.session_state["dialer_call_mode"] = (
+                    "browser" if "Browser" in _call_mode else "phone"
+                )
+            with _note_col:
+                if st.session_state["dialer_call_mode"] == "browser":
+                    if not _browser_ready:
+                        st.warning("Browser calling not set up. Run `python setup_twilio_app.py` first, then restart the webhook server.")
+                    else:
+                        st.caption("Calls go through your browser mic/speakers — no phone needed.")
                 else:
-                    st.error(f"Call failed: {res.get('error', 'unknown error')}")
-            if cc2.button("⏮ Prev", key="dial_prev", disabled=idx == 0,
+                    st.caption("Your cell rings first, then bridges to the lead.")
+
+            for i, p in enumerate(phones, 1):
+                pcid = _auto_caller_id(p)
+                _call_label = (f"📞 Call Phone {i}: {p}  (from {pcid})"
+                               if st.session_state["dialer_call_mode"] == "phone"
+                               else f"📞 Browser Call Phone {i}: {p}  (from {pcid})")
+                if st.button(_call_label,
+                             key=f"dial_call_{lead_id}_{i}",
+                             type="primary" if i == 1 else "secondary",
+                             use_container_width=True):
+                    if st.session_state["dialer_call_mode"] == "phone":
+                        res = place_call(lead_id, from_number=_FROM_OPTS[pcid], to_number=p)
+                        if res.get("called"):
+                            st.session_state["dialer_on_call"] = True
+                            st.session_state["dialer_call_phone"] = p
+                            st.toast(f"📞 Calling {p} from {pcid} — your phone rings first.")
+                            st.rerun()
+                        else:
+                            st.error(f"Call failed: {res.get('error', 'unknown error')}")
+                    else:
+                        if not _browser_ready:
+                            st.error("Browser calling not set up. Run `python setup_twilio_app.py`.")
+                        else:
+                            st.session_state["dialer_on_call"] = True
+                            st.session_state["dialer_call_phone"] = p
+                            st.session_state["dialer_browser_caller_id"] = _FROM_OPTS[pcid]
+                            st.rerun()
+
+            nc1, nc2, nc3 = st.columns(3)
+            if nc1.button("⏮ Prev", key="dial_prev", disabled=idx == 0,
                           use_container_width=True):
                 st.session_state["dialer_idx"] = max(0, idx - 1)
                 st.rerun()
-            if cc3.button("Skip ⏭", key="dial_skip", disabled=idx >= len(queue) - 1,
+            if nc2.button("Skip ⏭", key="dial_skip", disabled=idx >= len(queue) - 1,
                           use_container_width=True):
                 st.session_state["dialer_idx"] = min(len(queue) - 1, idx + 1)
                 st.rerun()
-            if cc4.button("Open lead", key="dial_open", use_container_width=True):
+            if nc3.button("Open lead", key="dial_open", use_container_width=True):
                 nav_to("Leads", lead_id)
         else:
-            st.markdown("**On call — pick the outcome when you hang up:**")
+            # ── On-call view ──────────────────────────────────────────────
+            if st.session_state["dialer_call_mode"] == "browser" and _browser_ready:
+                _sp_caller_id = st.session_state.get("dialer_browser_caller_id", _FROM_OPTS["515"])
+                _sp_name = urllib.parse.quote(lead["name"], safe="")
+                _sp_phone = urllib.parse.quote(
+                    st.session_state.get("dialer_call_phone", lead["phone"]), safe="")
+                _sp_url = (
+                    f"{_base_url}/softphone"
+                    f"?lead_id={lead_id}"
+                    f"&caller_id={urllib.parse.quote(_sp_caller_id, safe='')}"
+                    f"&lead_name={_sp_name}"
+                    f"&lead_phone={_sp_phone}"
+                    f"&autoconnect=1"
+                )
+                st.markdown(
+                    f'<iframe src="{_sp_url}" allow="microphone" '
+                    f'style="width:100%;height:220px;border:1px solid #ddd;'
+                    f'border-radius:10px;background:#fafbfa" '
+                    f'frameborder="0"></iframe>',
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown("**Pick the outcome when you hang up:**")
             d_cols = st.columns(3)
             for i, label in enumerate(DISPOSITIONS):
                 if d_cols[i % 3].button(label, key=f"dial_disp_{label}",
