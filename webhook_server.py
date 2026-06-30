@@ -674,6 +674,40 @@ def dialer_dispose():
     return resp
 
 
+@app.route("/dialer/status", methods=["POST", "OPTIONS"])
+def dialer_set_status():
+    """Manually set a lead's status (cold/warm/hot) from the softphone popup.
+    This is a direct status-field update (the dashboard does the same) — it does
+    NOT touch the engine's escalation logic. Logs a note for the audit trail."""
+    if request.method == "OPTIONS":
+        resp = Response("")
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
+        return resp
+    data = request.get_json(force=True, silent=True) or {}
+    lead_id = data.get("lead_id")
+    status = (data.get("status") or "").lower()
+    if not lead_id or status not in ("cold", "warm", "hot"):
+        resp = jsonify({"ok": False, "error": "bad lead_id or status"})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp, 400
+
+    lead = db.fetch_lead(int(lead_id), DB_PATH)
+    if not lead:
+        resp = jsonify({"ok": False, "error": "lead not found"})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp, 404
+
+    db.update_lead(int(lead_id), {"status": status}, DB_PATH)
+    db.add_interaction(int(lead_id), "note", f"Marked {status.upper()} from dialer",
+                       "outbound", DB_PATH, ts=datetime.utcnow())
+    log.info(f"Set lead {lead_id} ({lead['name']}) status -> {status}")
+
+    resp = jsonify({"ok": True, "lead_id": lead_id, "status": status})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
 @app.route("/dialer/current", methods=["GET", "POST"])
 def dialer_current():
     """Shared state between Streamlit and the softphone popup.
@@ -733,10 +767,17 @@ def softphone_page():
   .disp-title { font-size:12px; color:#777; text-align:center; margin-bottom:6px;
                 text-transform:uppercase; letter-spacing:.5px; }
   .disp-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; }
+  .disp-grid.locked { opacity:.4; pointer-events:none; }
   .disp-btn { padding:9px 4px; border:1px solid #ccc; border-radius:7px;
               background:#fff; font-size:12px; font-weight:600; cursor:pointer;
               color:#333; transition:all .12s; }
   .disp-btn:hover { background:#f0f7f1; border-color:#6B8F71; }
+  .st-hot  { border-color:#e74c3c; color:#c0392b; }
+  .st-hot:hover  { background:#fdecea; }
+  .st-warm { border-color:#e69500; color:#b8770a; }
+  .st-warm:hover { background:#fff6e6; }
+  .st-cold { border-color:#3498db; color:#2471a3; }
+  .st-cold:hover { background:#eaf4fb; }
   .disp-done { text-align:center; font-size:13px; color:#155724; font-weight:600;
                background:#d4edda; padding:8px; border-radius:7px; margin-top:8px; display:none; }
   .disp-done.show { display:block; }
@@ -758,14 +799,20 @@ def softphone_page():
   <button class="btn btn-hangup" id="btnHangup" disabled>📕 Hang Up</button>
 </div>
 <div class="disp" id="disp">
-  <div class="disp-title">Disposition — saves to CRM instantly</div>
-  <div class="disp-grid">
+  <div class="disp-title">Call outcome — saves to CRM</div>
+  <div class="disp-grid" id="dispOutcome">
     <button class="disp-btn" onclick="dispose('No Answer')">No Answer</button>
     <button class="disp-btn" onclick="dispose('Voicemail')">Voicemail</button>
     <button class="disp-btn" onclick="dispose('Connected')">Connected</button>
     <button class="disp-btn" onclick="dispose('Callback')">Callback</button>
     <button class="disp-btn" onclick="dispose('Not Interested')">Not Interested</button>
     <button class="disp-btn" onclick="dispose('Wrong Number')">Wrong Number</button>
+  </div>
+  <div class="disp-title" style="margin-top:10px">Set lead status</div>
+  <div class="disp-grid disp-grid-3" id="dispStatus">
+    <button class="disp-btn st-hot" onclick="setLeadStatus('hot')">🔥 Hot</button>
+    <button class="disp-btn st-warm" onclick="setLeadStatus('warm')">🌤 Warm</button>
+    <button class="disp-btn st-cold" onclick="setLeadStatus('cold')">❄️ Cold</button>
   </div>
 </div>
 <div class="disp-done" id="dispDone"></div>
@@ -784,8 +831,11 @@ def softphone_page():
   const logEl     = document.getElementById('log');
   const dispEl    = document.getElementById('disp');
   const dispDoneEl = document.getElementById('dispDone');
+  const dispOutcomeEl = document.getElementById('dispOutcome');
+  const dispStatusEl  = document.getElementById('dispStatus');
 
   let currentLeadId = null;     // lead being handled (null for manual quick-dials)
+  let savedParts = [];          // confirmation chips shown after saving
 
   let device = null;
   let call = null;
@@ -896,30 +946,43 @@ def softphone_page():
   function hideDisposition() {
     dispEl.classList.remove('show');
     dispDoneEl.classList.remove('show');
+    dispDoneEl.textContent = '';
+    dispOutcomeEl.classList.remove('locked');
+    dispStatusEl.classList.remove('locked');
+    savedParts = [];
   }
-  // Called by the disposition buttons — writes to the CRM immediately.
+  function showSaved(part) {
+    savedParts.push(part);
+    dispDoneEl.textContent = '✓ Saved: ' + savedParts.join('  ·  ');
+    dispDoneEl.classList.add('show');
+  }
+
+  // Call outcome -> logs the call + sets the next-call date.
   window.dispose = function(label) {
     if (!currentLeadId) return;
-    var lid = currentLeadId;
-    dispEl.classList.remove('show');
+    dispOutcomeEl.classList.add('locked');   // one outcome per call
     fetch('/dialer/dispose', { method: 'POST',
-      body: JSON.stringify({ lead_id: lid, disposition: label }) })
+      body: JSON.stringify({ lead_id: currentLeadId, disposition: label }) })
       .then(function(r) { return r.json(); })
       .then(function(j) {
-        if (j.ok) {
-          dispDoneEl.textContent = '✓ Saved to CRM: ' + label;
-          dispDoneEl.classList.add('show');
-          logMsg('Disposed: ' + label + ' (saved to CRM)');
-          currentLeadId = null;
-        } else {
-          dispEl.classList.add('show');
-          logMsg('Dispose failed: ' + (j.error || 'unknown'));
-        }
+        if (j.ok) { showSaved(label); logMsg('Outcome saved: ' + label); }
+        else { dispOutcomeEl.classList.remove('locked'); logMsg('Dispose failed: ' + (j.error || '')); }
       })
-      .catch(function(e) {
-        dispEl.classList.add('show');
-        logMsg('Dispose failed: ' + e);
-      });
+      .catch(function(e) { dispOutcomeEl.classList.remove('locked'); logMsg('Dispose failed: ' + e); });
+  };
+
+  // Lead status -> sets cold/warm/hot (direct status field update).
+  window.setLeadStatus = function(status) {
+    if (!currentLeadId) return;
+    dispStatusEl.classList.add('locked');    // one status per call
+    fetch('/dialer/status', { method: 'POST',
+      body: JSON.stringify({ lead_id: currentLeadId, status: status }) })
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        if (j.ok) { showSaved(status.toUpperCase()); logMsg('Status set: ' + status); }
+        else { dispStatusEl.classList.remove('locked'); logMsg('Status failed: ' + (j.error || '')); }
+      })
+      .catch(function(e) { dispStatusEl.classList.remove('locked'); logMsg('Status failed: ' + e); });
   };
 
   function updateTimer() {
