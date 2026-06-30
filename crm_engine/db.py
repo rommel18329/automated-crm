@@ -114,6 +114,24 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 timestamp      TEXT NOT NULL,
                 handled        INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS caller_id_pool (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone_number          TEXT NOT NULL UNIQUE,   -- E.164, +15155550100
+                area_code             TEXT NOT NULL,          -- '515'
+                twilio_sid            TEXT,                   -- Twilio number SID
+                status                TEXT NOT NULL DEFAULT 'active'
+                                      CHECK (status IN ('active','flagged','warming','retired')),
+                reputation            TEXT NOT NULL DEFAULT 'unknown'
+                                      CHECK (reputation IN ('unflagged','mixed_low','mixed_high','flagged','unknown')),
+                calls_today           INTEGER NOT NULL DEFAULT 0,
+                calls_today_date      TEXT,                   -- date the counter applies to
+                daily_cap             INTEGER NOT NULL DEFAULT 50,
+                warmup_started        TEXT,                   -- ISO date; NULL once fully warmed
+                last_reputation_check TEXT,                   -- ISO timestamp
+                added_date            TEXT NOT NULL,
+                notes                 TEXT NOT NULL DEFAULT ''
+            );
             """
         )
         # Migration: add 'investor' to status CHECK (requires table recreation in SQLite)
@@ -819,3 +837,81 @@ def performance_summary(db_path: Path = DB_PATH) -> dict[str, Any]:
         "by_touch": [_to_dict(r) for r in by_touch],
         "by_type": [_to_dict(r) for r in by_type],
     }
+
+
+# ── Caller ID pool (multi-line dialer number rotation + reputation) ──────────
+
+def add_caller_number(
+    phone_number: str,
+    area_code: str,
+    twilio_sid: str | None = None,
+    daily_cap: int = 50,
+    warming: bool = True,
+    db_path: Path = DB_PATH,
+) -> int:
+    """Register a number in the caller ID pool. New numbers start 'warming'
+    (low daily volume for ~7 days) unless warming=False."""
+    today = date.today().isoformat()
+    status = "warming" if warming else "active"
+    warmup_started = today if warming else None
+    with get_conn(db_path) as conn:
+        cur = conn.execute(
+            """INSERT INTO caller_id_pool
+               (phone_number, area_code, twilio_sid, status, reputation,
+                calls_today, calls_today_date, daily_cap, warmup_started,
+                added_date, notes)
+               VALUES (?,?,?,?,'unknown',0,?,?,?,?,'')
+               ON CONFLICT(phone_number) DO NOTHING""",
+            (phone_number, area_code, twilio_sid, status, today, daily_cap,
+             warmup_started, today),
+        )
+        return cur.lastrowid
+
+
+def fetch_caller_pool(db_path: Path = DB_PATH) -> list[dict[str, Any]]:
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM caller_id_pool ORDER BY area_code, phone_number"
+        ).fetchall()
+    return [_to_dict(r) for r in rows]
+
+
+def update_caller_number(number_id: int, fields: dict[str, Any], db_path: Path = DB_PATH) -> None:
+    if not fields:
+        return
+    cols = ", ".join(f"{k}=?" for k in fields)
+    with get_conn(db_path) as conn:
+        conn.execute(
+            f"UPDATE caller_id_pool SET {cols} WHERE id=?",
+            (*fields.values(), number_id),
+        )
+
+
+def increment_caller_calls(phone_number: str, db_path: Path = DB_PATH) -> None:
+    """Bump a number's calls-today counter, resetting it if the date rolled over."""
+    today = date.today().isoformat()
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT calls_today, calls_today_date FROM caller_id_pool WHERE phone_number=?",
+            (phone_number,),
+        ).fetchone()
+        if not row:
+            return
+        new_count = (row["calls_today"] + 1) if row["calls_today_date"] == today else 1
+        conn.execute(
+            "UPDATE caller_id_pool SET calls_today=?, calls_today_date=? WHERE phone_number=?",
+            (new_count, today, phone_number),
+        )
+
+
+def caller_calls_today(phone_number: str, db_path: Path = DB_PATH) -> int:
+    """Current call count for a number today (0 if the stored date is stale)."""
+    today = date.today().isoformat()
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT calls_today, calls_today_date FROM caller_id_pool WHERE phone_number=?",
+            (phone_number,),
+        ).fetchone()
+    if not row or row["calls_today_date"] != today:
+        return 0
+    return row["calls_today"]

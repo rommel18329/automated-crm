@@ -14,6 +14,7 @@ from crm_engine import db, engine
 from crm_engine.followup_engine import generate_followup_message
 from crm_engine.messaging_gateway import send_sms, place_call
 from crm_engine.dialer_import import parse_contacts
+from crm_engine import caller_id_pool
 
 st.set_page_config(page_title="Silverline Investment Group", layout="wide")
 st.markdown("""
@@ -174,7 +175,7 @@ input, textarea, [data-baseweb="select"] * {color: #2E2E2E !important;}
 </style>
 """
 
-PAGES = ["Dashboard", "Leads", "Call List", "Dialer", "Follow-ups", "Messages"]
+PAGES = ["Dashboard", "Leads", "Call List", "Dialer", "Caller ID Health", "Follow-ups", "Messages"]
 
 
 def info_icon(text: str, tip: str) -> str:
@@ -1144,6 +1145,7 @@ with st.sidebar:
     nav_item("Leads", "leads")
     nav_item("Call List", "call_list")
     nav_item("Dialer", "dialer")
+    nav_item("Caller ID Health", "caller_health")
     nav_item("Follow-ups", "followups")
 
     # Messages nav item with unread badge
@@ -2205,3 +2207,106 @@ elif page == "dialer":
                     st.session_state["dialer_batch_leads"] = []
                     st.session_state["dialer_on_call"] = False
                     st.rerun()
+
+elif page == "caller_health":
+    st.subheader("📡 Caller ID Health")
+    st.caption("Number pool for the multi-line dialer — rotation, daily caps, "
+               "warm-up, and spam-flag detection.")
+
+    pool = db.fetch_caller_pool()
+
+    if not pool:
+        st.info(
+            "No numbers in the pool yet.\n\n"
+            "**To add your 10-number pool:**\n"
+            "1. Preview available numbers: `python buy_numbers.py --area 515 --count 10`\n"
+            "2. Purchase them: `python buy_numbers.py --area 515 --count 10 --buy`\n\n"
+            "New numbers start in **warming** mode (low volume for 7 days) automatically."
+        )
+    else:
+        # Auto-detect likely-flagged numbers from answer-rate crater
+        suspects = caller_id_pool.detect_flagged()
+        suspect_nums = {s["phone_number"]: s for s in suspects}
+        if suspects:
+            st.warning(
+                "⚠️ **Possible spam flags detected** (answer rate cratered vs. pool median):\n\n"
+                + "\n".join(
+                    f"- **{s['phone_number']}** — answering {int(s['answer_rate']*100)}% "
+                    f"vs pool median {int(s['pool_median']*100)}%"
+                    for s in suspects
+                )
+            )
+
+        # Summary metrics
+        active = sum(1 for n in pool if n["status"] == "active")
+        warming = sum(1 for n in pool if n["status"] == "warming")
+        flagged = sum(1 for n in pool if n["status"] == "flagged")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total numbers", len(pool))
+        m2.metric("Active", active)
+        m3.metric("Warming", warming)
+        m4.metric("Flagged", flagged)
+
+        st.divider()
+
+        for num in pool:
+            phone = num["phone_number"]
+            used = db.caller_calls_today(phone)
+            cap = num["daily_cap"]
+            rate = caller_id_pool.answer_rate(phone)
+            is_suspect = phone in suspect_nums
+
+            status_color = {
+                "active": "#28a745", "warming": "#ffc107",
+                "flagged": "#dc3545", "retired": "#888",
+            }.get(num["status"], "#888")
+
+            c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+            with c1:
+                st.markdown(
+                    f"<span style='font-size:1.05rem;font-weight:600'>{phone}</span> "
+                    f"<span style='background:{status_color};color:#fff;padding:1px 8px;"
+                    f"border-radius:10px;font-size:0.75rem'>{num['status']}</span>"
+                    + (" <span style='color:#dc3545;font-size:0.8rem'>⚠️ flag?</span>"
+                       if is_suspect else ""),
+                    unsafe_allow_html=True,
+                )
+                _warm_note = ""
+                if num["status"] == "warming" and num["warmup_started"]:
+                    try:
+                        days_in = (date.today() - date.fromisoformat(num["warmup_started"])).days
+                        _warm_note = f" · warming day {days_in}/{caller_id_pool.WARMUP_DAYS}"
+                    except ValueError:
+                        pass
+                st.caption(f"Area {num['area_code']}{_warm_note}")
+            with c2:
+                _eff_cap = min(cap, caller_id_pool.WARMUP_DAILY_CAP) if num["status"] == "warming" else cap
+                st.markdown(f"**{used} / {_eff_cap}**")
+                st.caption("calls today")
+            with c3:
+                st.markdown(f"**{int(rate*100)}%**" if rate is not None else "—")
+                st.caption("answer rate")
+            with c4:
+                if num["status"] == "flagged":
+                    if st.button("Reactivate", key=f"react_{num['id']}"):
+                        db.update_caller_number(num["id"], {"status": "active", "reputation": "unknown"})
+                        st.rerun()
+                else:
+                    if st.button("Mark flagged", key=f"flag_{num['id']}"):
+                        db.update_caller_number(num["id"], {"status": "flagged", "reputation": "flagged"})
+                        st.rerun()
+            st.divider()
+
+    with st.expander("🛡️ How spam-flag protection works"):
+        st.markdown(
+            "- **Rotation:** each call picks a number matching the lead's area code, "
+            "spreading load and respecting daily caps.\n"
+            "- **Daily caps:** ~50 calls/number (15 while warming) keeps you under "
+            "carrier auto-flag thresholds.\n"
+            "- **Warm-up:** new numbers ramp slowly for 7 days before full volume.\n"
+            "- **Detection:** answer rate is tracked per number; a sudden crater vs. "
+            "the pool median flags a likely carrier block, and the number is pulled.\n"
+            "- **Proactive registration:** run `python register_voice_integrity.py` to "
+            "check Trust Hub / Voice Integrity status (registers numbers with the "
+            "T-Mobile / Verizon / AT&T analytics engines)."
+        )

@@ -33,6 +33,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 from crm_engine import db
+from crm_engine import caller_id_pool
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -398,6 +399,7 @@ def dialer_multi_start():
         "conference": conference,
         "lead_ids": lead_ids,
         "call_sids": {},
+        "from_numbers": {},   # lead_id -> caller ID used (for answer-rate stats)
         "winner": None,
         "winner_name": "",
         "winner_phone": "",
@@ -419,7 +421,9 @@ def dialer_multi_start():
             if not lead:
                 return
             phone = to_e164(lead["phone"])
-            from_ = pick_from_number(lead["phone"])
+            # Rotate caller ID from the pool (area-code match, caps, warm-up).
+            # Fall back to the simple 515/773 routing if the pool is empty.
+            from_ = caller_id_pool.pick_number(lead["phone"], DB_PATH) or pick_from_number(lead["phone"])
             try:
                 call = twilio.calls.create(
                     to=phone,
@@ -431,7 +435,11 @@ def dialer_multi_start():
                 )
                 with _batch_lock:
                     batch["call_sids"][lid] = call.sid
-                log.info(f"Multi-dial [{batch_id}] → {lead['name']} ({phone}) SID={call.sid}")
+                    batch["from_numbers"][lid] = from_
+                # Count toward this number's daily cap + answer-rate denominator.
+                db.increment_caller_calls(from_, DB_PATH)
+                caller_id_pool.record_placed(from_)
+                log.info(f"Multi-dial [{batch_id}] → {lead['name']} ({phone}) from {from_} SID={call.sid}")
             except Exception as exc:
                 log.warning(f"Multi-dial [{batch_id}] call to {lid} failed: {exc}")
                 with _batch_lock:
@@ -480,6 +488,11 @@ def voice_multi_answer(batch_id: str, lead_id: int):
         batch["winner_phone"] = lead["phone"] if lead else ""
         conference = batch["conference"]
         call_sid = request.form.get("CallSid", "")
+        winner_from = batch["from_numbers"].get(lead_id)
+
+    # This number reached a human — credit its answer rate.
+    if winner_from:
+        caller_id_pool.record_connected(winner_from)
 
     # Log the call interaction
     if lead:
