@@ -9,6 +9,7 @@ import time
 import urllib.parse
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from crm_engine import db, engine
 from crm_engine.followup_engine import generate_followup_message
@@ -1647,54 +1648,63 @@ elif page == "messages":
     # ── Quick Dial (any number, not tied to a lead) ───────────────────────────
     with st.expander("📞 Quick Dial — call any number", expanded=False):
         _qd_base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-        _qd_browser_ready = bool(os.getenv("TWILIO_TWIML_APP_SID"))
-
-        _qd_num = st.text_input(
-            "Number to dial", placeholder="(515) 555-0123",
-            key="quick_dial_number",
-        )
-        _qd_digits = "".join(c for c in (_qd_num or "") if c.isdigit())
-        _qd_cid = _auto_caller_id(_qd_num) if _qd_digits else "515"
-
-        qd1, qd2, qd3 = st.columns([2, 2, 2])
-        _qd_from = qd1.radio(
-            "Caller ID", ["515", "773"],
-            index=0 if _qd_cid == "515" else 1, horizontal=True,
-            key="quick_dial_from",
-        )
-        _qd_methods = (["Browser", "My phone"] if _qd_browser_ready else ["My phone"])
-        _qd_method = qd2.radio(
-            "Call via", _qd_methods, horizontal=True, key="quick_dial_method",
-        )
-        qd3.write("")  # vertical spacer to line up the button
-        if qd3.button("📞 Call", key="quick_dial_call", use_container_width=True,
-                      type="primary", disabled=len(_qd_digits) not in (10, 11)):
-            _qd_e164 = "+1" + _qd_digits if len(_qd_digits) == 10 else "+" + _qd_digits
-            if _qd_method == "Browser":
-                import requests as _qreq
-                try:
-                    _qreq.post(
-                        f"{_qd_base}/dialer/current",
-                        json={
-                            "to_number": _qd_e164,
-                            "caller_id": _FROM_OPTS[_qd_from],
-                            "lead_name": "Manual dial",
-                            "lead_phone": _qd_num,
-                            "ts": datetime.utcnow().isoformat(),
-                        },
-                        timeout=3,
-                    )
-                    st.toast(f"📞 Dialing {_qd_num} in the softphone popup…")
-                except Exception as _qe:
-                    st.error(f"Quick dial failed: {_qe}")
-            else:
-                _qr = place_call_number(_qd_e164, from_number=_FROM_OPTS[_qd_from])
-                if _qr.get("called"):
-                    st.toast(f"📞 Calling {_qd_num} from {_qd_from} — your phone rings first.")
-                else:
-                    st.error(f"Call failed: {_qr.get('error')}")
-        if _qd_method == "Browser":
-            st.caption("Browser mode needs the softphone popup open (open it from the Dialer page).")
+        _qd_515 = _FROM_OPTS["515"]
+        _qd_773 = _FROM_OPTS["773"]
+        # Self-contained widget: the Browser button opens/focuses the softphone
+        # popup itself (no need to visit the Dialer page first), then pushes the
+        # number for it to dial. The My-phone button bridges your cell instead.
+        components.html(f"""
+        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+          <input id="qdNum" placeholder="(515) 555-0123" inputmode="tel"
+                 style="width:100%;padding:9px 12px;font-size:15px;border:1px solid #ccc;
+                        border-radius:8px;margin-bottom:8px;box-sizing:border-box">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <label style="font-size:13px;color:#555">From:</label>
+            <select id="qdFrom" style="padding:7px;border-radius:6px;border:1px solid #ccc">
+              <option value="{_qd_515}">515 (Iowa)</option>
+              <option value="{_qd_773}">773 (Chicago)</option>
+            </select>
+            <button onclick="qd('browser')" style="flex:1;min-width:120px;padding:9px;
+                    background:#28a745;color:#fff;border:none;border-radius:8px;
+                    font-weight:600;font-size:14px;cursor:pointer">📞 Browser</button>
+            <button onclick="qd('phone')" style="flex:1;min-width:120px;padding:9px;
+                    background:#0d6efd;color:#fff;border:none;border-radius:8px;
+                    font-weight:600;font-size:14px;cursor:pointer">📞 My phone</button>
+          </div>
+          <div id="qdMsg" style="margin-top:8px;font-size:13px;color:#555;min-height:18px"></div>
+        </div>
+        <script>
+          var BASE = "{_qd_base}";
+          var SOFTPHONE = BASE + "/softphone";
+          function qdDigits(s) {{ return (s.match(/\\d/g) || []).join(''); }}
+          function qdE164(s) {{ var d = qdDigits(s); return d.length === 10 ? '+1'+d : '+'+d; }}
+          function qdMsg(t) {{ document.getElementById('qdMsg').textContent = t; }}
+          function qd(mode) {{
+            var raw = document.getElementById('qdNum').value;
+            var d = qdDigits(raw);
+            if (d.length !== 10 && d.length !== 11) {{ qdMsg('Enter a valid 10-digit number.'); return; }}
+            var from = document.getElementById('qdFrom').value;
+            var to = qdE164(raw);
+            if (mode === 'browser') {{
+              // Open (or focus) the softphone popup — same window name reuses it.
+              var win = window.open(SOFTPHONE, 'crm_softphone', 'width=380,height=440,resizable=yes');
+              if (!win) {{ qdMsg('Popup blocked — allow popups for this site, then try again.'); return; }}
+              fetch(BASE + '/dialer/current', {{ method:'POST',
+                body: JSON.stringify({{ to_number: to, caller_id: from,
+                  lead_name: 'Manual dial', lead_phone: raw, ts: Date.now().toString() }}) }});
+              qdMsg('Dialing ' + raw + ' in the softphone popup...');
+            }} else {{
+              qdMsg('Calling your phone first...');
+              fetch(BASE + '/quick-dial-phone', {{ method:'POST',
+                body: JSON.stringify({{ to: to, from: from }}) }})
+                .then(function(r){{ return r.json(); }})
+                .then(function(j){{ qdMsg(j.called ? ('Calling ' + raw + ' — your phone rings first.')
+                                                   : ('Failed: ' + (j.error || 'unknown'))); }})
+                .catch(function(e){{ qdMsg('Failed: ' + e); }});
+            }}
+          }}
+        </script>
+        """, height=130)
 
     # ── search bar ────────────────────────────────────────────────────────────
     msg_q = st.text_input(

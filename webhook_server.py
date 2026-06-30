@@ -34,6 +34,7 @@ load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 from crm_engine import db
 from crm_engine import caller_id_pool
+from crm_engine.messaging_gateway import place_call_number
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -601,6 +602,24 @@ def dialer_batch(batch_id: str):
         "resolved_count": batch["resolved_count"],
         "dropped": batch["dropped"],
     })
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/quick-dial-phone", methods=["POST", "OPTIONS"])
+def quick_dial_phone():
+    """Phone-bridge quick dial: ring the user's cell, then connect to a raw
+    number. Called by the Messages Quick Dial widget's 'My phone' button."""
+    if request.method == "OPTIONS":
+        resp = Response("")
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
+        return resp
+    data = request.get_json(force=True, silent=True) or {}
+    to = data.get("to", "")
+    from_number = data.get("from", "")
+    result = place_call_number(to, from_number=from_number)
+    resp = jsonify(result)
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
