@@ -697,7 +697,7 @@ def softphone_page():
 </div>
 <div class="log" id="log"></div>
 
-<script src="https://sdk.twilio.com/js/client/releases/1.14/twilio.min.js"></script>
+<script src="/static/twilio-voice.min.js"></script>
 <script>
 (function() {
   const statusEl  = document.getElementById('status');
@@ -709,7 +709,8 @@ def softphone_page():
   const btnHangup = document.getElementById('btnHangup');
   const logEl     = document.getElementById('log');
 
-  let connection = null;
+  let device = null;
+  let call = null;
   let muted = false;
   let timerInterval = null;
   let callStart = null;
@@ -717,6 +718,41 @@ def softphone_page():
   let lastDialTs = null;
   let currentBatchId = null;
   let batchPollInterval = null;
+
+  // 2.x: call events live on the Call object. Wire them when a call starts.
+  function wireCall(c) {
+    call = c;
+    c.on('accept', function() {
+      if (!currentBatchId) {
+        setStatus('Connected', 'connected');
+        startTimer();
+        logMsg('Call connected');
+      }
+    });
+    c.on('disconnect', onCallEnded);
+    c.on('cancel', onCallEnded);
+    c.on('reject', onCallEnded);
+    c.on('error', function(err) {
+      setStatus('Call error: ' + (err.message || err), 'error');
+      logMsg('Call error: ' + (err.message || err));
+      onCallEnded();
+    });
+  }
+
+  function onCallEnded() {
+    call = null;
+    currentBatchId = null;
+    muted = false;
+    stopTimer();
+    if (batchPollInterval) { clearInterval(batchPollInterval); batchPollInterval = null; }
+    setStatus('Call ended — dispose in CRM, next auto-dials', 'ended');
+    btnCall.disabled = false;
+    btnHangup.disabled = true;
+    btnMute.disabled = true;
+    btnMute.textContent = '🔇 Mute';
+    btnMute.classList.remove('active');
+    logMsg('Call ended');
+  }
 
   function logMsg(msg) {
     const d = document.createElement('div');
@@ -751,8 +787,8 @@ def softphone_page():
   }
 
   // ── Single-line dial ──────────────────────────────────────────────────
-  function dialSingle(lead) {
-    if (connection) return;
+  async function dialSingle(lead) {
+    if (call || !device) return;
     lastDialTs = lead.ts;
     nameEl.textContent = lead.lead_name || '(unknown)';
     phoneEl.textContent = lead.lead_phone || '';
@@ -766,12 +802,19 @@ def softphone_page():
     var params = { caller_id: lead.caller_id || '' };
     if (lead.to_number) { params.to_number = lead.to_number; }
     else { params.lead_id = String(lead.lead_id); }
-    connection = Twilio.Device.connect(params);
+    try {
+      var c = await device.connect({ params: params });
+      wireCall(c);
+    } catch (e) {
+      setStatus('Connect failed: ' + (e.message || e), 'error');
+      logMsg('Connect failed: ' + (e.message || e));
+      onCallEnded();
+    }
   }
 
   // ── Multi-line dial ───────────────────────────────────────────────────
-  function joinMulti(data) {
-    if (connection) return;
+  async function joinMulti(data) {
+    if (call || !device) return;
     lastDialTs = data.ts;
     currentBatchId = data.batch_id;
     nameEl.textContent = data.lines + ' lines ringing...';
@@ -782,7 +825,15 @@ def softphone_page():
     btnHangup.disabled = false;
     btnMute.disabled = false;
     logMsg('Multi-line: joining conference ' + data.conference);
-    connection = Twilio.Device.connect({ conference: data.conference });
+    try {
+      var c = await device.connect({ params: { conference: data.conference } });
+      wireCall(c);
+    } catch (e) {
+      setStatus('Connect failed: ' + (e.message || e), 'error');
+      logMsg('Connect failed: ' + (e.message || e));
+      onCallEnded();
+      return;
+    }
 
     if (batchPollInterval) clearInterval(batchPollInterval);
     batchPollInterval = setInterval(function() {
@@ -804,7 +855,7 @@ def softphone_page():
             logMsg('No one answered (' + b.total + ' leads)');
             clearInterval(batchPollInterval);
             batchPollInterval = null;
-            Twilio.Device.disconnectAll();
+            if (device) device.disconnectAll();
           }
         })
         .catch(function() {});
@@ -812,14 +863,14 @@ def softphone_page():
   }
 
   function hangUp() {
-    Twilio.Device.disconnectAll();
+    if (device) device.disconnectAll();
     if (batchPollInterval) { clearInterval(batchPollInterval); batchPollInterval = null; }
   }
 
   function toggleMute() {
-    if (!connection) return;
+    if (!call) return;
     muted = !muted;
-    connection.mute(muted);
+    call.mute(muted);
     btnMute.textContent = muted ? '🔊 Unmute' : '🔇 Mute';
     btnMute.classList.toggle('active', muted);
   }
@@ -835,7 +886,7 @@ def softphone_page():
       .then(function(data) {
         if (!data || !data.ts) return;
         if (data.ts === lastDialTs) return;
-        if (connection) return;
+        if (call) return;
         if (!deviceReady) return;
         if (data.mode === 'multi') { joinMulti(data); }
         else if (data.lead_id || data.to_number) { dialSingle(data); }
@@ -845,7 +896,52 @@ def softphone_page():
 
   setInterval(pollForLead, 500);
 
-  // ── Init Twilio Device ────────────────────────────────────────────────
+  // ── Init Twilio Device (Voice SDK 2.x) ────────────────────────────────
+  function initDevice(token) {
+    try {
+      device = new Twilio.Device(token, {
+        logLevel: 'error',
+        codecPreferences: ['opus', 'pcmu'],
+      });
+    } catch (e) {
+      setStatus('Device init failed: ' + (e.message || e), 'error');
+      logMsg('Device init failed: ' + (e.message || e));
+      return;
+    }
+    device.on('registered', function() {
+      deviceReady = true;
+      setStatus('Ready — waiting for lead from CRM', 'ready');
+      btnCall.disabled = false;
+      logMsg('Device ready. Click CALL in the CRM to start dialing.');
+    });
+    device.on('error', function(err) {
+      setStatus('Device error: ' + (err.message || err), 'error');
+      logMsg('Device error: ' + (err.message || err));
+    });
+    device.on('tokenWillExpire', function() {
+      fetch('/voice/token').then(function(r) { return r.json(); }).then(function(d) {
+        if (d.token && device) { device.updateToken(d.token); logMsg('Token refreshed'); }
+      }).catch(function() {});
+    });
+    device.register();
+    // Outgoing calls work even before 'registered' fires; mark ready as a
+    // fallback so a slow/missing registration event never blocks dialing.
+    setTimeout(function() {
+      if (!deviceReady && device) {
+        deviceReady = true;
+        setStatus('Ready — waiting for lead from CRM', 'ready');
+        btnCall.disabled = false;
+        logMsg('Device ready (outgoing).');
+      }
+    }, 3000);
+  }
+
+  if (typeof Twilio === 'undefined' || !Twilio.Device) {
+    setStatus('Voice SDK failed to load — check /static/twilio-voice.min.js', 'error');
+    logMsg('ERROR: Twilio Voice SDK not loaded.');
+    return;
+  }
+
   setStatus('Fetching token...', '');
   logMsg('Fetching access token...');
   fetch('/voice/token')
@@ -856,68 +952,13 @@ def softphone_page():
         logMsg('ERROR: ' + data.error);
         return;
       }
-      Twilio.Device.setup(data.token, { debug: false });
-      logMsg('Token received, setting up device...');
+      logMsg('Token received, initializing device...');
+      initDevice(data.token);
     })
     .catch(function(err) {
       setStatus('Token fetch failed: ' + err, 'error');
       logMsg('ERROR: ' + err);
     });
-
-  Twilio.Device.ready(function() {
-    deviceReady = true;
-    setStatus('Ready — waiting for lead from CRM', 'ready');
-    btnCall.disabled = false;
-    logMsg('Device ready. Click CALL in the CRM to start dialing.');
-  });
-
-  Twilio.Device.connect(function(conn) {
-    connection = conn;
-    if (!currentBatchId) {
-      setStatus('Connected', 'connected');
-      startTimer();
-      logMsg('Call connected');
-    }
-  });
-
-  Twilio.Device.disconnect(function() {
-    connection = null;
-    currentBatchId = null;
-    muted = false;
-    stopTimer();
-    setStatus('Call ended — dispose in CRM, next auto-dials', 'ended');
-    btnCall.disabled = false;
-    btnHangup.disabled = true;
-    btnMute.disabled = true;
-    btnMute.textContent = '🔇 Mute';
-    btnMute.classList.remove('active');
-    logMsg('Call ended');
-  });
-
-  Twilio.Device.error(function(err) {
-    setStatus('Error: ' + err.message, 'error');
-    logMsg('ERROR: ' + err.message);
-    connection = null;
-    currentBatchId = null;
-    stopTimer();
-    btnCall.disabled = false;
-    btnHangup.disabled = true;
-    btnMute.disabled = true;
-  });
-
-  // ── Token refresh ─────────────────────────────────────────────────────
-  setInterval(function() {
-    if (connection) return;
-    fetch('/voice/token')
-      .then(function(r) { return r.json(); })
-      .then(function(data) {
-        if (data.token) {
-          Twilio.Device.setup(data.token, { debug: false });
-          logMsg('Token refreshed');
-        }
-      })
-      .catch(() => {});
-  }, 50 * 60 * 1000);  // every 50 minutes
 })();
 </script>
 </body></html>"""
