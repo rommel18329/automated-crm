@@ -980,7 +980,14 @@ def _twiml_response() -> Response:
 
 if __name__ == "__main__":
     db.init_db(DB_PATH)
-    print("Twilio webhook server running on http://localhost:5001")
-    print("Expose with: ngrok http 5001")
-    print("Then set Twilio inbound webhook to: https://<ngrok-url>/twilio/inbound")
-    app.run(host="0.0.0.0", port=5001, debug=False)
+    print("Twilio webhook server starting on http://localhost:5001")
+    # Use waitress (production WSGI, multi-threaded) so concurrent softphone
+    # polls + simultaneous Twilio callbacks during multi-line dialing don't
+    # block each other or hang the single-threaded Flask dev server.
+    try:
+        from waitress import serve
+        print("Serving with waitress (threads=16)")
+        serve(app, host="0.0.0.0", port=5001, threads=16, channel_timeout=120)
+    except ImportError:
+        print("waitress not installed; falling back to threaded Flask dev server")
+        app.run(host="0.0.0.0", port=5001, debug=False, threaded=True)
