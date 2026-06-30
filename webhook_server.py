@@ -719,24 +719,64 @@ def softphone_page():
   let currentBatchId = null;
   let batchPollInterval = null;
 
+  // Auto-retry-once state (absorbs transient funnel 502s without double-dialing)
+  let acceptedFired = false;     // did this call ever connect to a human?
+  let dialStartTime = 0;         // when the current single dial began
+  let retriedThisDial = false;   // already used our one retry?
+  let lastSingleParams = null;   // the lead/number to re-dial on retry
+  let callEndHandled = false;    // guard against duplicate end events
+
+  function isTransientError(err) {
+    if (!err) return false;
+    var code = err.code || (err.error && err.error.code);
+    if (code === 31005 || code === 31000 || code === 31009 || code === 53000) return true;
+    var m = '' + (err.message || '');
+    return /gateway|bad gateway|502|connection/i.test(m);
+  }
+
   // 2.x: call events live on the Call object. Wire them when a call starts.
   function wireCall(c) {
     call = c;
+    callEndHandled = false;
+    acceptedFired = false;
     c.on('accept', function() {
+      acceptedFired = true;
       if (!currentBatchId) {
         setStatus('Connected', 'connected');
         startTimer();
         logMsg('Call connected');
       }
     });
-    c.on('disconnect', onCallEnded);
-    c.on('cancel', onCallEnded);
-    c.on('reject', onCallEnded);
+    c.on('disconnect', function() { handleCallEnd(null); });
+    c.on('cancel', function() { handleCallEnd(null); });
+    c.on('reject', function() { handleCallEnd(null); });
     c.on('error', function(err) {
-      setStatus('Call error: ' + (err.message || err), 'error');
-      logMsg('Call error: ' + (err.message || err));
-      onCallEnded();
+      logMsg('Call error: ' + (err.code ? ('[' + err.code + '] ') : '') + (err.message || err));
+      handleCallEnd(err);
     });
+  }
+
+  function handleCallEnd(err) {
+    if (callEndHandled) return;   // ignore duplicate end events for one call
+    callEndHandled = true;
+    call = null;
+    stopTimer();
+    // Retry ONCE only if: transient gateway/connection error, the call NEVER
+    // connected (no human answered), it's not a multi-line batch, we haven't
+    // retried yet, and it failed fast (<5s — a 502 fails instantly with no PSTN
+    // call placed, so re-dialing cannot reach someone twice).
+    var canRetry = isTransientError(err) && !acceptedFired && !currentBatchId
+                   && !retriedThisDial && lastSingleParams
+                   && (Date.now() - dialStartTime < 5000);
+    if (canRetry) {
+      retriedThisDial = true;
+      setStatus('Connection hiccup — retrying once...', 'connecting');
+      logMsg('Transient error before connect; retrying once in 1.2s...');
+      var p = lastSingleParams;
+      setTimeout(function() { dialSingle(p, true); }, 1200);
+      return;
+    }
+    onCallEnded();
   }
 
   function onCallEnded() {
@@ -787,8 +827,11 @@ def softphone_page():
   }
 
   // ── Single-line dial ──────────────────────────────────────────────────
-  async function dialSingle(lead) {
+  async function dialSingle(lead, isRetry) {
     if (call || !device) return;
+    lastSingleParams = lead;
+    dialStartTime = Date.now();
+    if (!isRetry) { retriedThisDial = false; }
     lastDialTs = lead.ts;
     nameEl.textContent = lead.lead_name || '(unknown)';
     phoneEl.textContent = lead.lead_phone || '';
