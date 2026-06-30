@@ -204,6 +204,27 @@ def voice_connect(lead_id: int):
     return Response(twiml, mimetype="text/xml")
 
 
+@app.route("/voice/connect-raw", methods=["POST", "GET"])
+def voice_connect_raw():
+    """Click-to-call leg 2 for an ad-hoc number (Messages quick-dial). Bridges
+    your answered cell to the raw number passed as ?to=."""
+    to_raw = request.args.get("to", "")
+    if not to_raw:
+        return Response(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Response><Say>No number specified.</Say></Response>',
+            mimetype="text/xml",
+        )
+    from_number = pick_from_number(to_raw)
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Response>'
+        f'<Dial callerId="{from_number}">{to_e164(to_raw)}</Dial>'
+        '</Response>'
+    )
+    return Response(twiml, mimetype="text/xml")
+
+
 @app.route("/voice/status", methods=["POST"])
 def voice_status():
     """Called after the forwarded call ends. If it wasn't answered, log a
@@ -336,6 +357,17 @@ def voice_browser_connect():
             f'<Conference startConferenceOnEnter="true" endConferenceOnExit="true"'
             f' waitUrl="" beep="false">{conference}</Conference>'
             '</Dial></Response>'
+        )
+        return Response(twiml, mimetype="text/xml")
+
+    # Ad-hoc browser quick-dial: a raw number with no lead attached.
+    raw_to = request.form.get("to_number", "")
+    if raw_to:
+        caller_id = request.form.get("caller_id", "") or pick_from_number(raw_to)
+        log.info(f"Browser quick-dial → {raw_to} from {caller_id}")
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            f'<Response><Dial callerId="{caller_id}">{to_e164(raw_to)}</Dial></Response>'
         )
         return Response(twiml, mimetype="text/xml")
 
@@ -711,10 +743,11 @@ def softphone_page():
     btnHangup.disabled = false;
     btnMute.disabled = false;
     logMsg('Dialing ' + (lead.lead_name || lead.lead_phone));
-    connection = Twilio.Device.connect({
-      lead_id: String(lead.lead_id),
-      caller_id: lead.caller_id || ''
-    });
+    // Ad-hoc quick-dial passes a raw to_number with no lead_id.
+    var params = { caller_id: lead.caller_id || '' };
+    if (lead.to_number) { params.to_number = lead.to_number; }
+    else { params.lead_id = String(lead.lead_id); }
+    connection = Twilio.Device.connect(params);
   }
 
   // ── Multi-line dial ───────────────────────────────────────────────────
@@ -786,7 +819,7 @@ def softphone_page():
         if (connection) return;
         if (!deviceReady) return;
         if (data.mode === 'multi') { joinMulti(data); }
-        else if (data.lead_id) { dialSingle(data); }
+        else if (data.lead_id || data.to_number) { dialSingle(data); }
       })
       .catch(function() {});
   }

@@ -89,6 +89,31 @@ def place_call(lead_id: int, db_path: Path = db.DB_PATH, from_number: str = "",
     return {"lead_id": lead_id, "called": called, "error": error_msg}
 
 
+def place_call_number(to_number: str, from_number: str = "") -> dict:
+    """Ad-hoc click-to-call to an arbitrary number (not tied to a lead).
+    Rings MY_CELL_NUMBER first; once answered, bridges to to_number.
+    Used by the Messages quick-dial box."""
+    if not _MY_CELL or not _PUBLIC_BASE_URL:
+        return {"called": False, "error": "MY_CELL_NUMBER or PUBLIC_BASE_URL not set in .env"}
+
+    digits = "".join(c for c in to_number if c.isdigit())
+    if len(digits) not in (10, 11):
+        return {"called": False, "error": f"'{to_number}' is not a valid US phone number"}
+
+    caller_id = from_number or _pick_from_number(to_number)
+    to_e164 = _to_e164(to_number)
+    try:
+        client = Client(_ACCOUNT_SID, _AUTH_TOKEN)
+        client.calls.create(
+            to=_to_e164(_MY_CELL),
+            from_=caller_id,
+            url=f"{_PUBLIC_BASE_URL}/voice/connect-raw?to={to_e164}",
+        )
+        return {"called": True, "to": to_e164, "error": None}
+    except Exception as exc:
+        return {"called": False, "error": str(exc)}
+
+
 def send_sms(lead_id: int, message: str, db_path: Path = db.DB_PATH) -> dict:
     """Send an SMS via Twilio and log it as an outbound interaction."""
     clean_message = message.strip()
