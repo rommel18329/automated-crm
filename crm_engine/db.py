@@ -695,8 +695,15 @@ def create_lead(
     db_path: Path = DB_PATH,
     status: str = "cold",
     motivation_score: int = 5,
+    conversation_stage: str = "initial_contact",
+    next_action_date: str | None = None,
 ) -> int:
+    """Create a lead. Defaults match a normal new lead (initial_contact, due
+    today). The dialer passes conversation_stage='not_contacted' and a far-future
+    next_action_date to create an uncontacted 'call lead' that stays out of the
+    auto follow-up queue until it is actually dialed."""
     today = date.today().isoformat()
+    next_action = next_action_date or today
     with get_conn(db_path) as conn:
         cur = conn.execute(
             """
@@ -706,7 +713,8 @@ def create_lead(
                 conversation_stage, deal_probability
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (name, phone, status, motivation_score, "", None, today, today, 0, None, "initial_contact", 0),
+            (name, phone, status, motivation_score, "", None, today, next_action, 0, None,
+             conversation_stage, 0),
         )
         return cur.lastrowid
 

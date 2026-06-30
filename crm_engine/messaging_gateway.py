@@ -40,13 +40,17 @@ def _to_e164(raw: str) -> str:
     return f"+{digits}"
 
 
-def place_call(lead_id: int, db_path: Path = db.DB_PATH, from_number: str = "") -> dict:
+def place_call(lead_id: int, db_path: Path = db.DB_PATH, from_number: str = "",
+               to_number: str = "") -> dict:
     """Click-to-call: rings MY_CELL_NUMBER first; once answered, Twilio
     dials the lead and bridges the two legs together. Logs an outbound
     call interaction on the lead immediately (call result itself isn't
     tracked here — that comes back through /voice/status if needed).
     from_number: override which Twilio number to call from; defaults to
-    area-code routing (IL → 773, everything else → 515)."""
+    area-code routing (IL → 773, everything else → 515).
+    to_number: dial this specific number instead of the lead's primary phone
+    (used by the dialer to try a lead's alternate numbers). Defaults to the
+    lead's stored phone."""
     lead = db.fetch_lead(lead_id, db_path)
     if not lead:
         return {"lead_id": lead_id, "called": False, "error": "Lead not found"}
@@ -54,14 +58,18 @@ def place_call(lead_id: int, db_path: Path = db.DB_PATH, from_number: str = "") 
     if not _MY_CELL or not _PUBLIC_BASE_URL:
         return {"lead_id": lead_id, "called": False, "error": "MY_CELL_NUMBER or PUBLIC_BASE_URL not set in .env"}
 
-    caller_id = from_number or _pick_from_number(lead.get("phone", ""))
+    caller_id = from_number or _pick_from_number(to_number or lead.get("phone", ""))
     error_msg = None
     try:
         client = Client(_ACCOUNT_SID, _AUTH_TOKEN)
+        connect_url = f"{_PUBLIC_BASE_URL}/voice/connect/{lead_id}"
+        to_digits = "".join(c for c in to_number if c.isdigit())
+        if to_digits:
+            connect_url += f"?to={to_digits}"
         client.calls.create(
             to=_to_e164(_MY_CELL),
             from_=caller_id,
-            url=f"{_PUBLIC_BASE_URL}/voice/connect/{lead_id}",
+            url=connect_url,
         )
         called = True
         log_content = f"Outbound call placed (click-to-call) to {lead['name']}"
