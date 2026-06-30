@@ -20,7 +20,7 @@ import sys
 import logging
 import uuid
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, date
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -624,6 +624,56 @@ def quick_dial_phone():
     return resp
 
 
+# label -> (interaction note, days until next call or None). Mirrors the
+# dashboard dialer so disposing in the popup behaves identically.
+_DISPOSITIONS = {
+    "No Answer":      ("Call - no answer", 1),
+    "Voicemail":      ("Call - left voicemail", 3),
+    "Wrong Number":   ("Call - wrong number", None),
+    "Not Interested": ("Call - not interested", None),
+    "Callback":       ("Call - wants callback", 1),
+    "Connected":      ("Call - connected, talked", 3),
+}
+
+
+@app.route("/dialer/dispose", methods=["POST", "OPTIONS"])
+def dialer_dispose():
+    """Log a call disposition from the softphone popup and update the lead in
+    crm.db immediately (interaction + next-call date)."""
+    if request.method == "OPTIONS":
+        resp = Response("")
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
+        return resp
+    data = request.get_json(force=True, silent=True) or {}
+    lead_id = data.get("lead_id")
+    label = data.get("disposition", "")
+    if not lead_id or label not in _DISPOSITIONS:
+        resp = jsonify({"ok": False, "error": "bad lead_id or disposition"})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp, 400
+
+    note, days = _DISPOSITIONS[label]
+    lead = db.fetch_lead(int(lead_id), DB_PATH)
+    if not lead:
+        resp = jsonify({"ok": False, "error": "lead not found"})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp, 404
+
+    db.add_interaction(int(lead_id), "call", note, "outbound", DB_PATH, ts=datetime.utcnow())
+    fields = {"last_contact_date": date.today().isoformat()}
+    if lead.get("conversation_stage") == "not_contacted":
+        fields["conversation_stage"] = "initial_contact"
+    if days is not None:
+        fields["next_action_date"] = (date.today() + timedelta(days=days)).isoformat()
+    db.update_lead(int(lead_id), fields, DB_PATH)
+    log.info(f"Disposed lead {lead_id} ({lead['name']}): {label}")
+
+    resp = jsonify({"ok": True, "lead_id": lead_id, "disposition": label})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
 @app.route("/dialer/current", methods=["GET", "POST"])
 def dialer_current():
     """Shared state between Streamlit and the softphone popup.
@@ -678,6 +728,18 @@ def softphone_page():
   .btn-hangup { background:#dc3545; color:#fff; }
   .btn-mute   { background:#6c757d; color:#fff; }
   .btn-mute.active { background:#ffc107; color:#000; }
+  .disp { margin-top:12px; display:none; }
+  .disp.show { display:block; }
+  .disp-title { font-size:12px; color:#777; text-align:center; margin-bottom:6px;
+                text-transform:uppercase; letter-spacing:.5px; }
+  .disp-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; }
+  .disp-btn { padding:9px 4px; border:1px solid #ccc; border-radius:7px;
+              background:#fff; font-size:12px; font-weight:600; cursor:pointer;
+              color:#333; transition:all .12s; }
+  .disp-btn:hover { background:#f0f7f1; border-color:#6B8F71; }
+  .disp-done { text-align:center; font-size:13px; color:#155724; font-weight:600;
+               background:#d4edda; padding:8px; border-radius:7px; margin-top:8px; display:none; }
+  .disp-done.show { display:block; }
   .log { margin-top:14px; font-size:12px; color:#999; max-height:80px;
          overflow-y:auto; border-top:1px solid #eee; padding-top:6px; }
   .log div { padding:1px 0; }
@@ -695,6 +757,18 @@ def softphone_page():
   <button class="btn btn-mute" id="btnMute" disabled>🔇 Mute</button>
   <button class="btn btn-hangup" id="btnHangup" disabled>📕 Hang Up</button>
 </div>
+<div class="disp" id="disp">
+  <div class="disp-title">Disposition — saves to CRM instantly</div>
+  <div class="disp-grid">
+    <button class="disp-btn" onclick="dispose('No Answer')">No Answer</button>
+    <button class="disp-btn" onclick="dispose('Voicemail')">Voicemail</button>
+    <button class="disp-btn" onclick="dispose('Connected')">Connected</button>
+    <button class="disp-btn" onclick="dispose('Callback')">Callback</button>
+    <button class="disp-btn" onclick="dispose('Not Interested')">Not Interested</button>
+    <button class="disp-btn" onclick="dispose('Wrong Number')">Wrong Number</button>
+  </div>
+</div>
+<div class="disp-done" id="dispDone"></div>
 <div class="log" id="log"></div>
 
 <script src="/static/twilio-voice.min.js"></script>
@@ -708,6 +782,10 @@ def softphone_page():
   const btnMute   = document.getElementById('btnMute');
   const btnHangup = document.getElementById('btnHangup');
   const logEl     = document.getElementById('log');
+  const dispEl    = document.getElementById('disp');
+  const dispDoneEl = document.getElementById('dispDone');
+
+  let currentLeadId = null;     // lead being handled (null for manual quick-dials)
 
   let device = null;
   let call = null;
@@ -785,13 +863,18 @@ def softphone_page():
     muted = false;
     stopTimer();
     if (batchPollInterval) { clearInterval(batchPollInterval); batchPollInterval = null; }
-    setStatus('Call ended — dispose in CRM, next auto-dials', 'ended');
     btnCall.disabled = false;
     btnHangup.disabled = true;
     btnMute.disabled = true;
     btnMute.textContent = '🔇 Mute';
     btnMute.classList.remove('active');
     logMsg('Call ended');
+    if (currentLeadId) {
+      setStatus('Call ended — pick a disposition below', 'ended');
+      showDisposition();
+    } else {
+      setStatus('Call ended', 'ended');
+    }
   }
 
   function logMsg(msg) {
@@ -806,6 +889,38 @@ def softphone_page():
     statusEl.textContent = text;
     statusEl.className = 'status ' + (cls || '');
   }
+
+  function showDisposition() {
+    if (currentLeadId) { dispEl.classList.add('show'); }
+  }
+  function hideDisposition() {
+    dispEl.classList.remove('show');
+    dispDoneEl.classList.remove('show');
+  }
+  // Called by the disposition buttons — writes to the CRM immediately.
+  window.dispose = function(label) {
+    if (!currentLeadId) return;
+    var lid = currentLeadId;
+    dispEl.classList.remove('show');
+    fetch('/dialer/dispose', { method: 'POST',
+      body: JSON.stringify({ lead_id: lid, disposition: label }) })
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        if (j.ok) {
+          dispDoneEl.textContent = '✓ Saved to CRM: ' + label;
+          dispDoneEl.classList.add('show');
+          logMsg('Disposed: ' + label + ' (saved to CRM)');
+          currentLeadId = null;
+        } else {
+          dispEl.classList.add('show');
+          logMsg('Dispose failed: ' + (j.error || 'unknown'));
+        }
+      })
+      .catch(function(e) {
+        dispEl.classList.add('show');
+        logMsg('Dispose failed: ' + e);
+      });
+  };
 
   function updateTimer() {
     if (!callStart) return;
@@ -832,6 +947,8 @@ def softphone_page():
     lastSingleParams = lead;
     dialStartTime = Date.now();
     if (!isRetry) { retriedThisDial = false; }
+    hideDisposition();
+    currentLeadId = lead.lead_id || null;   // null for manual quick-dials
     lastDialTs = lead.ts;
     nameEl.textContent = lead.lead_name || '(unknown)';
     phoneEl.textContent = lead.lead_phone || '';
@@ -858,6 +975,8 @@ def softphone_page():
   // ── Multi-line dial ───────────────────────────────────────────────────
   async function joinMulti(data) {
     if (call || !device) return;
+    hideDisposition();
+    currentLeadId = null;
     lastDialTs = data.ts;
     currentBatchId = data.batch_id;
     nameEl.textContent = data.lines + ' lines ringing...';
@@ -886,6 +1005,7 @@ def softphone_page():
           if (b.status === 'connected' && b.winner_name) {
             nameEl.textContent = b.winner_name;
             phoneEl.textContent = b.winner_phone || '';
+            currentLeadId = b.winner || null;   // dispose the winning lead
             setStatus('Connected — ' + b.winner_name, 'connected');
             logMsg('Connected to ' + b.winner_name);
             startTimer();
