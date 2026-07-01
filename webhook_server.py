@@ -893,11 +893,13 @@ def softphone_page():
     <button class="disp-btn" onclick="dispose('Not Interested')">Not Interested</button>
     <button class="disp-btn" onclick="dispose('Wrong Number')">Wrong Number</button>
   </div>
-  <div class="disp-title" style="margin-top:10px">Set lead status</div>
-  <div class="disp-grid disp-grid-3" id="dispStatus">
-    <button class="disp-btn st-hot" onclick="setLeadStatus('hot')">🔥 Hot</button>
-    <button class="disp-btn st-warm" onclick="setLeadStatus('warm')">🌤 Warm</button>
-    <button class="disp-btn st-cold" onclick="setLeadStatus('cold')">❄️ Cold</button>
+  <div id="statusSection">
+    <div class="disp-title" style="margin-top:10px">Set lead status</div>
+    <div class="disp-grid disp-grid-3" id="dispStatus">
+      <button class="disp-btn st-hot" onclick="setLeadStatus('hot')">🔥 Hot</button>
+      <button class="disp-btn st-warm" onclick="setLeadStatus('warm')">🌤 Warm</button>
+      <button class="disp-btn st-cold" onclick="setLeadStatus('cold')">❄️ Cold</button>
+    </div>
   </div>
 </div>
 <div class="disp-done" id="dispDone"></div>
@@ -1102,8 +1104,13 @@ def softphone_page():
     dispDoneEl.textContent = '';
     dispOutcomeEl.classList.remove('locked');
     dispStatusEl.classList.remove('locked');
+    var _ss = document.getElementById('statusSection');
+    if (_ss) _ss.style.display = '';   // restore status prompt for the next call
     savedParts = [];
   }
+
+  // Outcomes that don't need a hot/warm/cold temperature — just log and move on.
+  var TERMINAL_OUTCOMES = ['Wrong Number'];
   function showSaved(part) {
     savedParts.push(part);
     dispDoneEl.textContent = '✓ Saved: ' + savedParts.join('  ·  ');
@@ -1114,12 +1121,24 @@ def softphone_page():
   window.dispose = function(label) {
     if (!currentLeadId) return;
     dispOutcomeEl.classList.add('locked');   // one outcome per call
+    var terminal = TERMINAL_OUTCOMES.indexOf(label) !== -1;
+    if (terminal) {
+      // No temperature needed — hide the status prompt entirely.
+      var _ss = document.getElementById('statusSection');
+      if (_ss) _ss.style.display = 'none';
+    }
     fetch('/dialer/dispose', { method: 'POST',
       body: JSON.stringify({ lead_id: currentLeadId, disposition: label }) })
       .then(function(r) { return r.json(); })
       .then(function(j) {
-        if (j.ok) { showSaved(label); logMsg('Outcome saved: ' + label); }
-        else { dispOutcomeEl.classList.remove('locked'); logMsg('Dispose failed: ' + (j.error || '')); }
+        if (j.ok) {
+          showSaved(label);
+          logMsg('Outcome saved: ' + label);
+          if (terminal) { dispDoneEl.textContent = '✓ ' + label + ' — hit Next lead'; }
+        } else {
+          dispOutcomeEl.classList.remove('locked');
+          logMsg('Dispose failed: ' + (j.error || ''));
+        }
       })
       .catch(function(e) { dispOutcomeEl.classList.remove('locked'); logMsg('Dispose failed: ' + e); });
   };
