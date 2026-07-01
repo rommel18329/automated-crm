@@ -674,6 +674,29 @@ def dialer_dispose():
     return resp
 
 
+@app.route("/dialer/lead/<int:lead_id>")
+def dialer_lead(lead_id: int):
+    """Lead details for the softphone script panel (name + property address)."""
+    lead = db.fetch_lead(lead_id, DB_PATH)
+    if not lead:
+        resp = jsonify({}); resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp, 404
+    tl = lead.get("timeline") or ""
+    address = ""
+    if "Address:" in tl:
+        after = tl.split("Address:", 1)[1]
+        address = after.split(". Situation")[0].split(". Notes")[0].strip()
+    name = (lead.get("name") or "").strip()
+    resp = jsonify({
+        "name": name,
+        "first_name": name.split()[0] if name else "",
+        "phone": lead.get("phone", ""),
+        "address": address,
+    })
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
 @app.route("/dialer/status", methods=["POST", "OPTIONS"])
 def dialer_set_status():
     """Manually set a lead's status (cold/warm/hot) from the softphone popup.
@@ -781,6 +804,23 @@ def softphone_page():
   .disp-done { text-align:center; font-size:13px; color:#155724; font-weight:600;
                background:#d4edda; padding:8px; border-radius:7px; margin-top:8px; display:none; }
   .disp-done.show { display:block; }
+  .script { margin-top:12px; border:1px solid #e3e3e3; border-radius:8px;
+            background:#fff; padding:8px 10px; }
+  .script summary { cursor:pointer; font-weight:700; font-size:13px; color:#444;
+                    list-style:none; }
+  .script summary::-webkit-details-marker { display:none; }
+  .rep-row { font-size:12px; color:#666; margin:8px 0 6px; }
+  .rep-row input { border:1px solid #ccc; border-radius:5px; padding:3px 6px;
+                   font-size:12px; width:90px; }
+  .sc-block { margin-top:8px; }
+  .sc-label { font-size:11px; text-transform:uppercase; letter-spacing:.5px;
+              color:#8a8a8a; margin-bottom:3px; font-weight:700; }
+  .sc-line { font-size:13px; color:#1a1a1a; line-height:1.4; padding:4px 6px;
+             border-left:3px solid #6B8F71; background:#f6f9f6; border-radius:4px;
+             margin-bottom:5px; }
+  .sc-obj { font-size:12px; color:#333; line-height:1.35; padding:3px 0;
+            border-bottom:1px dashed #eee; }
+  .sc-obj b { color:#b8770a; }
   .log { margin-top:14px; font-size:12px; color:#999; max-height:80px;
          overflow-y:auto; border-top:1px solid #eee; padding-top:6px; }
   .log div { padding:1px 0; }
@@ -816,6 +856,33 @@ def softphone_page():
   </div>
 </div>
 <div class="disp-done" id="dispDone"></div>
+<details class="script" id="scriptBox" open>
+  <summary>📋 Script</summary>
+  <div class="rep-row">Your name: <input id="repName" value="Rom" maxlength="20"></div>
+  <div class="sc-block">
+    <div class="sc-label">Open — pick one</div>
+    <div class="sc-line" id="scOpen1"></div>
+    <div class="sc-line" id="scOpen2"></div>
+    <div class="sc-line" id="scOpen3"></div>
+  </div>
+  <div class="sc-block">
+    <div class="sc-label">Once they confirm</div>
+    <div class="sc-line" id="scConnect"></div>
+  </div>
+  <div class="sc-block">
+    <div class="sc-label">Get them talking</div>
+    <div class="sc-line">What's the condition like — anything need work?</div>
+    <div class="sc-line">If the price and terms were right, is it something you'd sell?</div>
+    <div class="sc-line">Do you have a number in mind, or want me to come back with one?</div>
+  </div>
+  <div class="sc-block">
+    <div class="sc-label">If they push back</div>
+    <div class="sc-obj"><b>Not interested:</b> Totally fair — mind if I ask, is it just not the right time, or not something you'd ever sell?</div>
+    <div class="sc-obj"><b>What's your offer:</b> Depends on the condition — can I ask you a couple quick things about the place first?</div>
+    <div class="sc-obj"><b>How'd you get my #:</b> Property records are public with the county. I focus on this area and yours came up — no pressure at all.</div>
+    <div class="sc-obj"><b>I'll think about it:</b> Of course — what's the main thing you'd want to figure out before deciding?</div>
+  </div>
+</details>
 <div class="log" id="log"></div>
 
 <script src="/static/twilio-voice.min.js"></script>
@@ -833,9 +900,46 @@ def softphone_page():
   const dispDoneEl = document.getElementById('dispDone');
   const dispOutcomeEl = document.getElementById('dispOutcome');
   const dispStatusEl  = document.getElementById('dispStatus');
+  const repNameEl = document.getElementById('repName');
+  const scOpen1 = document.getElementById('scOpen1');
+  const scOpen2 = document.getElementById('scOpen2');
+  const scOpen3 = document.getElementById('scOpen3');
+  const scConnect = document.getElementById('scConnect');
 
   let currentLeadId = null;     // lead being handled (null for manual quick-dials)
   let savedParts = [];          // confirmation chips shown after saving
+  let lastScriptInfo = null;    // {first_name, address} for the active lead
+
+  // Rep name persists across sessions (so you and your wife each keep yours).
+  try { var _rn = localStorage.getItem('crm_rep_name'); if (_rn) repNameEl.value = _rn; } catch (e) {}
+  repNameEl.addEventListener('input', function() {
+    try { localStorage.setItem('crm_rep_name', repNameEl.value); } catch (e) {}
+    renderScript(lastScriptInfo);
+  });
+
+  function renderScript(info) {
+    lastScriptInfo = info;
+    var rep = (repNameEl.value || 'Rom').trim() || 'Rom';
+    var first = (info && info.first_name) ? info.first_name : '';
+    var addr = (info && info.address) ? info.address : '';
+    var addrPhrase = addr || 'this property';
+    var namePhrase = first || 'there';
+    scOpen1.textContent = 'Hey, is this the owner of ' + addrPhrase + '?';
+    scOpen2.textContent = 'Hey, this is ' + rep + ' - is this ' + namePhrase + '?';
+    scOpen3.textContent = 'Hey, this is ' + rep + ', I was hoping to reach the owner of ' + addrPhrase + '?';
+    scConnect.textContent = "Great - my partner and I buy a few houses around here, and I wanted to "
+      + "see if you'd ever consider selling this one, now or down the road.";
+  }
+
+  function loadScriptForLead(leadId) {
+    if (!leadId) { renderScript(null); return; }
+    fetch('/dialer/lead/' + leadId)
+      .then(function(r) { return r.json(); })
+      .then(function(info) { renderScript(info); })
+      .catch(function() { renderScript(null); });
+  }
+
+  renderScript(null);   // show generic script until a lead is dialed
 
   let device = null;
   let call = null;
@@ -1012,6 +1116,7 @@ def softphone_page():
     if (!isRetry) { retriedThisDial = false; }
     hideDisposition();
     currentLeadId = lead.lead_id || null;   // null for manual quick-dials
+    loadScriptForLead(currentLeadId);
     lastDialTs = lead.ts;
     nameEl.textContent = lead.lead_name || '(unknown)';
     phoneEl.textContent = lead.lead_phone || '';
@@ -1069,6 +1174,7 @@ def softphone_page():
             nameEl.textContent = b.winner_name;
             phoneEl.textContent = b.winner_phone || '';
             currentLeadId = b.winner || null;   // dispose the winning lead
+            loadScriptForLead(currentLeadId);   // fill script for the person who answered
             setStatus('Connected — ' + b.winner_name, 'connected');
             logMsg('Connected to ' + b.winner_name);
             startTimer();
