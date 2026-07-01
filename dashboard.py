@@ -1992,7 +1992,12 @@ elif page == "dialer":
                      for c in preview],
                     use_container_width=True, hide_index=True,
                 )
-                if st.button(f"✅ Add {len(preview)} to dialer", key="dialer_confirm", type="primary"):
+                _default_name = f"Import {date.today().isoformat()}"
+                _list_name = st.text_input(
+                    "Name this list", value=_default_name, key="dialer_list_name",
+                    help="Saved so you can start dialing it anytime from the Saved lists below.",
+                )
+                if st.button(f"✅ Save & add {len(preview)} to dialer", key="dialer_confirm", type="primary"):
                     # Index every number already in the CRM so we never create a
                     # duplicate call lead for someone already on file (double-dial risk).
                     existing_nums: dict[str, int] = {}
@@ -2033,12 +2038,16 @@ elif page == "dialer":
                         for p in c.phones:
                             seen_nums.add(p)
                         new_ids.append(lid)
+                    # Save the batch as a named, persistent dial list.
+                    if new_ids:
+                        _new_list_id = db.create_dial_list(_list_name)
+                        db.add_list_members(_new_list_id, new_ids)
                     st.session_state["dialer_queue"] = queue + new_ids
                     st.session_state["dialer_idx"] = len(queue)   # jump to first new lead
                     st.session_state["dialer_on_call"] = False
                     st.session_state["dialer_preview"] = None
                     st.session_state["dialer_warnings"] = []
-                    msg = f"Added {len(new_ids)} new call leads to the dialer."
+                    msg = f"Saved list '{_list_name}' — added {len(new_ids)} call leads to the dialer."
                     extras = []
                     if skipped_existing:
                         extras.append(f"{skipped_existing} already in CRM")
@@ -2051,9 +2060,61 @@ elif page == "dialer":
             else:
                 st.info("No dialable contacts found in that paste.")
 
+    # ── Saved lists ───────────────────────────────────────────────────────────
+    _saved_lists = db.fetch_dial_lists()
+    with st.expander(f"📋 Saved lists ({len(_saved_lists)})", expanded=not queue):
+        # One-time helper: gather previously-imported contacts not yet in a list.
+        _listed = db.listed_lead_ids()
+        _orphans = [l["id"] for l in all_leads
+                    if l.get("conversation_stage") == "not_contacted" and l["id"] not in _listed]
+        if _orphans:
+            oc1, oc2 = st.columns([3, 2])
+            oc1.caption(f"{len(_orphans)} previously-imported contacts aren't in a list yet.")
+            if oc2.button(f"Save {len(_orphans)} as a list", key="gather_orphans"):
+                _gid = db.create_dial_list(f"Imported contacts {date.today().isoformat()}")
+                db.add_list_members(_gid, _orphans)
+                st.success(f"Saved {len(_orphans)} contacts as a list.")
+                st.rerun()
+
+        if not _saved_lists:
+            st.caption("No saved lists yet. Import a list above (name it) and it'll appear here.")
+        for _dl in _saved_lists:
+            _lc1, _lc2, _lc3 = st.columns([4, 3, 2])
+            with _lc1:
+                st.markdown(f"**{_dl['name']}**")
+                _created = _dl["created_at"][:10] if _dl.get("created_at") else ""
+                st.caption(f"📇 {_dl['contacts']} contacts · ✅ {_dl['dialed']} dialed · "
+                           f"⏳ {_dl['remaining']} left · {_created}")
+            with _lc2:
+                _rn_key = f"rename_val_{_dl['id']}"
+                st.text_input("Rename", value=_dl["name"], key=_rn_key,
+                              label_visibility="collapsed")
+                if st.button("Rename", key=f"rename_btn_{_dl['id']}"):
+                    db.rename_dial_list(_dl["id"], st.session_state[_rn_key])
+                    st.rerun()
+            with _lc3:
+                if st.button("▶ Start dialing", key=f"start_list_{_dl['id']}", type="primary"):
+                    _ids = db.fetch_list_lead_ids(_dl["id"])
+                    st.session_state["dialer_queue"] = _ids
+                    st.session_state["dialer_idx"] = 0
+                    st.session_state["dialer_on_call"] = False
+                    st.session_state["dialer_batch_id"] = None
+                    st.toast(f"Loaded '{_dl['name']}' ({len(_ids)} leads) into the dialer.")
+                    st.rerun()
+                if st.button("🗑 Delete list", key=f"del_list_{_dl['id']}"):
+                    if st.session_state.get(f"confirm_del_{_dl['id']}"):
+                        db.delete_dial_list(_dl["id"])
+                        st.session_state.pop(f"confirm_del_{_dl['id']}", None)
+                        st.toast(f"Deleted list '{_dl['name']}' (leads kept).")
+                        st.rerun()
+                    else:
+                        st.session_state[f"confirm_del_{_dl['id']}"] = True
+                        st.warning("Click Delete again to confirm (leads are kept).")
+            st.divider()
+
     # ── The dial card ─────────────────────────────────────────────────────────
     if not queue:
-        st.info("Nobody in the dialer yet. Import a list above to start.")
+        st.info("Nobody in the dialer yet. Import a list above or start a saved list.")
     else:
         idx = min(st.session_state["dialer_idx"], len(queue) - 1)
         st.session_state["dialer_idx"] = idx

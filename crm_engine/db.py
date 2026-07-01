@@ -132,6 +132,19 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 added_date            TEXT NOT NULL,
                 notes                 TEXT NOT NULL DEFAULT ''
             );
+
+            CREATE TABLE IF NOT EXISTS dial_lists (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                notes       TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS dial_list_members (
+                list_id  INTEGER NOT NULL,
+                lead_id  INTEGER NOT NULL,
+                PRIMARY KEY (list_id, lead_id)
+            );
             """
         )
         # Migration: add 'investor' to status CHECK (requires table recreation in SQLite)
@@ -915,3 +928,84 @@ def caller_calls_today(phone_number: str, db_path: Path = DB_PATH) -> int:
     if not row or row["calls_today_date"] != today:
         return 0
     return row["calls_today"]
+
+
+# ── Dial lists (named, persistent imported lists for the dialer) ─────────────
+
+def create_dial_list(name: str, notes: str = "", db_path: Path = DB_PATH) -> int:
+    with get_conn(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO dial_lists (name, created_at, notes) VALUES (?,?,?)",
+            (name.strip() or "Untitled list", datetime.utcnow().isoformat(timespec="seconds"), notes),
+        )
+        return cur.lastrowid
+
+
+def add_list_members(list_id: int, lead_ids: Iterable[int], db_path: Path = DB_PATH) -> None:
+    with get_conn(db_path) as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO dial_list_members (list_id, lead_id) VALUES (?,?)",
+            [(list_id, lid) for lid in lead_ids],
+        )
+
+
+def fetch_dial_lists(db_path: Path = DB_PATH) -> list[dict[str, Any]]:
+    """Return each list with contact/dialed/remaining counts. 'dialed' = members
+    whose lead has advanced past 'not_contacted' (i.e., actually worked)."""
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT dl.id, dl.name, dl.created_at, dl.notes,
+                   COUNT(m.lead_id) AS contacts,
+                   SUM(CASE WHEN l.conversation_stage != 'not_contacted' THEN 1 ELSE 0 END) AS dialed
+            FROM dial_lists dl
+            LEFT JOIN dial_list_members m ON m.list_id = dl.id
+            LEFT JOIN leads l ON l.id = m.lead_id
+            GROUP BY dl.id
+            ORDER BY dl.created_at DESC
+            """
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = _to_dict(r)
+        d["contacts"] = d["contacts"] or 0
+        d["dialed"] = d["dialed"] or 0
+        d["remaining"] = d["contacts"] - d["dialed"]
+        out.append(d)
+    return out
+
+
+def fetch_list_lead_ids(list_id: int, db_path: Path = DB_PATH) -> list[int]:
+    """Lead ids in a list that still exist, uncontacted first (so a fresh
+    dialing run starts with people you haven't reached yet)."""
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT m.lead_id
+            FROM dial_list_members m
+            JOIN leads l ON l.id = m.lead_id
+            WHERE m.list_id = ?
+            ORDER BY CASE WHEN l.conversation_stage = 'not_contacted' THEN 0 ELSE 1 END, m.lead_id
+            """,
+            (list_id,),
+        ).fetchall()
+    return [r["lead_id"] for r in rows]
+
+
+def rename_dial_list(list_id: int, name: str, db_path: Path = DB_PATH) -> None:
+    with get_conn(db_path) as conn:
+        conn.execute("UPDATE dial_lists SET name=? WHERE id=?", (name.strip(), list_id))
+
+
+def delete_dial_list(list_id: int, db_path: Path = DB_PATH) -> None:
+    """Remove the list grouping only. Lead rows are left untouched."""
+    with get_conn(db_path) as conn:
+        conn.execute("DELETE FROM dial_list_members WHERE list_id=?", (list_id,))
+        conn.execute("DELETE FROM dial_lists WHERE id=?", (list_id,))
+
+
+def listed_lead_ids(db_path: Path = DB_PATH) -> set[int]:
+    """Set of lead ids that already belong to some dial list."""
+    with get_conn(db_path) as conn:
+        rows = conn.execute("SELECT DISTINCT lead_id FROM dial_list_members").fetchall()
+    return {r["lead_id"] for r in rows}
