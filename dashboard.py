@@ -2065,8 +2065,10 @@ elif page == "dialer":
     with st.expander(f"📋 Saved lists ({len(_saved_lists)})", expanded=not queue):
         # One-time helper: gather previously-imported contacts not yet in a list.
         _listed = db.listed_lead_ids()
+        # True dialer imports are parked far-future; match those precisely so we
+        # don't offer to group unrelated old uncontacted leads.
         _orphans = [l["id"] for l in all_leads
-                    if l.get("conversation_stage") == "not_contacted" and l["id"] not in _listed]
+                    if (l.get("next_action_date") or "") >= "2999-01-01" and l["id"] not in _listed]
         if _orphans:
             oc1, oc2 = st.columns([3, 2])
             oc1.caption(f"{len(_orphans)} previously-imported contacts aren't in a list yet.")
