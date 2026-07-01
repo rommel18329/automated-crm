@@ -2302,7 +2302,25 @@ elif page == "dialer":
                 except Exception:
                     pass
 
-            st.markdown("**Pick the outcome when you hang up:**")
+            # Advance WITHOUT re-logging — for when you already disposed in the
+            # softphone popup. Cycles any un-reached batch leads back into the queue.
+            st.caption("Disposed in the softphone popup? Just hit **Next lead**. "
+                       "Or pick an outcome here to save *and* advance.")
+            if st.button("▶ Next lead", key="dial_next", type="primary",
+                         use_container_width=True):
+                if _batch_id:
+                    _batch_leads = st.session_state.get("dialer_batch_leads", [])
+                    _dropped = ([lid for lid in _batch_leads if lid != _winner_id]
+                                if _winner_id else _batch_leads)
+                    st.session_state["dialer_queue"].extend(_dropped)
+                    st.session_state["dialer_batch_id"] = None
+                    st.session_state["dialer_batch_leads"] = []
+                st.session_state["dialer_on_call"] = False
+                if st.session_state["dialer_idx"] < len(queue) - 1:
+                    st.session_state["dialer_idx"] += 1
+                st.rerun()
+
+            st.markdown("**Or save the outcome here (also advances):**")
             d_cols = st.columns(3)
             for i, label in enumerate(DISPOSITIONS):
                 if d_cols[i % 3].button(label, key=f"dial_disp_{label}",
