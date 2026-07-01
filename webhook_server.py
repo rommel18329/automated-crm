@@ -19,6 +19,7 @@ import re
 import sys
 import logging
 import uuid
+import time
 import threading
 from datetime import datetime, timedelta, date
 from pathlib import Path
@@ -439,28 +440,54 @@ def dialer_multi_start():
         "dropped": [],
         "resolved_count": 0,
         "total": len(lead_ids),
-        "status": "ringing",
+        "status": "waiting_agent",   # waiting for the softphone to join the room
+        "agent_ready": False,
     }
 
     with _batch_lock:
         _multi_batches[batch_id] = batch
 
     def _fire_calls():
+        # Wait until the softphone has actually joined the conference, so the
+        # winning call never drops into an empty room (the cause of the silence).
+        waited = 0.0
+        while waited < 20:
+            with _batch_lock:
+                if batch.get("agent_ready"):
+                    break
+            time.sleep(0.25); waited += 0.25
+        with _batch_lock:
+            if not batch.get("agent_ready"):
+                batch["status"] = "no_agent"
+                log.warning(f"Multi [{batch_id}] softphone never joined — calls NOT fired")
+                return
+            batch["status"] = "ringing"
+
         from twilio.rest import Client as TwilioClient
         twilio = TwilioClient(ACCOUNT_SID, AUTH_TOKEN)
 
-        def _one_call(lid):
+        # Pre-assign a DISTINCT caller ID per line (sequential, so no race gives
+        # two lines the same number — that's the concurrency/spam risk).
+        assignments = []
+        used_numbers: set[str] = set()
+        for lid in lead_ids:
             lead = db.fetch_lead(lid, DB_PATH)
             if not lead:
-                return
+                with _batch_lock:
+                    batch["resolved_count"] += 1
+                continue
+            frm = (caller_id_pool.pick_number(lead["phone"], DB_PATH, exclude=used_numbers)
+                   or pick_from_number(lead["phone"]))
+            used_numbers.add(frm)
+            assignments.append((lid, lead, frm))
+
+        def _one_call(a):
+            lid, lead, frm = a
             phone = to_e164(lead["phone"])
-            # Rotate caller ID from the pool (area-code match, caps, warm-up).
-            # Fall back to the simple 515/773 routing if the pool is empty.
-            from_ = caller_id_pool.pick_number(lead["phone"], DB_PATH) or pick_from_number(lead["phone"])
             try:
                 call = twilio.calls.create(
                     to=phone,
-                    from_=from_,
+                    from_=frm,
                     url=f"{PUBLIC_BASE_URL}/voice/multi-answer/{batch_id}/{lid}",
                     status_callback=f"{PUBLIC_BASE_URL}/voice/multi-status/{batch_id}/{lid}",
                     status_callback_event=["completed", "busy", "no-answer", "failed", "canceled"],
@@ -468,22 +495,21 @@ def dialer_multi_start():
                 )
                 with _batch_lock:
                     batch["call_sids"][lid] = call.sid
-                    batch["from_numbers"][lid] = from_
-                # Count toward this number's daily cap + answer-rate denominator.
-                db.increment_caller_calls(from_, DB_PATH)
-                caller_id_pool.record_placed(from_)
-                log.info(f"Multi-dial [{batch_id}] → {lead['name']} ({phone}) from {from_} SID={call.sid}")
+                    batch["from_numbers"][lid] = frm
+                db.increment_caller_calls(frm, DB_PATH)
+                caller_id_pool.record_placed(frm)
+                log.info(f"Multi-dial [{batch_id}] → {lead['name']} ({phone}) from {frm} SID={call.sid}")
             except Exception as exc:
                 log.warning(f"Multi-dial [{batch_id}] call to {lid} failed: {exc}")
                 with _batch_lock:
                     batch["resolved_count"] += 1
 
         with ThreadPoolExecutor(max_workers=10) as pool:
-            pool.map(_one_call, lead_ids)
+            pool.map(_one_call, assignments)
 
     threading.Thread(target=_fire_calls, daemon=True).start()
 
-    # Tell the softphone to join the conference
+    # Tell the softphone to join the conference (it POSTs agent-ready once in)
     global _dialer_current
     _dialer_current = {
         "mode": "multi",
@@ -494,6 +520,25 @@ def dialer_multi_start():
     }
 
     resp = jsonify({"batch_id": batch_id, "lines": len(lead_ids)})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/dialer/agent-ready/<batch_id>", methods=["POST", "OPTIONS"])
+def dialer_agent_ready(batch_id: str):
+    """The softphone calls this once it has joined the conference. Releases the
+    gated multi-dial so the outbound calls fire into a room the agent is in."""
+    if request.method == "OPTIONS":
+        resp = Response("")
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
+        return resp
+    with _batch_lock:
+        batch = _multi_batches.get(batch_id)
+        if batch and not batch.get("agent_ready"):
+            batch["agent_ready"] = True
+            log.info(f"Multi [{batch_id}] softphone joined — releasing calls")
+    resp = jsonify({"ok": True})
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
@@ -973,7 +1018,11 @@ def softphone_page():
     acceptedFired = false;
     c.on('accept', function() {
       acceptedFired = true;
-      if (!currentBatchId) {
+      if (currentBatchId) {
+        // Agent is now in the conference — tell the server to fire the calls.
+        fetch('/dialer/agent-ready/' + currentBatchId, { method: 'POST' }).catch(function(){});
+        logMsg('In the room — firing lines...');
+      } else {
         setStatus('Connected', 'connected');
         startTimer();
         logMsg('Call connected');

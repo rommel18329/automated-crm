@@ -101,7 +101,8 @@ def _area_of(phone: str) -> str:
     return digits[:3] if len(digits) >= 3 else ""
 
 
-def pick_number(lead_phone: str, db_path: Path = db.DB_PATH) -> str | None:
+def pick_number(lead_phone: str, db_path: Path = db.DB_PATH,
+                exclude: set | None = None) -> str | None:
     """Choose the best caller ID for a call to lead_phone.
 
     Priority:
@@ -109,9 +110,11 @@ def pick_number(lead_phone: str, db_path: Path = db.DB_PATH) -> str | None:
          then any usable number.
       2. Among candidates, the one with the most remaining daily headroom
          (spreads load evenly and keeps patterns steady).
-    Skips flagged / retired numbers and any number already at its cap.
+    Skips flagged / retired numbers, any number already at its cap, and any
+    number in `exclude` (used to give each line of a multi-dial its own number).
     Returns E.164 string, or None if the pool is empty / all capped.
     """
+    exclude = exclude or set()
     pool = db.fetch_caller_pool(db_path)
     if not pool:
         return None
@@ -119,6 +122,8 @@ def pick_number(lead_phone: str, db_path: Path = db.DB_PATH) -> str | None:
     usable = []
     for num in pool:
         if num["status"] in ("flagged", "retired"):
+            continue
+        if num["phone_number"] in exclude:
             continue
         _maybe_graduate(num, db_path)
         used = db.caller_calls_today(num["phone_number"], db_path)

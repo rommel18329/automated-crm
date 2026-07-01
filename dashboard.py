@@ -2287,8 +2287,14 @@ elif page == "dialer":
                     _winner_id = _br.get("winner")
                     _winner_name = _br.get("winner_name", "")
                     _batch_status = _br.get("status", "")
-                    if _batch_status == "ringing":
-                        st.info(f"Multi-line ringing... ({_br.get('total', '?')} leads) — check softphone")
+                    if _batch_status == "waiting_agent":
+                        st.info("Waiting for the softphone to join the call... "
+                                "**Keep the softphone popup open and visible.**")
+                    elif _batch_status == "no_agent":
+                        st.error("The softphone never joined, so no calls were placed. "
+                                 "Open the softphone popup (Dialer page) and keep it visible, then dial again.")
+                    elif _batch_status == "ringing":
+                        st.info(f"📞 Ringing {_br.get('total', '?')} lines — listen in the softphone.")
                     elif _batch_status == "connected" and _winner_name:
                         st.success(f"Connected to: **{_winner_name}** ({_br.get('winner_phone', '')})")
                     elif _batch_status == "no_answer":
@@ -2323,7 +2329,7 @@ elif page == "dialer":
                     st.session_state["dialer_batch_leads"] = []
                 st.session_state["dialer_on_call"] = False
                 st.rerun()
-            if _batch_id and _batch_status == "no_answer":
+            if _batch_id and _batch_status in ("no_answer", "no_agent"):
                 if _cancel_col2.button("⏭ Skip batch — next", key="dial_skip_batch"):
                     _batch_leads = st.session_state.get("dialer_batch_leads", [])
                     _q = st.session_state["dialer_queue"]
