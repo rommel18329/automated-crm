@@ -1651,6 +1651,7 @@ elif page == "messages":
         _qd_base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
         _qd_515 = _FROM_OPTS["515"]
         _qd_773 = _FROM_OPTS["773"]
+        _qd_agent = "rom" if st.session_state.get("user", "RJ") == "RJ" else "gabby"
         # Self-contained widget: the Browser button opens/focuses the softphone
         # popup itself (no need to visit the Dialer page first), then pushes the
         # number for it to dial. The My-phone button bridges your cell instead.
@@ -1676,7 +1677,8 @@ elif page == "messages":
         </div>
         <script>
           var BASE = "{_qd_base}";
-          var SOFTPHONE = BASE + "/softphone";
+          var AGENT = "{_qd_agent}";
+          var SOFTPHONE = BASE + "/softphone?agent=" + AGENT;
           function qdDigits(s) {{ return (s.match(/\\d/g) || []).join(''); }}
           function qdE164(s) {{ var d = qdDigits(s); return d.length === 10 ? '+1'+d : '+'+d; }}
           function qdMsg(t) {{ document.getElementById('qdMsg').textContent = t; }}
@@ -1688,10 +1690,10 @@ elif page == "messages":
             var to = qdE164(raw);
             if (mode === 'browser') {{
               // Open (or focus) the softphone popup — same window name reuses it.
-              var win = window.open(SOFTPHONE, 'crm_softphone', 'width=380,height=440,resizable=yes');
+              var win = window.open(SOFTPHONE, 'crm_softphone_' + AGENT, 'width=380,height=440,resizable=yes');
               if (!win) {{ qdMsg('Popup blocked — allow popups for this site, then try again.'); return; }}
               fetch(BASE + '/dialer/current', {{ method:'POST',
-                body: JSON.stringify({{ to_number: to, caller_id: from,
+                body: JSON.stringify({{ agent: AGENT, to_number: to, caller_id: from,
                   lead_name: 'Manual dial', lead_phone: raw, ts: Date.now().toString() }}) }});
               qdMsg('Dialing ' + raw + ' in the softphone popup...');
             }} else {{
@@ -2157,6 +2159,13 @@ elif page == "dialer":
         st.session_state.setdefault("dialer_batch_id", None)
 
         if not st.session_state["dialer_on_call"]:
+            # Which agent this browser session is (RJ toggle = Rom, GL = Gabby).
+            # Drives lead claiming, the dial channel, and the softphone identity.
+            _agent = "rom" if st.session_state.get("user", "RJ") == "RJ" else "gabby"
+            st.caption(f"Dialing as **{_agent.capitalize()}** — flip the RJ/GL toggle "
+                       f"(top right) to switch. Leads are claimed per agent, so two "
+                       f"people can work the same list without double-dialing.")
+
             _call_mode = st.radio(
                 "Call mode",
                 ["Browser (headset/mic)", "Phone (bridges to your cell)"],
@@ -2182,10 +2191,10 @@ elif page == "dialer":
                         info_icon("⚡ ~500ms connect (Device stays warm)", _browser_tip),
                         unsafe_allow_html=True,
                     )
-                    _softphone_url = f"{_base_url}/softphone"
+                    _softphone_url = f"{_base_url}/softphone?agent={_agent}"
                     _sp_col2.markdown(
-                        f"<a href='{_softphone_url}' target='_crm_softphone' "
-                        f"onclick=\"window.open('{_softphone_url}','_crm_softphone',"
+                        f"<a href='{_softphone_url}' target='_crm_softphone_{_agent}' "
+                        f"onclick=\"window.open('{_softphone_url}','_crm_softphone_{_agent}',"
                         f"'width=380,height=400,resizable=yes');return false;\" "
                         f"style='display:inline-block;background:#28a745;color:#fff;"
                         f"padding:6px 14px;border-radius:6px;font-size:13px;"
@@ -2218,21 +2227,39 @@ elif page == "dialer":
                 )
                 _remaining = queue[idx:]
                 _batch_size = min(_lines, len(_remaining))
-                _batch_ids = _remaining[:_batch_size]
                 if st.button(f"📞 Dial {_batch_size} lines now",
                              key="dial_multi", type="primary",
                              use_container_width=True):
                     import requests as _req
+                    # Check out the next leads server-side: skips anything the
+                    # other agent has claimed or that anyone dialed today. Two
+                    # agents on the same list split it automatically.
+                    _cl = _req.post(
+                        f"{_base_url}/dialer/claim",
+                        json={"agent": _agent, "candidates": _remaining[:100],
+                              "count": _batch_size},
+                        timeout=10,
+                    ).json()
+                    _to_dial = _cl.get("to_dial", [])
+                    _skipped = set(_cl.get("skipped", []))
+                    if _skipped:
+                        st.session_state["dialer_queue"] = [
+                            l for l in st.session_state["dialer_queue"] if l not in _skipped
+                        ]
+                    if not _to_dial:
+                        st.toast("⏭ Next leads are taken (other agent / already "
+                                 "dialed today) — queue trimmed, try again.")
+                        st.rerun()
                     resp = _req.post(
                         f"{_base_url}/dialer/multi-start",
-                        json={"lead_ids": _batch_ids, "amd": _amd_on},
+                        json={"lead_ids": _to_dial, "amd": _amd_on, "agent": _agent},
                         timeout=10,
                     )
                     if resp.ok:
                         rdata = resp.json()
                         st.session_state["dialer_on_call"] = True
                         st.session_state["dialer_batch_id"] = rdata["batch_id"]
-                        st.session_state["dialer_batch_leads"] = _batch_ids
+                        st.session_state["dialer_batch_leads"] = _to_dial
                         st.rerun()
                     else:
                         st.error(f"Multi-dial failed: {resp.text}")
@@ -2246,6 +2273,23 @@ elif page == "dialer":
                                  key=f"dial_call_{lead_id}_{i}",
                                  type="primary" if i == 1 else "secondary",
                                  use_container_width=True):
+                        import requests as _req
+                        # Claim this lead first — if the other agent has it (or
+                        # anyone dialed it today), skip instead of double-dialing.
+                        try:
+                            _cl = _req.post(
+                                f"{_base_url}/dialer/claim",
+                                json={"agent": _agent, "candidates": [lead_id], "count": 1},
+                                timeout=10,
+                            ).json()
+                        except Exception:
+                            _cl = {"to_dial": [lead_id]}   # claim server unreachable: fail open
+                        if not _cl.get("to_dial"):
+                            st.session_state["dialer_queue"] = [
+                                l for l in st.session_state["dialer_queue"] if l != lead_id
+                            ]
+                            st.toast("⏭ Lead taken by the other agent or already dialed today — skipped.")
+                            st.rerun()
                         if not _is_browser:
                             res = place_call(lead_id, from_number=_FROM_OPTS[pcid], to_number=p)
                             if res.get("called"):
@@ -2259,11 +2303,11 @@ elif page == "dialer":
                             if not _browser_ready:
                                 st.error("Browser calling not set up. Run `python setup_twilio_app.py`.")
                             else:
-                                import requests as _req
                                 _ts = datetime.utcnow().isoformat()
                                 _req.post(
                                     f"{_base_url}/dialer/current",
                                     json={
+                                        "agent": _agent,
                                         "lead_id": lead_id,
                                         "caller_id": _FROM_OPTS[pcid],
                                         "lead_name": lead["name"],

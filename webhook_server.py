@@ -62,9 +62,24 @@ def pick_from_number(to_phone: str) -> str:
 # In-memory map: CallSid → lead_id, used to attach recordings to the right lead
 _call_sid_to_lead: dict[str, int] = {}
 
-# Shared state for the persistent softphone popup.
-# Streamlit POSTs here when the user clicks CALL; the popup polls for changes.
-_dialer_current: dict = {}   # {lead_id, caller_id, lead_name, lead_phone, ts}
+# Per-agent dial channels for the persistent softphone popups.
+# Streamlit POSTs here when an agent clicks CALL; that agent's popup polls
+# its own channel — two agents (rom / gabby) never see each other's dials.
+_dialer_current: dict[str, dict] = {}   # agent -> {lead_id, caller_id, ..., ts}
+
+# Lead claims: while an agent is dialing a lead, the other agent can't.
+# In-memory (single webhook server = single source of truth), TTL-expired.
+# The permanent guard is db.leads_dialed_today() — anything dialed today by
+# anyone is excluded for the rest of the day.
+_lead_claims: dict[int, dict] = {}      # lead_id -> {"agent": str, "ts": float}
+_CLAIM_TTL = 600.0                       # seconds a claim blocks the other agent
+
+
+def _prune_claims() -> None:
+    """Call with _batch_lock held."""
+    now = time.time()
+    for lid in [l for l, c in _lead_claims.items() if now - c["ts"] > _CLAIM_TTL]:
+        _lead_claims.pop(lid, None)
 
 # Multi-line batch state.  batch_id -> dict with:
 #   conference, lead_ids, call_sids{lead_id: sid}, winner(lead_id),
@@ -334,7 +349,9 @@ def voice_token():
     from twilio.jwt.access_token import AccessToken
     from twilio.jwt.access_token.grants import VoiceGrant
 
-    token = AccessToken(ACCOUNT_SID, API_KEY, API_SECRET, identity="crm-dialer")
+    # Per-agent identity so two softphones (rom + gabby) register separately.
+    agent = re.sub(r"[^a-z0-9]", "", (request.args.get("agent") or "dialer").lower()) or "dialer"
+    token = AccessToken(ACCOUNT_SID, API_KEY, API_SECRET, identity=f"crm-{agent}")
     token.add_grant(VoiceGrant(outgoing_application_sid=TWIML_APP_SID))
     jwt = token.to_jwt()
     resp = jsonify({"token": jwt})
@@ -469,9 +486,15 @@ def dialer_multi_start():
         twilio = TwilioClient(ACCOUNT_SID, AUTH_TOKEN)
 
         # Pre-assign a DISTINCT caller ID per line (sequential, so no race gives
-        # two lines the same number — that's the concurrency/spam risk).
+        # two lines the same number — that's the concurrency/spam risk). Also
+        # exclude numbers currently ringing in the OTHER agent's active batches.
         assignments = []
-        used_numbers: set[str] = set()
+        with _batch_lock:
+            used_numbers: set[str] = {
+                n for b in _multi_batches.values()
+                if b["batch_id"] != batch_id and b["status"] in ("waiting_agent", "ringing")
+                for n in b["from_numbers"].values()
+            }
         for lid in lead_ids:
             lead = db.fetch_lead(lid, DB_PATH)
             if not lead:
@@ -511,9 +534,10 @@ def dialer_multi_start():
 
     threading.Thread(target=_fire_calls, daemon=True).start()
 
-    # Tell the softphone to join the conference (it POSTs agent-ready once in)
-    global _dialer_current
-    _dialer_current = {
+    # Tell THIS agent's softphone to join the conference (it POSTs agent-ready
+    # once it's in the room, which releases the gated calls above).
+    agent = (data.get("agent") or "rom").lower()
+    _dialer_current[agent] = {
         "mode": "multi",
         "batch_id": batch_id,
         "conference": conference,
@@ -877,6 +901,9 @@ def dialer_dispose():
                        agent=data.get("agent"), batch_id=b_id,
                        from_number=frm, to_number=to,
                        duration_sec=data.get("duration_sec"))
+    # Disposed = done for today; the claim is no longer needed.
+    with _batch_lock:
+        _lead_claims.pop(int(lead_id), None)
     log.info(f"Disposed lead {lead_id} ({lead['name']}): {label}")
 
     resp = jsonify({"ok": True, "lead_id": lead_id, "disposition": label})
@@ -945,16 +972,64 @@ def dialer_set_status():
 
 @app.route("/dialer/current", methods=["GET", "POST"])
 def dialer_current():
-    """Shared state between Streamlit and the softphone popup.
-    POST: Streamlit writes {lead_id, caller_id, lead_name, lead_phone, ts}.
-    GET:  The popup polls this to detect new leads to dial."""
-    global _dialer_current
+    """Per-agent dial channel between Streamlit and each softphone popup.
+    POST: Streamlit writes {agent, lead_id, caller_id, lead_name, lead_phone, ts}.
+    GET:  A popup polls ?agent=<name> to detect its own new leads to dial."""
     if request.method == "POST":
-        _dialer_current = request.get_json(force=True) or {}
+        data = request.get_json(force=True) or {}
+        agent = (data.get("agent") or "rom").lower()
+        _dialer_current[agent] = data
         resp = jsonify({"ok": True})
         resp.headers["Access-Control-Allow-Origin"] = "*"
         return resp
-    resp = jsonify(_dialer_current)
+    agent = (request.args.get("agent") or "rom").lower()
+    resp = jsonify(_dialer_current.get(agent, {}))
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/dialer/claim", methods=["POST", "OPTIONS"])
+def dialer_claim():
+    """Check out the next dialable leads for an agent (the pro-dialer split).
+
+    Body: {agent, candidates: [lead_id in queue order], count}
+    Returns {to_dial: [...], skipped: [...]} where skipped leads are either
+    claimed by the other agent right now or already dialed today by anyone —
+    the dashboard drops those from its local queue, so two agents working the
+    same list divide it automatically without ever double-dialing."""
+    if request.method == "OPTIONS":
+        resp = Response("")
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
+        return resp
+    data = request.get_json(force=True, silent=True) or {}
+    agent = (data.get("agent") or "rom").lower()
+    try:
+        candidates = [int(x) for x in data.get("candidates", [])]
+        count = max(1, int(data.get("count", 1)))
+    except (TypeError, ValueError):
+        return jsonify({"error": "bad payload"}), 400
+
+    dialed_today = db.leads_dialed_today(DB_PATH)
+    to_dial: list[int] = []
+    skipped: list[int] = []
+    now = time.time()
+    with _batch_lock:
+        _prune_claims()
+        for lid in candidates:
+            if len(to_dial) >= count:
+                break
+            claim = _lead_claims.get(lid)
+            if lid in dialed_today or (claim and claim["agent"] != agent):
+                skipped.append(lid)
+                continue
+            to_dial.append(lid)
+        for lid in to_dial:
+            _lead_claims[lid] = {"agent": agent, "ts": now}
+    if skipped:
+        log.info(f"Claim [{agent}]: dialing {to_dial}, skipped {len(skipped)} "
+                 f"(other agent / already dialed today)")
+    resp = jsonify({"to_dial": to_dial, "skipped": skipped})
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
@@ -1126,10 +1201,18 @@ def softphone_page():
   let lastCallDuration = 0;     // seconds, for the KPI disposition row
   let dispBatchId = null;       // batch the disposition belongs to (multi-dial)
 
-  // Rep name persists across sessions (so you and your wife each keep yours).
-  try { var _rn = localStorage.getItem('crm_rep_name'); if (_rn) repNameEl.value = _rn; } catch (e) {}
+  // Which agent this popup belongs to (rom / gabby). Each agent's popup polls
+  // its own dial channel and registers its own Twilio identity.
+  var AGENT = (new URLSearchParams(location.search).get('agent') || 'rom').toLowerCase();
+  document.title = 'CRM Softphone - ' + AGENT.charAt(0).toUpperCase() + AGENT.slice(1);
+  var h3 = document.querySelector('h3');
+  if (h3) h3.textContent = '📞 CRM Softphone — ' + AGENT.charAt(0).toUpperCase() + AGENT.slice(1);
+
+  // Rep name persists per agent; defaults to the agent's name.
+  repNameEl.value = AGENT.charAt(0).toUpperCase() + AGENT.slice(1);
+  try { var _rn = localStorage.getItem('crm_rep_name_' + AGENT); if (_rn) repNameEl.value = _rn; } catch (e) {}
   repNameEl.addEventListener('input', function() {
-    try { localStorage.setItem('crm_rep_name', repNameEl.value); } catch (e) {}
+    try { localStorage.setItem('crm_rep_name_' + AGENT, repNameEl.value); } catch (e) {}
     renderScript(lastScriptInfo);
   });
 
@@ -1472,7 +1555,7 @@ def softphone_page():
 
   // ── Poll /dialer/current for new leads / multi-batches ────────────────
   function pollForLead() {
-    fetch('/dialer/current')
+    fetch('/dialer/current?agent=' + AGENT)
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (!data || !data.ts) return;
@@ -1510,7 +1593,7 @@ def softphone_page():
       logMsg('Device error: ' + (err.message || err));
     });
     device.on('tokenWillExpire', function() {
-      fetch('/voice/token').then(function(r) { return r.json(); }).then(function(d) {
+      fetch('/voice/token?agent=' + AGENT).then(function(r) { return r.json(); }).then(function(d) {
         if (d.token && device) { device.updateToken(d.token); logMsg('Token refreshed'); }
       }).catch(function() {});
     });
@@ -1534,8 +1617,8 @@ def softphone_page():
   }
 
   setStatus('Fetching token...', '');
-  logMsg('Fetching access token...');
-  fetch('/voice/token')
+  logMsg('Fetching access token (' + AGENT + ')...');
+  fetch('/voice/token?agent=' + AGENT)
     .then(function(r) { return r.json(); })
     .then(function(data) {
       if (data.error) {

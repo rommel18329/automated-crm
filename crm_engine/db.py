@@ -1070,6 +1070,23 @@ def attach_status_to_disposition(lead_id: int, status: str, db_path: Path = DB_P
     log_disposition(lead_id, "(status only)", "popup", status_set=status, db_path=db_path)
 
 
+def leads_dialed_today(db_path: Path = DB_PATH) -> set[int]:
+    """Lead ids already dialed today by ANY agent — disposition rows plus
+    outbound call interactions. Drives the two-agent no-double-dial guard."""
+    today = date.today().isoformat()
+    with get_conn(db_path) as conn:
+        d = conn.execute(
+            "SELECT DISTINCT lead_id FROM dispositions WHERE created_at >= ?",
+            (today,),
+        ).fetchall()
+        i = conn.execute(
+            "SELECT DISTINCT lead_id FROM interactions "
+            "WHERE type='call' AND direction='outbound' AND timestamp >= ?",
+            (today,),
+        ).fetchall()
+    return {r["lead_id"] for r in d} | {r["lead_id"] for r in i}
+
+
 def fetch_disposition_stats(days: int = 30, db_path: Path = DB_PATH) -> list[dict[str, Any]]:
     """Counts by disposition over the last N days — starter query for KPIs."""
     cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat(timespec="seconds")
