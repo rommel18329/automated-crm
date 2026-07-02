@@ -438,6 +438,8 @@ def dialer_multi_start():
         "winner_name": "",
         "winner_phone": "",
         "dropped": [],
+        "machines": [],       # lead_ids classified as voicemail by AMD
+        "amd": bool(data.get("amd", True)),
         "resolved_count": 0,
         "total": len(lead_ids),
         "status": "waiting_agent",   # waiting for the softphone to join the room
@@ -543,46 +545,42 @@ def dialer_agent_ready(batch_id: str):
     return resp
 
 
-@app.route("/voice/multi-answer/<batch_id>/<int:lead_id>", methods=["POST"])
-def voice_multi_answer(batch_id: str, lead_id: int):
-    """A lead answered. If first → join the conference. Otherwise → hangup."""
-    with _batch_lock:
-        batch = _multi_batches.get(batch_id)
-        if not batch:
-            return Response('<?xml version="1.0"?><Response><Hangup/></Response>',
-                            mimetype="text/xml")
+_HANGUP_TWIML = '<?xml version="1.0"?><Response><Hangup/></Response>'
 
-        if batch["winner"] is not None:
-            # Someone already won — hang up this call
-            log.info(f"Multi [{batch_id}] lead {lead_id} answered but {batch['winner']} already won")
-            return Response('<?xml version="1.0"?><Response><Hangup/></Response>',
-                            mimetype="text/xml")
 
-        # First answer — this lead wins
-        batch["winner"] = lead_id
-        batch["status"] = "connected"
-        lead = db.fetch_lead(lead_id, DB_PATH)
-        batch["winner_name"] = lead["name"] if lead else ""
-        batch["winner_phone"] = lead["phone"] if lead else ""
-        conference = batch["conference"]
-        call_sid = request.form.get("CallSid", "")
-        winner_from = batch["from_numbers"].get(lead_id)
+def _conference_twiml(conference: str, caller_id: str, stop_stream: bool = False) -> str:
+    """Winner TwiML: join the conference the softphone is waiting in.
+    stop_stream ends the AMD media stream first (AMD path only)."""
+    stop = '<Stop><Stream name="amd"/></Stop>' if stop_stream else ''
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Response>' + stop +
+        f'<Dial callerId="{caller_id}"'
+        ' record="record-from-ringing-dual"'
+        ' recordingStatusCallback="/voice/recording"'
+        ' recordingStatusCallbackMethod="POST">'
+        f'<Conference startConferenceOnEnter="true" endConferenceOnExit="true"'
+        f' waitUrl="" beep="false">{conference}</Conference>'
+        '</Dial></Response>'
+    )
 
-    # This number reached a human — credit its answer rate.
-    if winner_from:
-        caller_id_pool.record_connected(winner_from)
 
-    # Log the call interaction
+def _finalize_winner(batch_id: str, batch: dict, lead_id: int, call_sid: str | None) -> None:
+    """Side effects shared by every winner path: interaction log, recording
+    map, answer-rate credit, and killing the other ringing lines."""
+    lead = db.fetch_lead(lead_id, DB_PATH)
     if lead:
         db.add_interaction(
             lead_id, "call",
             f"Outbound call (multi-line dialer) to {lead['name']}",
             "outbound", DB_PATH, ts=datetime.utcnow(),
         )
-        if call_sid:
-            _call_sid_to_lead[call_sid] = lead_id
+    if call_sid:
+        _call_sid_to_lead[call_sid] = lead_id
+    winner_from = batch["from_numbers"].get(lead_id)
+    if winner_from:
+        caller_id_pool.record_connected(winner_from)
 
-    # Kill all other ringing calls in a background thread
     def _kill_others():
         from twilio.rest import Client as TwilioClient
         twilio = TwilioClient(ACCOUNT_SID, AUTH_TOKEN)
@@ -598,20 +596,170 @@ def voice_multi_answer(batch_id: str, lead_id: int):
                 batch["dropped"].append(lid)
 
     threading.Thread(target=_kill_others, daemon=True).start()
-
     log.info(f"Multi [{batch_id}] WINNER: lead {lead_id} ({batch['winner_name']})")
+
+
+@app.route("/voice/multi-answer/<batch_id>/<int:lead_id>", methods=["POST"])
+def voice_multi_answer(batch_id: str, lead_id: int):
+    """A lead's line was answered.
+
+    AMD off: first answer wins the conference immediately (legacy behavior).
+    AMD on:  hold the call and stream its audio to the AMD server; the winner
+    is declared by /voice/amd-result (human) or /voice/amd-timeout (fail-open).
+    """
+    call_sid = request.form.get("CallSid", "")
+    lead = db.fetch_lead(lead_id, DB_PATH)
+    with _batch_lock:
+        batch = _multi_batches.get(batch_id)
+        if not batch:
+            return Response(_HANGUP_TWIML, mimetype="text/xml")
+        if call_sid:
+            batch["call_sids"].setdefault(lead_id, call_sid)
+        if batch["winner"] is not None:
+            log.info(f"Multi [{batch_id}] lead {lead_id} answered but {batch['winner']} already won")
+            return Response(_HANGUP_TWIML, mimetype="text/xml")
+        amd_on = batch.get("amd", False)
+        if not amd_on:
+            batch["winner"] = lead_id
+            batch["status"] = "connected"
+            batch["winner_name"] = lead["name"] if lead else ""
+            batch["winner_phone"] = lead["phone"] if lead else ""
+        conference = batch["conference"]
+
+    if amd_on:
+        # Hold + screen: stream callee audio to the AMD server. If no verdict
+        # arrives, the Redirect fails open and connects like today.
+        stream_url = PUBLIC_BASE_URL.replace("https://", "wss://") + "/amd"
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Response>'
+            f'<Start><Stream name="amd" url="{stream_url}">'
+            f'<Parameter name="batch" value="{batch_id}"/>'
+            f'<Parameter name="lead" value="{lead_id}"/>'
+            '</Stream></Start>'
+            '<Pause length="6"/>'
+            f'<Redirect method="POST">{PUBLIC_BASE_URL}/voice/amd-timeout/{batch_id}/{lead_id}</Redirect>'
+            '</Response>'
+        )
+        log.info(f"Multi [{batch_id}] lead {lead_id} answered — AMD screening")
+        return Response(twiml, mimetype="text/xml")
+
+    _finalize_winner(batch_id, batch, lead_id, call_sid)
     caller_id = pick_from_number(batch["winner_phone"])
-    twiml = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<Response><Dial callerId="' + caller_id + '"'
-        ' record="record-from-ringing-dual"'
-        ' recordingStatusCallback="/voice/recording"'
-        ' recordingStatusCallbackMethod="POST">'
-        f'<Conference startConferenceOnEnter="true" endConferenceOnExit="true"'
-        f' waitUrl="" beep="false">{conference}</Conference>'
-        '</Dial></Response>'
-    )
-    return Response(twiml, mimetype="text/xml")
+    return Response(_conference_twiml(conference, caller_id), mimetype="text/xml")
+
+
+def _handle_machine(batch_id: str, batch: dict, lead_id: int, sid: str | None) -> None:
+    """AMD said voicemail: hang the line up, auto-dispose the lead (+1 day),
+    and log a KPI row with source='amd'."""
+    with _batch_lock:
+        if lead_id not in batch["machines"]:
+            batch["machines"].append(lead_id)
+    if sid:
+        try:
+            from twilio.rest import Client as TwilioClient
+            TwilioClient(ACCOUNT_SID, AUTH_TOKEN).calls(sid).update(status="completed")
+        except Exception:
+            pass
+    lead = db.fetch_lead(lead_id, DB_PATH)
+    if lead:
+        db.add_interaction(lead_id, "call", "Call - voicemail detected (auto)",
+                           "outbound", DB_PATH, ts=datetime.utcnow())
+        fields = {
+            "last_contact_date": date.today().isoformat(),
+            "next_action_date": (date.today() + timedelta(days=1)).isoformat(),
+        }
+        if lead.get("conversation_stage") == "not_contacted":
+            fields["conversation_stage"] = "initial_contact"
+        db.update_lead(lead_id, fields, DB_PATH)
+        db.log_disposition(lead_id, "Voicemail (auto)", source="amd",
+                           batch_id=batch_id,
+                           from_number=batch["from_numbers"].get(lead_id),
+                           to_number=lead.get("phone"))
+    log.info(f"AMD [{batch_id}] machine on lead {lead_id} — hung up + auto-disposed")
+
+
+def _declare_winner_via_rest(batch_id: str, batch: dict, lead_id: int, sid: str | None) -> None:
+    """AMD said human (or unknown): first one wins; redirect that live call
+    into the conference. Late humans are hung up."""
+    lead = db.fetch_lead(lead_id, DB_PATH)
+    with _batch_lock:
+        if batch["winner"] is not None:
+            late = batch["winner"] != lead_id
+        else:
+            late = False
+            batch["winner"] = lead_id
+            batch["status"] = "connected"
+            batch["winner_name"] = lead["name"] if lead else ""
+            batch["winner_phone"] = lead["phone"] if lead else ""
+        conference = batch["conference"]
+    from twilio.rest import Client as TwilioClient
+    twilio = TwilioClient(ACCOUNT_SID, AUTH_TOKEN)
+    if late:
+        if sid:
+            try:
+                twilio.calls(sid).update(status="completed")
+            except Exception:
+                pass
+        return
+    caller_id = pick_from_number(batch["winner_phone"])
+    if sid:
+        try:
+            twilio.calls(sid).update(
+                twiml=_conference_twiml(conference, caller_id, stop_stream=True))
+        except Exception as exc:
+            log.warning(f"AMD [{batch_id}] failed to redirect winner {lead_id}: {exc}")
+    _finalize_winner(batch_id, batch, lead_id, sid)
+
+
+@app.route("/voice/amd-result/<batch_id>/<int:lead_id>", methods=["POST"])
+def voice_amd_result(batch_id: str, lead_id: int):
+    """Verdict from the AMD server: human/unknown connect, machine hangs up."""
+    data = request.get_json(force=True, silent=True) or {}
+    result = data.get("result", "unknown")
+    detail = data.get("detail", "")
+    log.info(f"AMD [{batch_id}] lead {lead_id}: {result} ({detail})")
+    with _batch_lock:
+        batch = _multi_batches.get(batch_id)
+        if not batch:
+            return jsonify({"ok": False, "error": "batch not found"}), 404
+        sid = batch["call_sids"].get(lead_id)
+        already_winner = batch["winner"] == lead_id
+    if result == "machine" and not already_winner:
+        _handle_machine(batch_id, batch, lead_id, sid)
+    else:
+        _declare_winner_via_rest(batch_id, batch, lead_id, sid)
+    return jsonify({"ok": True})
+
+
+@app.route("/voice/amd-timeout/<batch_id>/<int:lead_id>", methods=["POST", "GET"])
+def voice_amd_timeout(batch_id: str, lead_id: int):
+    """TwiML fallback after the AMD hold <Pause>: no verdict arrived (AMD
+    server down/slow), so FAIL OPEN — connect this call like AMD never ran."""
+    call_sid = request.form.get("CallSid", "")
+    lead = db.fetch_lead(lead_id, DB_PATH)
+    with _batch_lock:
+        batch = _multi_batches.get(batch_id)
+        if not batch:
+            return Response(_HANGUP_TWIML, mimetype="text/xml")
+        if batch["winner"] == lead_id:
+            # amd-result already declared us winner; its REST redirect lost the
+            # race with this Redirect — return the same conference TwiML.
+            conference = batch["conference"]
+            phone = batch["winner_phone"]
+            return Response(_conference_twiml(conference, pick_from_number(phone),
+                                              stop_stream=True), mimetype="text/xml")
+        if batch["winner"] is not None:
+            return Response(_HANGUP_TWIML, mimetype="text/xml")
+        batch["winner"] = lead_id
+        batch["status"] = "connected"
+        batch["winner_name"] = lead["name"] if lead else ""
+        batch["winner_phone"] = lead["phone"] if lead else ""
+        conference = batch["conference"]
+    log.info(f"AMD [{batch_id}] no verdict for lead {lead_id} — failing open to connect")
+    _finalize_winner(batch_id, batch, lead_id, call_sid)
+    return Response(_conference_twiml(conference, pick_from_number(batch["winner_phone"]),
+                                      stop_stream=True), mimetype="text/xml")
 
 
 @app.route("/voice/multi-status/<batch_id>/<int:lead_id>", methods=["POST"])
@@ -646,6 +794,8 @@ def dialer_batch(batch_id: str):
         "total": batch["total"],
         "resolved_count": batch["resolved_count"],
         "dropped": batch["dropped"],
+        "machines_count": len(batch.get("machines", [])),
+        "amd": batch.get("amd", False),
     })
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
@@ -712,6 +862,21 @@ def dialer_dispose():
     if days is not None:
         fields["next_action_date"] = (date.today() + timedelta(days=days)).isoformat()
     db.update_lead(int(lead_id), fields, DB_PATH)
+
+    # KPI row. Enrich caller-ID/number from the batch when this lead won one.
+    frm = data.get("from_number")
+    to = data.get("to_number") or lead.get("phone")
+    b_id = data.get("batch_id")
+    if b_id:
+        with _batch_lock:
+            b = _multi_batches.get(b_id)
+            if b and b.get("winner") == int(lead_id):
+                frm = b["from_numbers"].get(int(lead_id)) or frm
+                to = b.get("winner_phone") or to
+    db.log_disposition(int(lead_id), label, source="popup",
+                       agent=data.get("agent"), batch_id=b_id,
+                       from_number=frm, to_number=to,
+                       duration_sec=data.get("duration_sec"))
     log.info(f"Disposed lead {lead_id} ({lead['name']}): {label}")
 
     resp = jsonify({"ok": True, "lead_id": lead_id, "disposition": label})
@@ -769,6 +934,8 @@ def dialer_set_status():
     db.update_lead(int(lead_id), {"status": status}, DB_PATH)
     db.add_interaction(int(lead_id), "note", f"Marked {status.upper()} from dialer",
                        "outbound", DB_PATH, ts=datetime.utcnow())
+    # KPI: attach the temperature to this call's disposition row.
+    db.attach_status_to_disposition(int(lead_id), status, DB_PATH)
     log.info(f"Set lead {lead_id} ({lead['name']}) status -> {status}")
 
     resp = jsonify({"ok": True, "lead_id": lead_id, "status": status})
@@ -956,6 +1123,8 @@ def softphone_page():
   let currentLeadId = null;     // lead being handled (null for manual quick-dials)
   let savedParts = [];          // confirmation chips shown after saving
   let lastScriptInfo = null;    // {first_name, address} for the active lead
+  let lastCallDuration = 0;     // seconds, for the KPI disposition row
+  let dispBatchId = null;       // batch the disposition belongs to (multi-dial)
 
   // Rep name persists across sessions (so you and your wife each keep yours).
   try { var _rn = localStorage.getItem('crm_rep_name'); if (_rn) repNameEl.value = _rn; } catch (e) {}
@@ -1043,6 +1212,10 @@ def softphone_page():
     if (callEndHandled) return;   // ignore duplicate end events for one call
     callEndHandled = true;
     call = null;
+    if (callStart) {
+      lastCallDuration = Math.floor((Date.now() - callStart) / 1000);
+      callStart = null;
+    }
     stopTimer();
     // Retry ONCE only if: transient gateway/connection error, the call NEVER
     // connected (no human answered), it's not a multi-line batch, we haven't
@@ -1127,8 +1300,18 @@ def softphone_page():
       var _ss = document.getElementById('statusSection');
       if (_ss) _ss.style.display = 'none';
     }
+    // KPI extras: who called, how long, which batch/numbers.
+    var singleMatch = lastSingleParams
+      && String(lastSingleParams.lead_id) === String(currentLeadId);
     fetch('/dialer/dispose', { method: 'POST',
-      body: JSON.stringify({ lead_id: currentLeadId, disposition: label }) })
+      body: JSON.stringify({
+        lead_id: currentLeadId, disposition: label,
+        agent: (repNameEl.value || '').trim() || null,
+        duration_sec: lastCallDuration || 0,
+        batch_id: dispBatchId,
+        from_number: singleMatch ? (lastSingleParams.caller_id || null) : null,
+        to_number: singleMatch ? (lastSingleParams.lead_phone || null) : null
+      }) })
       .then(function(r) { return r.json(); })
       .then(function(j) {
         if (j.ok) {
@@ -1148,7 +1331,8 @@ def softphone_page():
     if (!currentLeadId) return;
     dispStatusEl.classList.add('locked');    // one status per call
     fetch('/dialer/status', { method: 'POST',
-      body: JSON.stringify({ lead_id: currentLeadId, status: status }) })
+      body: JSON.stringify({ lead_id: currentLeadId, status: status,
+        agent: (repNameEl.value || '').trim() || null }) })
       .then(function(r) { return r.json(); })
       .then(function(j) {
         if (j.ok) { showSaved(status.toUpperCase()); logMsg('Status set: ' + status); }
@@ -1184,6 +1368,8 @@ def softphone_page():
     if (!isRetry) { retriedThisDial = false; }
     hideDisposition();
     currentLeadId = lead.lead_id || null;   // null for manual quick-dials
+    dispBatchId = null;
+    lastCallDuration = 0;
     loadScriptForLead(currentLeadId);
     lastDialTs = lead.ts;
     nameEl.textContent = lead.lead_name || '(unknown)';
@@ -1213,6 +1399,8 @@ def softphone_page():
     if (call || !device) return;
     hideDisposition();
     currentLeadId = null;
+    dispBatchId = data.batch_id;
+    lastCallDuration = 0;
     lastDialTs = data.ts;
     currentBatchId = data.batch_id;
     nameEl.textContent = data.lines + ' lines ringing...';
@@ -1248,11 +1436,14 @@ def softphone_page():
             startTimer();
             clearInterval(batchPollInterval);
             batchPollInterval = null;
+          } else if (b.status === 'ringing' && b.machines_count > 0) {
+            setStatus('Ringing — ' + b.machines_count + ' voicemail(s) skipped', 'ringing');
           } else if (b.status === 'no_answer') {
             nameEl.textContent = 'No one answered';
             phoneEl.textContent = '';
-            setStatus('All ' + b.total + ' lines — no answer', 'no-answer');
-            logMsg('No one answered (' + b.total + ' leads)');
+            var vmNote = b.machines_count > 0 ? ' (' + b.machines_count + ' voicemail, auto-logged)' : '';
+            setStatus('All ' + b.total + ' lines — no live answer' + vmNote, 'no-answer');
+            logMsg('No live answer (' + b.total + ' leads' + vmNote + ')');
             clearInterval(batchPollInterval);
             batchPollInterval = null;
             if (device) device.disconnectAll();

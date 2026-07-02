@@ -39,6 +39,12 @@ SERVICES = {
         "health": None,   # streamlit has no cheap health endpoint; use port check
         "grace": 12,
     },
+    "amd": {
+        "cmd": [sys.executable, str(ROOT / "amd_server.py")],
+        "port": 5002,
+        "health": None,   # websocket server; the port check is the health check
+        "grace": 6,
+    },
 }
 
 CHECK_EVERY = 5          # seconds between health checks

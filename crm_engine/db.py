@@ -140,6 +140,20 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 notes       TEXT NOT NULL DEFAULT ''
             );
 
+            CREATE TABLE IF NOT EXISTS dispositions (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id      INTEGER NOT NULL,
+                disposition  TEXT NOT NULL,
+                status_set   TEXT,
+                source       TEXT NOT NULL,      -- popup | dashboard | amd
+                agent        TEXT,
+                batch_id     TEXT,
+                from_number  TEXT,
+                to_number    TEXT,
+                duration_sec INTEGER,
+                created_at   TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS dial_list_members (
                 list_id  INTEGER NOT NULL,
                 lead_id  INTEGER NOT NULL,
@@ -1009,3 +1023,61 @@ def listed_lead_ids(db_path: Path = DB_PATH) -> set[int]:
     with get_conn(db_path) as conn:
         rows = conn.execute("SELECT DISTINCT lead_id FROM dial_list_members").fetchall()
     return {r["lead_id"] for r in rows}
+
+
+# ── Dispositions (structured, KPI-ready call outcome log) ────────────────────
+
+def log_disposition(
+    lead_id: int,
+    disposition: str,
+    source: str,
+    status_set: str | None = None,
+    agent: str | None = None,
+    batch_id: str | None = None,
+    from_number: str | None = None,
+    to_number: str | None = None,
+    duration_sec: int | None = None,
+    db_path: Path = DB_PATH,
+) -> None:
+    """One row per disposition event. Everything the KPIs will need later:
+    who called, from which number, to which number, in which batch, how long,
+    what the outcome was, and any status set on the same call."""
+    with get_conn(db_path) as conn:
+        conn.execute(
+            """INSERT INTO dispositions
+               (lead_id, disposition, status_set, source, agent, batch_id,
+                from_number, to_number, duration_sec, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (lead_id, disposition, status_set, source, agent, batch_id,
+             from_number, to_number, duration_sec,
+             datetime.utcnow().isoformat(timespec="seconds")),
+        )
+
+
+def attach_status_to_disposition(lead_id: int, status: str, db_path: Path = DB_PATH) -> None:
+    """Record a hot/warm/cold set on the lead's most recent disposition row
+    (within 15 min). If there isn't one, log a standalone status row."""
+    cutoff = (datetime.utcnow() - timedelta(minutes=15)).isoformat(timespec="seconds")
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            """SELECT id FROM dispositions
+               WHERE lead_id=? AND created_at>=? ORDER BY id DESC LIMIT 1""",
+            (lead_id, cutoff),
+        ).fetchone()
+        if row:
+            conn.execute("UPDATE dispositions SET status_set=? WHERE id=?", (status, row["id"]))
+            return
+    log_disposition(lead_id, "(status only)", "popup", status_set=status, db_path=db_path)
+
+
+def fetch_disposition_stats(days: int = 30, db_path: Path = DB_PATH) -> list[dict[str, Any]]:
+    """Counts by disposition over the last N days — starter query for KPIs."""
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat(timespec="seconds")
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            """SELECT disposition, source, COUNT(*) AS n
+               FROM dispositions WHERE created_at>=?
+               GROUP BY disposition, source ORDER BY n DESC""",
+            (cutoff,),
+        ).fetchall()
+    return [_to_dict(r) for r in rows]

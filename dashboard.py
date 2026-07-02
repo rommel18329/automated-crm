@@ -401,8 +401,9 @@ def build_followups(leads: list[dict]) -> tuple[list[dict], list[dict]]:
 def interaction_windows(interactions: list[dict]) -> dict[str, list[dict]]:
     now = datetime.utcnow()
     start_day = datetime.combine(date.today(), datetime.min.time())
-    start_week = start_day.replace(hour=0)  # same day base
-    start_week = start_week.replace(day=start_week.day - start_week.weekday())
+    # Subtract with timedelta — .replace(day=...) blows up with
+    # "day is out of range for month" when the week began last month.
+    start_week = start_day - timedelta(days=start_day.weekday())
     start_month = start_day.replace(day=1)
 
     def in_window(item: dict, start: datetime) -> bool:
@@ -1931,6 +1932,10 @@ elif page == "dialer":
         if days is not None:
             fields["next_action_date"] = (date.today() + timedelta(days=days)).isoformat()
         db.update_lead(lead_id, fields)
+        # KPI row (dashboard-side dispositions; popup logs its own)
+        db.log_disposition(lead_id, label, source="dashboard", agent=who,
+                           batch_id=st.session_state.get("dialer_batch_id"),
+                           to_number=lead.get("phone") if lead else None)
         st.session_state["dialer_on_call"] = False
         if st.session_state["dialer_idx"] < len(queue) - 1:
             st.session_state["dialer_idx"] += 1   # auto-advance after disposing
@@ -2204,6 +2209,13 @@ elif page == "dialer":
                 st.session_state["dialer_lines"] = _lines
 
             if _is_browser and _lines > 1 and _browser_ready:
+                _amd_on = st.checkbox(
+                    "🤖 Skip voicemails (self-built AMD)", value=True, key="dialer_amd",
+                    help="Listens to the first seconds of each answered line: humans "
+                         "connect to you; voicemail greetings/beeps are hung up and "
+                         "auto-logged as 'Voicemail (auto)'. If detection is unsure it "
+                         "connects you anyway — a real person is never dropped.",
+                )
                 _remaining = queue[idx:]
                 _batch_size = min(_lines, len(_remaining))
                 _batch_ids = _remaining[:_batch_size]
@@ -2213,7 +2225,7 @@ elif page == "dialer":
                     import requests as _req
                     resp = _req.post(
                         f"{_base_url}/dialer/multi-start",
-                        json={"lead_ids": _batch_ids},
+                        json={"lead_ids": _batch_ids, "amd": _amd_on},
                         timeout=10,
                     )
                     if resp.ok:
@@ -2298,7 +2310,10 @@ elif page == "dialer":
                     elif _batch_status == "connected" and _winner_name:
                         st.success(f"Connected to: **{_winner_name}** ({_br.get('winner_phone', '')})")
                     elif _batch_status == "no_answer":
-                        st.warning("No one answered this batch.")
+                        st.warning("No live answer on this batch.")
+                    _mc = _br.get("machines_count", 0)
+                    if _mc:
+                        st.caption(f"🤖 {_mc} voicemail(s) auto-skipped and logged as 'Voicemail (auto)'")
                 except Exception:
                     pass
 
