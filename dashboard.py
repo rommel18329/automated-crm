@@ -2193,8 +2193,8 @@ elif page == "dialer":
                     )
                     _softphone_url = f"{_base_url}/softphone?agent={_agent}"
                     _sp_col2.markdown(
-                        f"<a href='{_softphone_url}' target='_crm_softphone_{_agent}' "
-                        f"onclick=\"window.open('{_softphone_url}','_crm_softphone_{_agent}',"
+                        f"<a href='{_softphone_url}' target='crm_softphone_{_agent}' "
+                        f"onclick=\"window.open('{_softphone_url}','crm_softphone_{_agent}',"
                         f"'width=380,height=400,resizable=yes');return false;\" "
                         f"style='display:inline-block;background:#28a745;color:#fff;"
                         f"padding:6px 14px;border-radius:6px;font-size:13px;"

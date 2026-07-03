@@ -32,6 +32,11 @@ FLASK_BASE = "http://127.0.0.1:5001"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("amd")
+# The supervisor's TCP health probe connects and closes without an HTTP
+# handshake every few seconds; websockets logs a full traceback each time.
+# Silence that noise so real events stay readable.
+logging.getLogger("websockets").setLevel(logging.CRITICAL)
+logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
 
 
 def _post_result(batch: str, lead: str, result: str, detail: str) -> None:

@@ -445,9 +445,11 @@ def dialer_multi_start():
 
     batch_id = uuid.uuid4().hex[:12]
     conference = f"multi_{batch_id}"
+    agent = (data.get("agent") or "rom").lower()
     batch = {
         "batch_id": batch_id,
         "conference": conference,
+        "agent": agent,
         "lead_ids": lead_ids,
         "call_sids": {},
         "from_numbers": {},   # lead_id -> caller ID used (for answer-rate stats)
@@ -478,6 +480,11 @@ def dialer_multi_start():
         with _batch_lock:
             if not batch.get("agent_ready"):
                 batch["status"] = "no_agent"
+                # Clear the dead command from the channel so a popup opened
+                # later can't replay it into a dead conference.
+                cur = _dialer_current.get(batch["agent"])
+                if cur and cur.get("batch_id") == batch_id:
+                    _dialer_current.pop(batch["agent"], None)
                 log.warning(f"Multi [{batch_id}] softphone never joined — calls NOT fired")
                 return
             batch["status"] = "ringing"
@@ -536,7 +543,6 @@ def dialer_multi_start():
 
     # Tell THIS agent's softphone to join the conference (it POSTs agent-ready
     # once it's in the room, which releases the gated calls above).
-    agent = (data.get("agent") or "rom").lower()
     _dialer_current[agent] = {
         "mode": "multi",
         "batch_id": batch_id,
@@ -1480,11 +1486,21 @@ def softphone_page():
   // ── Multi-line dial ───────────────────────────────────────────────────
   async function joinMulti(data) {
     if (call || !device) return;
+    lastDialTs = data.ts;   // claim this command immediately (no double-trigger)
+    // Stale-replay guard: never join a batch that already ended (a fresh popup
+    // can see an old command still sitting in the channel).
+    try {
+      var bs = await (await fetch('/dialer/batch/' + data.batch_id)).json();
+      if (!bs || (bs.status !== 'waiting_agent' && bs.status !== 'ringing')) {
+        logMsg('Ignored stale batch ' + data.batch_id + ' (' + ((bs && bs.status) || 'gone') + ')');
+        return;
+      }
+    } catch (e) { return; }
+    if (call) return;       // a dial started while we were checking
     hideDisposition();
     currentLeadId = null;
     dispBatchId = data.batch_id;
     lastCallDuration = 0;
-    lastDialTs = data.ts;
     currentBatchId = data.batch_id;
     nameEl.textContent = data.lines + ' lines ringing...';
     phoneEl.textContent = '';
@@ -1568,7 +1584,13 @@ def softphone_page():
       .catch(function() {});
   }
 
-  setInterval(pollForLead, 500);
+  // Baseline first: ignore any command already sitting in the channel from a
+  // previous session — only commands issued AFTER this popup opened may dial.
+  fetch('/dialer/current?agent=' + AGENT)
+    .then(function(r) { return r.json(); })
+    .then(function(d) { if (d && d.ts) { lastDialTs = d.ts; } })
+    .catch(function() {})
+    .finally(function() { setInterval(pollForLead, 500); });
 
   // ── Init Twilio Device (Voice SDK 2.x) ────────────────────────────────
   function initDevice(token) {
