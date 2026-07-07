@@ -214,6 +214,16 @@ input, textarea, [data-baseweb="select"] * { color: var(--ink) !important; }
   filter: none; transform: none !important;
   background: linear-gradient(90deg, rgba(107,152,115,.38), rgba(107,152,115,.14)) !important;
 }
+/* Force EVERY sidebar nav label hard-left (labels live in a nested <p>) */
+[data-testid="stSidebar"] div[data-testid="stButton"] > button,
+[data-testid="stSidebar"] div[data-testid="stButton"] > button[kind="primary"],
+[data-testid="stSidebar"] div[data-testid="stButton"] > button[kind="secondary"] {
+  justify-content: flex-start !important;
+}
+[data-testid="stSidebar"] div[data-testid="stButton"] > button div,
+[data-testid="stSidebar"] div[data-testid="stButton"] > button p {
+  text-align: left !important; width: 100% !important; margin: 0 !important;
+}
 .sl-brand { display: flex; align-items: center; gap: 12px; padding: 6px 4px 18px;
   border-bottom: 1px solid rgba(255,255,255,.08); margin-bottom: 14px; }
 .sl-brand-mark { width: 40px; height: 40px; border-radius: 12px; display: flex;
@@ -245,11 +255,11 @@ input, textarea, [data-baseweb="select"] * { color: var(--ink) !important; }
 .msg-row{display:flex;margin:8px 0;}
 .msg-left{justify-content:flex-start;}
 .msg-right{justify-content:flex-end;}
-.msg-bubble-in{background:#EBEEEA;padding:9px 14px;border-radius:18px 18px 18px 5px;max-width:75%;
-  color:var(--ink);font-size:.95rem;line-height:1.45;box-shadow:var(--sh-sm);}
-.msg-bubble-out{background:linear-gradient(180deg,#57845F,#436C4B);padding:9px 14px;
-  border-radius:18px 18px 5px 18px;max-width:75%;color:#fff;font-size:.95rem;line-height:1.45;
-  box-shadow:0 2px 8px -2px rgba(67,108,75,.4);}
+/* iPhone / iMessage look — intentionally kept faithful to iOS */
+.msg-bubble-in{background:#e5e5ea;padding:9px 13px;border-radius:18px 18px 18px 5px;max-width:75%;
+  color:#000;font-size:.95rem;line-height:1.4;}
+.msg-bubble-out{background:linear-gradient(180deg,#41A2FF 0%,#0b84fe 100%);padding:9px 13px;
+  border-radius:18px 18px 5px 18px;max-width:75%;color:#fff;font-size:.95rem;line-height:1.4;}
 .msg-time{font-size:.70rem;color:var(--ink-3);margin-bottom:3px;text-align:center;width:100%;}
 .tooltip-wrap{position:relative;display:inline-flex;align-items:center;gap:6px;}
 .tooltip-icon{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;
@@ -282,6 +292,27 @@ input, textarea, [data-baseweb="select"] * { color: var(--ink) !important; }
 .call-name{font-weight:700;font-size:.94rem;letter-spacing:-0.01em;}
 .call-preview{font-size:.82rem;color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .call-ts{font-size:.76rem;color:var(--ink-3);white-space:nowrap;flex-shrink:0;}
+
+/* ── Page components (used across every page) ───────────────── */
+.sl-banner{padding:12px 16px;border-radius:var(--r-md);margin-bottom:12px;
+  font-size:.95rem;box-shadow:var(--sh-sm);border:1px solid var(--border);background:var(--card);}
+.sl-banner.green{background:#EDF6EE;border-color:#CDE5D0;box-shadow:inset 4px 0 0 #4E9C58;}
+.sl-banner.red{background:#FCEDEC;border-color:#F3D2D0;box-shadow:inset 4px 0 0 #DC4B45;}
+.sl-flag{font-size:.82rem;padding:6px 10px;margin:3px 0;background:var(--surface-2);
+  border-radius:8px;box-shadow:inset 3px 0 0 #C4A46E;color:var(--ink-2);}
+.sl-coach{font-size:.84rem;padding:10px 14px;margin:6px 0 4px;background:#EDF3FB;
+  border-radius:var(--r-sm);box-shadow:inset 3px 0 0 #3B6FC4;color:#1E3A5F;}
+.sl-coach-tag{font-weight:700;font-size:.72rem;letter-spacing:.08em;
+  text-transform:uppercase;opacity:.65;}
+.sl-row-name{font-size:1.02rem;font-weight:700;letter-spacing:-0.01em;color:var(--ink);}
+.sl-row-name.done{color:var(--ink-3);text-decoration:line-through;}
+.sl-row-phone{font-size:.88rem;color:var(--ink-2);}
+.sl-row-sub{font-size:.82rem;color:var(--ink-3);margin:2px 0 4px;}
+.sl-num{font-size:1.02rem;font-weight:700;letter-spacing:-0.01em;}
+.sl-chip{color:#fff;padding:2px 10px;border-radius:999px;font-size:.72rem;
+  font-weight:700;letter-spacing:.02em;}
+.sl-buybox{background:var(--card);border:1px solid var(--border);
+  border-radius:var(--r-md);padding:16px 18px;box-shadow:var(--sh-sm);}
 
 /* ── Dialer lead card ───────────────────────────────────────── */
 .sl-lead-card{position:relative;border:1px solid var(--border);border-radius:var(--r-lg);
@@ -779,7 +810,7 @@ def render_buy_box(lead_id: int, lead: dict) -> None:
         notes_line = f"<div style='margin:4px 0;font-size:.85rem;color:#555'>📝 {notes}</div>" if notes else ""
 
         st.markdown(
-            f"<div style='background:#f4f1ec;border:1px solid #ddd;border-radius:12px;padding:14px 16px'>"
+            f"<div class='sl-buybox'>"
             f"<div style='margin-bottom:6px'>{pt_pills}</div>"
             f"<div style='margin-bottom:6px'>📍 {state_pills}</div>"
             f"<div style='margin-bottom:6px'>💼 {deal_pills}</div>"
@@ -1251,8 +1282,8 @@ with st.sidebar:
     )
 
     _NAV_ICONS = {
-        "dashboard": "◈", "leads": "👤", "call_list": "☎", "dialer": "⚡",
-        "caller_health": "🛡", "followups": "↻", "messages": "💬",
+        "dashboard": "🏠", "leads": "👤", "call_list": "📋", "dialer": "⚡",
+        "caller_health": "🛡️", "followups": "🔁", "messages": "💬",
     }
 
     def nav_item(label: str, page_key: str) -> None:
@@ -1319,8 +1350,7 @@ if page == "dashboard":
         reply_leads = list(seen_leads.values())
         reply_word = "reply" if len(reply_leads) == 1 else "replies"
         st.markdown(
-            f"<div style='background:#edf7ed;border-left:4px solid #4caf50;"
-            f"padding:10px 14px;border-radius:6px;margin-bottom:12px'>"
+            f"<div class='sl-banner green'>"
             f"<b>💬 {len(reply_leads)} new {reply_word} in the last 24 hours</b>"
             f"</div>",
             unsafe_allow_html=True,
@@ -1338,8 +1368,7 @@ if page == "dashboard":
     if recent_missed_calls:
         call_word = "call" if len(recent_missed_calls) == 1 else "calls"
         st.markdown(
-            f"<div style='background:#fdecea;border-left:4px solid #e53935;"
-            f"padding:10px 14px;border-radius:6px;margin-bottom:12px'>"
+            f"<div class='sl-banner red'>"
             f"<b>📞 {len(recent_missed_calls)} missed {call_word} you haven't followed up on</b>"
             f"</div>",
             unsafe_allow_html=True,
@@ -1559,17 +1588,14 @@ elif page == "call_list":
                 # Name + phone on same line
                 st.markdown(
                     f"<div style='display:flex;align-items:baseline;gap:12px'>"
-                    f"<span style='font-size:1.05rem;font-weight:600;"
-                    f"{'color:#aaa;text-decoration:line-through' if is_done else 'color:#1a1a1a'}'>"
-                    f"{entry['name']}</span>"
-                    f"<span style='font-size:0.9rem;color:#555'>{lead['phone'] if lead else ''}</span>"
+                    f"<span class='sl-row-name{' done' if is_done else ''}'>{entry['name']}</span>"
+                    f"<span class='sl-row-phone'>{lead['phone'] if lead else ''}</span>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
                 if clean_address:
                     st.markdown(
-                        f"<div style='font-size:0.82rem;color:#777;margin:1px 0 4px 0'>"
-                        f"📍 {clean_address}</div>",
+                        f"<div class='sl-row-sub'>📍 {clean_address}</div>",
                         unsafe_allow_html=True,
                     )
                 labels = human_intent_labels(entry.get("intent_signals", []))
@@ -1693,21 +1719,14 @@ elif page == "followups":
 
             if flags:
                 for flag in flags:
-                    st.markdown(
-                        f"<div style='font-size:0.82rem;padding:4px 8px;margin:2px 0;"
-                        f"background:#fafafa;border-left:3px solid #b0976a;"
-                        f"border-radius:4px'>{flag}</div>",
-                        unsafe_allow_html=True,
-                    )
+                    st.markdown(f"<div class='sl-flag'>{flag}</div>",
+                                unsafe_allow_html=True)
 
             _coaching = st.session_state.get(coaching_key, "")
             if _coaching:
                 st.markdown(
-                    f"<div style='font-size:0.83rem;padding:8px 12px;margin:6px 0 4px 0;"
-                    f"background:#eef6ff;border-left:3px solid #2563eb;"
-                    f"border-radius:4px;color:#1e3a5f'>"
-                    f"<span style='font-weight:600;font-size:0.75rem;letter-spacing:0.04em;"
-                    f"text-transform:uppercase;opacity:0.7'>Coach</span><br>{_coaching}</div>",
+                    f"<div class='sl-coach'>"
+                    f"<span class='sl-coach-tag'>Coach</span><br>{_coaching}</div>",
                     unsafe_allow_html=True,
                 )
 
@@ -1997,8 +2016,8 @@ elif page == "messages":
             _cr1.markdown(f"<div style='font-size:1.4rem;padding-top:4px'>{_icon}</div>", unsafe_allow_html=True)
             with _cr2:
                 st.markdown(
-                    f"<div style='font-weight:600;font-size:.95rem'>{_cl_name}</div>"
-                    f"<div style='font-size:.82rem;color:#555'>{_call_preview}</div>",
+                    f"<div class='call-name'>{_cl_name}</div>"
+                    f"<div class='call-preview'>{_call_preview}</div>",
                     unsafe_allow_html=True,
                 )
                 if _has_rec:
@@ -2313,7 +2332,7 @@ elif page == "dialer":
                         f"<a href='{_softphone_url}' target='crm_softphone_{_agent}' "
                         f"onclick=\"window.open('{_softphone_url}','crm_softphone_{_agent}',"
                         f"'width=380,height=400,resizable=yes');return false;\" "
-                        f"style='display:inline-block;background:#28a745;color:#fff;"
+                        f"style='display:inline-block;background:linear-gradient(180deg,#5E8A67,#49764F);color:#fff;"
                         f"padding:6px 14px;border-radius:6px;font-size:13px;"
                         f"font-weight:600;text-decoration:none;text-align:center;"
                         f"width:100%'>Open Softphone</a>",
@@ -2589,8 +2608,8 @@ elif page == "caller_health":
             c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
             with c1:
                 st.markdown(
-                    f"<span style='font-size:1.05rem;font-weight:600'>{phone}</span> "
-                    f"<span style='background:{status_color};color:#fff;padding:1px 8px;"
+                    f"<span class='sl-num'>{phone}</span> "
+                    f"<span class='sl-chip' style='background:{status_color};padding:1px 8px;"
                     f"border-radius:10px;font-size:0.75rem'>{num['status']}</span>"
                     + (" <span style='color:#dc3545;font-size:0.8rem'>⚠️ flag?</span>"
                        if is_suspect else ""),
