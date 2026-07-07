@@ -45,6 +45,15 @@ SERVICES = {
         "health": None,   # websocket server; the port check is the health check
         "grace": 6,
     },
+    # 2026 UI preview — identical logic to dashboard.py, new design system.
+    # Runs beside the original (8501) so both can be compared live.
+    "streamlit_v2": {
+        "cmd": [sys.executable, "-m", "streamlit", "run", str(ROOT / "dashboard_v2.py"),
+                "--server.port", "8502", "--server.headless", "true"],
+        "port": 8502,
+        "health": None,
+        "grace": 12,
+    },
 }
 
 CHECK_EVERY = 5          # seconds between health checks
