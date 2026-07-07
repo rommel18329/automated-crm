@@ -85,15 +85,18 @@ div[data-testid="stButton"] > button {
   transition: transform .12s ease, box-shadow .15s ease, border-color .15s ease,
               background .15s ease !important;
 }
+/* Flat, minimal: default buttons are quiet text — no bubbles. Only primary
+   CTAs are filled. Hover gives a soft tint for affordance. */
 div[data-testid="stButton"] > button[kind="secondary"] {
-  background: var(--card) !important;
-  border: 1px solid var(--border-strong) !important;
-  color: var(--ink) !important;
-  box-shadow: var(--sh-sm) !important;
+  background: transparent !important;
+  border: none !important;
+  color: var(--ink-2) !important;
+  box-shadow: none !important;
 }
 div[data-testid="stButton"] > button[kind="secondary"]:hover {
-  border-color: var(--accent) !important; color: var(--accent-strong) !important;
-  transform: translateY(-1px); box-shadow: var(--sh-md) !important;
+  background: var(--accent-soft) !important;
+  color: var(--accent-strong) !important;
+  transform: none; box-shadow: none !important;
 }
 div[data-testid="stButton"] > button[kind="primary"] {
   background: linear-gradient(180deg, #5E8A67 0%, #49764F 100%) !important;
@@ -113,15 +116,18 @@ div[data-testid="stButton"] > button[kind="tertiary"] {
 div[data-testid="stButton"] > button[kind="tertiary"]:hover { text-decoration: underline; }
 div[data-testid="stButton"] > button:active { transform: translateY(0) scale(.99); }
 
-/* Brand title button (top-left, acts as home link) */
-.st-key-home_dashboard_button button,
-div[data-testid="stButton"] button#home_dashboard_button {
+/* Brand title button (top-left, acts as home link) — plain bold wordmark */
+.st-key-home_dashboard_button div[data-testid="stButton"] > button,
+.st-key-home_dashboard_button div[data-testid="stButton"] > button[kind="secondary"] {
   font-size: 1.45rem !important; font-weight: 800 !important;
   letter-spacing: -0.03em !important; text-align: left !important;
   color: var(--ink) !important; background: transparent !important;
   border: none !important; box-shadow: none !important; padding: 0 !important;
 }
-.st-key-home_dashboard_button button:hover { color: var(--accent-strong) !important; transform: none !important; }
+.st-key-home_dashboard_button div[data-testid="stButton"] > button:hover {
+  color: var(--accent-strong) !important; background: transparent !important;
+  transform: none !important;
+}
 
 /* ── Inputs ─────────────────────────────────────────────────── */
 input, textarea, [data-baseweb="select"] * { color: var(--ink) !important; }
@@ -214,15 +220,17 @@ input, textarea, [data-baseweb="select"] * { color: var(--ink) !important; }
   filter: none; transform: none !important;
   background: linear-gradient(90deg, rgba(107,152,115,.38), rgba(107,152,115,.14)) !important;
 }
-/* Force EVERY sidebar nav label hard-left (labels live in a nested <p>) */
-[data-testid="stSidebar"] div[data-testid="stButton"] > button,
-[data-testid="stSidebar"] div[data-testid="stButton"] > button[kind="primary"],
-[data-testid="stSidebar"] div[data-testid="stButton"] > button[kind="secondary"] {
+/* Force EVERY sidebar nav label hard-left. The label <p> sits inside a nested
+   FLEX div whose justify-content centers it — text-align can't fix flex
+   positioning, the inner div's justify-content must be overridden too. */
+[data-testid="stSidebar"] [data-testid="stButton"] button,
+[data-testid="stSidebar"] [data-testid="stButton"] button > div,
+[data-testid="stSidebar"] [data-testid="stButton"] button [data-testid="stMarkdownContainer"] {
   justify-content: flex-start !important;
+  text-align: left !important;
 }
-[data-testid="stSidebar"] div[data-testid="stButton"] > button div,
-[data-testid="stSidebar"] div[data-testid="stButton"] > button p {
-  text-align: left !important; width: 100% !important; margin: 0 !important;
+[data-testid="stSidebar"] [data-testid="stButton"] button p {
+  text-align: left !important; margin: 0 !important;
 }
 .sl-brand { display: flex; align-items: center; gap: 12px; padding: 6px 4px 18px;
   border-bottom: 1px solid rgba(255,255,255,.08); margin-bottom: 14px; }
