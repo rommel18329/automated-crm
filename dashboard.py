@@ -1633,6 +1633,10 @@ elif page == "call_list":
 
 elif page == "followups":
     st.subheader("Follow-up Suggestions")
+    _session_ai_cost = st.session_state.get("ai_cost_session_total", 0.0)
+    if _session_ai_cost > 0:
+        st.caption(f"🤖 AI cost this session: **${_session_ai_cost:.4f}** "
+                   f"(Claude Haiku 4.5 — resets when you restart the app)")
     overdue_only = st.session_state.get("followup_overdue_only", False)
     queue = result["followup_queue"]
 
@@ -1672,8 +1676,9 @@ elif page == "followups":
             flags_key = f"f_flags_{lid}"
             ctx_key = f"f_ctx_{lid}"
             coaching_key = f"f_coaching_{lid}"
+            cost_key = f"f_cost_{lid}"
 
-            def _run_generation(target_lead, target_item, target_msg_key, target_flags_key, target_coaching_key, force=False, extra_context=""):
+            def _run_generation(target_lead, target_item, target_msg_key, target_flags_key, target_coaching_key, target_cost_key, force=False, extra_context=""):
                 import json as _json
                 ixns_g = db.fetch_interactions(target_lead["id"])
                 ixn_count = len(ixns_g)
@@ -1684,6 +1689,7 @@ elif page == "followups":
                     if cached and cached["interaction_count"] == ixn_count:
                         st.session_state[target_msg_key] = cached["message"]
                         st.session_state[target_flags_key] = _json.loads(cached["flags"])
+                        st.session_state[target_cost_key] = 0.0  # cached — no API call, no cost
                         return
 
                 draft = generate_followup_message(
@@ -1696,6 +1702,10 @@ elif page == "followups":
                 )
                 st.session_state[target_msg_key] = draft.message
                 st.session_state[target_flags_key] = draft.flags
+                st.session_state[target_cost_key] = draft.cost_usd
+                st.session_state["ai_cost_session_total"] = (
+                    st.session_state.get("ai_cost_session_total", 0.0) + draft.cost_usd
+                )
                 if draft.coaching:
                     st.session_state[target_coaching_key] = draft.coaching
                 else:
@@ -1708,13 +1718,13 @@ elif page == "followups":
             # Handle regenerate (force=True skips cache)
             if st.session_state.pop(regen_key, False):
                 with st.spinner("Regenerating..."):
-                    _run_generation(lead, item, msg_key, flags_key, coaching_key, force=True,
+                    _run_generation(lead, item, msg_key, flags_key, coaching_key, cost_key, force=True,
                                     extra_context=st.session_state.get(ctx_key, ""))
 
             # Lazy-generate on first view (uses cache if available)
             if msg_key not in st.session_state:
                 with st.spinner(f"Analyzing {item['lead_name']}..."):
-                    _run_generation(lead, item, msg_key, flags_key, coaching_key)
+                    _run_generation(lead, item, msg_key, flags_key, coaching_key, cost_key)
 
             flags = st.session_state.get(flags_key, [])
 
@@ -1745,6 +1755,13 @@ elif page == "followups":
                     st.caption("No conversation yet")
 
             st.text_area("Suggested text", key=msg_key, height=75)
+
+            _cost = st.session_state.get(cost_key)
+            if _cost is not None:
+                if _cost > 0:
+                    st.caption(f"💰 This generation cost **${_cost:.4f}**")
+                else:
+                    st.caption("💰 $0.0000 — reused cached suggestion, no API call")
 
             c1, c2, c_ctx, c3 = st.columns([2, 1, 3, 1])
             _SNOOZE_DAYS = {"warm": 5, "cold": 30}

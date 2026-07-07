@@ -14,6 +14,10 @@ client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 DEFAULT_FALLBACK = "Hey, just wanted to follow up. Still a good time to connect on the property?"
 
+# claude-haiku-4-5 pricing: $1.00 / 1M input tokens, $5.00 / 1M output tokens
+_PRICE_IN_PER_TOKEN = 1.00 / 1_000_000
+_PRICE_OUT_PER_TOKEN = 5.00 / 1_000_000
+
 SYSTEM_PROMPT = """You are an expert real estate acquisitions specialist and negotiation coach helping a wholesaler/investor close cash deals with motivated sellers.
 
 Your job: analyze the full conversation history and generate ONE perfect SMS to send RIGHT NOW that moves the deal toward closing — without spooking the seller or losing momentum.
@@ -84,6 +88,9 @@ class MessageResult:
     flags: list[str] = field(default_factory=list)
     tone: str = "warm"
     coaching: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
 
 
 def _build_conversation_text(conversation: list[dict], max_msgs: int = 20) -> str:
@@ -182,11 +189,17 @@ Now write the perfect next SMS to send."""
         data = json.loads(raw[start:end])
         message = _strip_ai_tells(str(data.get("message", DEFAULT_FALLBACK)))
         coaching = _strip_ai_tells(str(data.get("coaching", "")))
+        in_tok = getattr(resp.usage, "input_tokens", 0) or 0
+        out_tok = getattr(resp.usage, "output_tokens", 0) or 0
+        cost = in_tok * _PRICE_IN_PER_TOKEN + out_tok * _PRICE_OUT_PER_TOKEN
         return MessageResult(
             message=message,
             flags=[str(f) for f in data.get("flags", [])[:5]],
             tone=str(data.get("tone", "warm")),
             coaching=coaching,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            cost_usd=cost,
         )
     except Exception as exc:
         return MessageResult(

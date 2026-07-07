@@ -17,6 +17,9 @@ class FollowupDraft:
     flags: list[str] = field(default_factory=list)
     tone: str = "warm"
     coaching: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
 
 
 def _choose_objective(strong_intent: bool, ignored_texts: int) -> str:
@@ -66,4 +69,7 @@ def generate_followup_message(
         flags=result.flags,
         tone=result.tone,
         coaching=result.coaching,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+        cost_usd=result.cost_usd,
     )
