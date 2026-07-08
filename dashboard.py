@@ -1677,8 +1677,9 @@ elif page == "followups":
             ctx_key = f"f_ctx_{lid}"
             coaching_key = f"f_coaching_{lid}"
             cost_key = f"f_cost_{lid}"
+            reasoning_key = f"f_reasoning_{lid}"
 
-            def _run_generation(target_lead, target_item, target_msg_key, target_flags_key, target_coaching_key, target_cost_key, force=False, extra_context=""):
+            def _run_generation(target_lead, target_item, target_msg_key, target_flags_key, target_coaching_key, target_cost_key, target_reasoning_key, force=False, extra_context=""):
                 import json as _json
                 ixns_g = db.fetch_interactions(target_lead["id"])
                 ixn_count = len(ixns_g)
@@ -1690,6 +1691,7 @@ elif page == "followups":
                         st.session_state[target_msg_key] = cached["message"]
                         st.session_state[target_flags_key] = _json.loads(cached["flags"])
                         st.session_state[target_cost_key] = 0.0  # cached — no API call, no cost
+                        st.session_state[target_reasoning_key] = f"Tone: {cached['tone']} (cached suggestion)"
                         return
 
                 draft = generate_followup_message(
@@ -1703,6 +1705,7 @@ elif page == "followups":
                 st.session_state[target_msg_key] = draft.message
                 st.session_state[target_flags_key] = draft.flags
                 st.session_state[target_cost_key] = draft.cost_usd
+                st.session_state[target_reasoning_key] = draft.reasoning
                 st.session_state["ai_cost_session_total"] = (
                     st.session_state.get("ai_cost_session_total", 0.0) + draft.cost_usd
                 )
@@ -1718,13 +1721,13 @@ elif page == "followups":
             # Handle regenerate (force=True skips cache)
             if st.session_state.pop(regen_key, False):
                 with st.spinner("Regenerating..."):
-                    _run_generation(lead, item, msg_key, flags_key, coaching_key, cost_key, force=True,
+                    _run_generation(lead, item, msg_key, flags_key, coaching_key, cost_key, reasoning_key, force=True,
                                     extra_context=st.session_state.get(ctx_key, ""))
 
             # Lazy-generate on first view (uses cache if available)
             if msg_key not in st.session_state:
                 with st.spinner(f"Analyzing {item['lead_name']}..."):
-                    _run_generation(lead, item, msg_key, flags_key, coaching_key, cost_key)
+                    _run_generation(lead, item, msg_key, flags_key, coaching_key, cost_key, reasoning_key)
 
             flags = st.session_state.get(flags_key, [])
 
@@ -1773,7 +1776,23 @@ elif page == "followups":
                     send_sms(lid, approved_text)  # logs the text interaction internally
                     user_value = st.session_state.get("user", "RJ")
                     user_dot = "🔴" if user_value == "RJ" else "🟢"
-                    db.add_interaction(lid, "note", f"{user_dot} {user_value} approved & sent follow-up", "outbound", ts=ts)
+
+                    # Auto-note: what the AI decided and why, so future you (or
+                    # anyone else on the lead) can see the reasoning at a glance.
+                    _reasoning = st.session_state.get(reasoning_key, "")
+                    _sent_flags = st.session_state.get(flags_key, [])
+                    _detail_parts = [p for p in [_reasoning] if p]
+                    if _sent_flags:
+                        _detail_parts.append("Flags noted: " + "; ".join(_sent_flags[:3]))
+                    _extra_ctx = st.session_state.get(ctx_key, "").strip()
+                    if _extra_ctx:
+                        _detail_parts.append(f"Agent context given: {_extra_ctx}")
+                    _detail = "  ·  ".join(_detail_parts) if _detail_parts else "no reasoning captured"
+                    db.add_interaction(
+                        lid, "note",
+                        f"{user_dot} {user_value} approved & sent AI follow-up — {_detail}",
+                        "outbound", ts=ts,
+                    )
                     # Snooze: hide lead until next follow-up window
                     lead_status = lead.get("status", "warm")
                     snooze = _SNOOZE_DAYS.get(lead_status, 5)
@@ -1781,6 +1800,7 @@ elif page == "followups":
                     db.update_lead(lid, {"next_action_date": next_date})
                     st.session_state.pop(msg_key, None)
                     st.session_state.pop(flags_key, None)
+                    st.session_state.pop(reasoning_key, None)
                     autoplay_audio()
                     st.success(f"Sent! Snoozed {snooze} days.")
                 st.rerun()
