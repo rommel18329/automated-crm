@@ -2367,20 +2367,33 @@ elif page == "dialer":
                 if not _browser_ready:
                     st.warning("Browser calling not set up. Run `python setup_twilio_app.py` first, then restart the webhook server.")
                 else:
+                    _softphone_url = f"{_base_url}/softphone?agent={_agent}"
+                    # Auto-open the softphone popup once per session the moment
+                    # browser mode is active, so the user never has to know to
+                    # click it first. Popup blockers may catch it — the fallback
+                    # link below re-opens it on demand.
+                    _sp_opened_key = f"softphone_opened_{_agent}"
+                    if not st.session_state.get(_sp_opened_key):
+                        components.html(
+                            f"<script>window.open('{_softphone_url}',"
+                            f"'crm_softphone_{_agent}',"
+                            f"'width=380,height=400,resizable=yes');</script>",
+                            height=0,
+                        )
+                        st.session_state[_sp_opened_key] = True
                     _sp_col1, _sp_col2 = st.columns([3, 1])
                     _sp_col1.markdown(
-                        info_icon("⚡ ~500ms connect (Device stays warm)", _browser_tip),
+                        info_icon("⚡ ~500ms connect (softphone opens automatically)", _browser_tip),
                         unsafe_allow_html=True,
                     )
-                    _softphone_url = f"{_base_url}/softphone?agent={_agent}"
                     _sp_col2.markdown(
                         f"<a href='{_softphone_url}' target='crm_softphone_{_agent}' "
                         f"onclick=\"window.open('{_softphone_url}','crm_softphone_{_agent}',"
                         f"'width=380,height=400,resizable=yes');return false;\" "
-                        f"style='display:inline-block;background:linear-gradient(180deg,#5E8A67,#49764F);color:#fff;"
-                        f"padding:6px 14px;border-radius:6px;font-size:13px;"
-                        f"font-weight:600;text-decoration:none;text-align:center;"
-                        f"width:100%'>Open Softphone</a>",
+                        f"style='display:inline-block;background:transparent;color:#6b7a70;"
+                        f"padding:6px 10px;border:1px solid #cdd6cf;border-radius:6px;font-size:12px;"
+                        f"text-decoration:none;text-align:center;"
+                        f"width:100%'>Didn't open? Click</a>",
                         unsafe_allow_html=True,
                     )
             else:
@@ -2408,19 +2421,28 @@ elif page == "dialer":
                 )
                 _remaining = queue[idx:]
                 _batch_size = min(_lines, len(_remaining))
-                if st.button(f"📞 Dial {_batch_size} lines now",
+                if st.button(f"▶ Start Dialing ({_batch_size} lines)",
                              key="dial_multi", type="primary",
                              use_container_width=True):
                     import requests as _req
                     # Check out the next leads server-side: skips anything the
                     # other agent has claimed or that anyone dialed today. Two
                     # agents on the same list split it automatically.
-                    _cl = _req.post(
-                        f"{_base_url}/dialer/claim",
-                        json={"agent": _agent, "candidates": _remaining[:100],
-                              "count": _batch_size},
-                        timeout=10,
-                    ).json()
+                    # All backend calls are wrapped: if the webhook server is
+                    # down or the tunnel returns a non-JSON error page, show a
+                    # clear message instead of a raw JSONDecodeError stack trace.
+                    try:
+                        _cl = _req.post(
+                            f"{_base_url}/dialer/claim",
+                            json={"agent": _agent, "candidates": _remaining[:100],
+                                  "count": _batch_size},
+                            timeout=10,
+                        ).json()
+                    except Exception:
+                        st.error("⚠️ Can't reach the dialer backend. Is the webhook "
+                                 "server running? Start everything with "
+                                 "**Launch CRM** (or `python run_crm.py`), then try again.")
+                        st.stop()
                     _to_dial = _cl.get("to_dial", [])
                     _skipped = set(_cl.get("skipped", []))
                     if _skipped:
@@ -2431,11 +2453,17 @@ elif page == "dialer":
                         st.toast("⏭ Next leads are taken (other agent / already "
                                  "dialed today) — queue trimmed, try again.")
                         st.rerun()
-                    resp = _req.post(
-                        f"{_base_url}/dialer/multi-start",
-                        json={"lead_ids": _to_dial, "amd": _amd_on, "agent": _agent},
-                        timeout=10,
-                    )
+                    try:
+                        resp = _req.post(
+                            f"{_base_url}/dialer/multi-start",
+                            json={"lead_ids": _to_dial, "amd": _amd_on, "agent": _agent},
+                            timeout=10,
+                        )
+                    except Exception:
+                        st.error("⚠️ Can't reach the dialer backend. Is the webhook "
+                                 "server running? Start everything with "
+                                 "**Launch CRM** (or `python run_crm.py`), then try again.")
+                        st.stop()
                     if resp.ok:
                         rdata = resp.json()
                         st.session_state["dialer_on_call"] = True
