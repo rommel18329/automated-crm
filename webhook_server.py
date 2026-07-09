@@ -228,7 +228,7 @@ def voice_incoming():
         '<Response>'
         f'<Dial timeout="20" callerId="{from_raw}" action="/voice/status"'
         ' record="record-from-ringing-dual"'
-        ' recordingStatusCallback="/voice/recording"'
+        f' recordingStatusCallback="{PUBLIC_BASE_URL}/voice/recording"'
         ' recordingStatusCallbackMethod="POST">'
         f'{MY_CELL_NUMBER}'
         '</Dial>'
@@ -472,7 +472,7 @@ def voice_browser_connect():
         '<Response>'
         f'<Dial callerId="{caller_id}"'
         ' record="record-from-ringing-dual"'
-        ' recordingStatusCallback="/voice/recording"'
+        f' recordingStatusCallback="{PUBLIC_BASE_URL}/voice/recording"'
         ' recordingStatusCallbackMethod="POST">'
         f'{lead_e164}'
         '</Dial>'
@@ -564,7 +564,10 @@ def _start_multi_batch(agent: str, lead_ids: list[int], amd: bool = True) -> str
                     from_=frm,
                     url=f"{PUBLIC_BASE_URL}/voice/multi-answer/{batch_id}/{lid}",
                     status_callback=f"{PUBLIC_BASE_URL}/voice/multi-status/{batch_id}/{lid}",
-                    status_callback_event=["completed", "busy", "no-answer", "failed", "canceled"],
+                    # "completed" is the only valid FINAL event here; busy/
+                    # no-answer/failed arrive as the CallStatus on that event.
+                    # (The old list logged a 21626 warning on every call.)
+                    status_callback_event=["completed"],
                     timeout=25,
                 )
                 with _batch_lock:
@@ -640,7 +643,7 @@ def _conference_twiml(conference: str, caller_id: str, stop_stream: bool = False
         '<Response>' + stop +
         f'<Dial callerId="{caller_id}"'
         ' record="record-from-ringing-dual"'
-        ' recordingStatusCallback="/voice/recording"'
+        f' recordingStatusCallback="{PUBLIC_BASE_URL}/voice/recording"'
         ' recordingStatusCallbackMethod="POST">'
         f'<Conference startConferenceOnEnter="true" endConferenceOnExit="true"'
         f' waitUrl="" beep="false">{conference}</Conference>'
@@ -911,6 +914,9 @@ _DISPOSITIONS = {
     "Not Interested": ("Call - not interested", None),
     "Callback":       ("Call - wants callback", 1),
     "Connected":      ("Call - connected, talked", 3),
+    # Answered but no audio either way (silent screening app, dead line,
+    # or an audio-path glitch). Retry the next day.
+    "Dead Air":       ("Call - answered but dead air (no audio)", 1),
 }
 
 
@@ -1312,6 +1318,7 @@ def softphone_page():
   <button class="btn btn-call" id="btnCall" disabled>📞 Call</button>
   <button class="btn btn-mute" id="btnMute" disabled>🔇 Mute</button>
   <button class="btn btn-hangup" id="btnHangup" disabled>📕 Hang Up</button>
+  <button class="btn btn-mute" id="btnSound" title="Speaker test — plays a ring tone through your browser. If you hear it, your audio output works; dead air on a call means the other side was silent.">🔊 Test</button>
 </div>
 <div class="disp" id="disp">
   <div class="disp-title">Call outcome — saves to CRM</div>
@@ -1322,6 +1329,7 @@ def softphone_page():
     <button class="disp-btn" onclick="dispose('Callback')">Callback</button>
     <button class="disp-btn" onclick="dispose('Not Interested')">Not Interested</button>
     <button class="disp-btn" onclick="dispose('Wrong Number')">Wrong Number</button>
+    <button class="disp-btn" onclick="dispose('Dead Air')">🔇 Dead Air</button>
   </div>
   <div id="statusSection">
     <div class="disp-title" style="margin-top:10px">Set lead status</div>
@@ -1401,7 +1409,7 @@ def softphone_page():
   let statusSaved = false;              // this call's hot/warm/cold was set
   let lastOutcomeNoStatus = false;      // outcome that needs no temperature
   // Outcomes where there's no temperature to set — advance right after saving.
-  var NO_STATUS_OUTCOMES = ['Wrong Number', 'No Answer', 'Voicemail'];
+  var NO_STATUS_OUTCOMES = ['Wrong Number', 'No Answer', 'Voicemail', 'Dead Air'];
 
   // Which agent this popup belongs to (rom / gabby). Each agent's popup polls
   // its own dial channel and registers its own Twilio identity.
@@ -1571,7 +1579,7 @@ def softphone_page():
   }
 
   // Outcomes that don't need a hot/warm/cold temperature — just log and move on.
-  var TERMINAL_OUTCOMES = ['Wrong Number'];
+  var TERMINAL_OUTCOMES = ['Wrong Number', 'Dead Air'];
   function showSaved(part) {
     savedParts.push(part);
     dispDoneEl.textContent = '✓ Saved: ' + savedParts.join('  ·  ');
@@ -1870,6 +1878,25 @@ def softphone_page():
   btnCall.addEventListener('click', function() { pollForLead(); });
   btnHangup.addEventListener('click', hangUp);
   btnMute.addEventListener('click', toggleMute);
+
+  // 🔊 Speaker test: plays the ring tone locally. Instantly separates
+  // "my browser audio is broken" from "the lead was silent" on dead-air calls.
+  var btnSound = document.getElementById('btnSound');
+  var testAudio = null;
+  btnSound.addEventListener('click', function() {
+    try {
+      if (testAudio) { testAudio.pause(); testAudio = null; return; }
+      testAudio = new Audio('/static/ringback.wav');
+      testAudio.play().then(function() {
+        logMsg('Speaker test: playing ring tone — hearing it means your audio output works.');
+        setTimeout(function() { if (testAudio) { testAudio.pause(); testAudio = null; } }, 2500);
+      }).catch(function(e) {
+        logMsg('Speaker test FAILED: ' + e + ' — browser blocked audio or wrong output device.');
+        setStatus('Speaker test failed — check browser audio/output device', 'error');
+        testAudio = null;
+      });
+    } catch (e) { logMsg('Speaker test error: ' + e); }
+  });
 
   // ── Poll /dialer/current for new leads / multi-batches ────────────────
   function pollForLead() {

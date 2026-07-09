@@ -2104,6 +2104,7 @@ elif page == "dialer":
         "Not Interested": ("Call — not interested", None),
         "Callback":       ("Call — wants callback", 1),
         "Connected":      ("Call — connected, talked", 3),
+        "Dead Air":       ("Call — answered but dead air (no audio)", 1),
     }
 
     def _dispose(lead_id: int, label: str) -> None:
