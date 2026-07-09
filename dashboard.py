@@ -2339,17 +2339,6 @@ elif page == "dialer":
         st.session_state.setdefault("dialer_lines", 3)
         st.session_state.setdefault("dialer_batch_id", None)
 
-        # One-shot softphone popup: fired here (not on mode-select) so it only
-        # opens when the user actually hit Start Dialing. Cleared after firing.
-        _sp_pending = st.session_state.pop("_open_softphone_pending", None)
-        if _sp_pending:
-            _sp_url = f"{_base_url}/softphone?agent={_sp_pending}"
-            components.html(
-                f"<script>window.open('{_sp_url}','crm_softphone_{_sp_pending}',"
-                f"'width=380,height=400,resizable=yes');</script>",
-                height=0,
-            )
-
         if not st.session_state["dialer_on_call"]:
             # Which agent this browser session is (RJ toggle = Rom, GL = Gabby).
             # Drives lead claiming, the dial channel, and the softphone identity.
@@ -2379,9 +2368,8 @@ elif page == "dialer":
                     st.warning("Browser calling not set up. Run `python setup_twilio_app.py` first, then restart the webhook server.")
                 else:
                     _softphone_url = f"{_base_url}/softphone?agent={_agent}"
-                    # The softphone opens automatically when you hit Start
-                    # Dialing (see the dial handler below). This link is just a
-                    # manual backup in case a popup blocker eats it.
+                    # Start Dialing opens the softphone itself (same click =
+                    # no popup blocker). This link is just a manual backup.
                     _sp_col1, _sp_col2 = st.columns([3, 1])
                     _sp_col1.markdown(
                         info_icon("⚡ ~500ms connect (softphone opens when you start)", _browser_tip),
@@ -2390,7 +2378,7 @@ elif page == "dialer":
                     _sp_col2.markdown(
                         f"<a href='{_softphone_url}' target='crm_softphone_{_agent}' "
                         f"onclick=\"window.open('{_softphone_url}','crm_softphone_{_agent}',"
-                        f"'width=380,height=400,resizable=yes');return false;\" "
+                        f"'width=390,height=640,resizable=yes');return false;\" "
                         f"style='display:inline-block;background:transparent;color:#6b7a70;"
                         f"padding:6px 10px;border:1px solid #cdd6cf;border-radius:6px;font-size:12px;"
                         f"text-decoration:none;text-align:center;"
@@ -2412,7 +2400,7 @@ elif page == "dialer":
                                    key="dialer_lines_slider")
                 st.session_state["dialer_lines"] = _lines
 
-            if _is_browser and _lines > 1 and _browser_ready:
+            if _is_browser and _browser_ready:
                 _amd_on = st.checkbox(
                     "🤖 Skip voicemails (self-built AMD)", value=True, key="dialer_amd",
                     help="Listens to the first seconds of each answered line: humans "
@@ -2422,60 +2410,67 @@ elif page == "dialer":
                 )
                 _remaining = queue[idx:]
                 _batch_size = min(_lines, len(_remaining))
-                if st.button(f"▶ Start Dialing ({_batch_size} lines)",
-                             key="dial_multi", type="primary",
-                             use_container_width=True):
-                    import requests as _req
-                    # Check out the next leads server-side: skips anything the
-                    # other agent has claimed or that anyone dialed today. Two
-                    # agents on the same list split it automatically.
-                    # All backend calls are wrapped: if the webhook server is
-                    # down or the tunnel returns a non-JSON error page, show a
-                    # clear message instead of a raw JSONDecodeError stack trace.
-                    try:
-                        _cl = _req.post(
-                            f"{_base_url}/dialer/claim",
-                            json={"agent": _agent, "candidates": _remaining[:100],
-                                  "count": _batch_size},
-                            timeout=10,
-                        ).json()
-                    except Exception:
-                        st.error("⚠️ Can't reach the dialer backend. Is the webhook "
-                                 "server running? Start everything with "
-                                 "**Launch CRM** (or `python run_crm.py`), then try again.")
-                        st.stop()
-                    _to_dial = _cl.get("to_dial", [])
-                    _skipped = set(_cl.get("skipped", []))
-                    if _skipped:
-                        st.session_state["dialer_queue"] = [
-                            l for l in st.session_state["dialer_queue"] if l not in _skipped
-                        ]
-                    if not _to_dial:
-                        st.toast("⏭ Next leads are taken (other agent / already "
-                                 "dialed today) — queue trimmed, try again.")
+
+                # Is a softphone queue already running for this agent?
+                import requests as _req
+                try:
+                    _q = _req.get(f"{_base_url}/dialer/queue/status",
+                                  params={"agent": _agent}, timeout=4).json()
+                except Exception:
+                    _q = {}
+                if _q.get("active"):
+                    st.info(
+                        f"📞 Softphone queue running — **{_q.get('remaining', '?')} of "
+                        f"{_q.get('total', '?')}** leads left. Work from the softphone "
+                        f"window: dispose there and the next batch dials itself."
+                    )
+                    _qc1, _qc2 = st.columns(2)
+                    if _qc1.button("🔄 Refresh", key="q_refresh", use_container_width=True):
                         st.rerun()
-                    try:
-                        resp = _req.post(
-                            f"{_base_url}/dialer/multi-start",
-                            json={"lead_ids": _to_dial, "amd": _amd_on, "agent": _agent},
-                            timeout=10,
-                        )
-                    except Exception:
-                        st.error("⚠️ Can't reach the dialer backend. Is the webhook "
-                                 "server running? Start everything with "
-                                 "**Launch CRM** (or `python run_crm.py`), then try again.")
-                        st.stop()
-                    if resp.ok:
-                        rdata = resp.json()
-                        st.session_state["dialer_on_call"] = True
-                        st.session_state["dialer_batch_id"] = rdata["batch_id"]
-                        st.session_state["dialer_batch_leads"] = _to_dial
-                        # Open the softphone popup now that dialing has actually
-                        # started (fires on the rerun below, near the dial card top).
-                        st.session_state["_open_softphone_pending"] = _agent
+                    if _qc2.button("⏹ End softphone queue", key="q_stop", use_container_width=True):
+                        try:
+                            _req.post(f"{_base_url}/dialer/queue/stop",
+                                      json={"agent": _agent}, timeout=5)
+                        except Exception:
+                            pass
                         st.rerun()
-                    else:
-                        st.error(f"Multi-dial failed: {resp.text}")
+                else:
+                    # One real click: opens the softphone (same click = popup
+                    # blockers allow it) AND loads the whole remaining list into
+                    # the server-side queue. From then on the softphone drives
+                    # itself: dispose → next batch dials automatically. Leads
+                    # already dialed today / claimed by the other agent are
+                    # skipped server-side at claim time.
+                    _lead_js = "[" + ",".join(str(int(l)) for l in _remaining) + "]"
+                    _amd_js = "true" if _amd_on else "false"
+                    _start_js = (
+                        f"window.open('{_softphone_url}','crm_softphone_{_agent}',"
+                        f"'width=390,height=640,resizable=yes');"
+                        f"var b=this;b.style.pointerEvents='none';"
+                        f"b.textContent='📞 Dialing — work from the softphone window';"
+                        f"fetch('{_base_url}/dialer/queue/start',{{method:'POST',"
+                        f"body:JSON.stringify({{agent:'{_agent}',lead_ids:{_lead_js},"
+                        f"lines:{_batch_size},amd:{_amd_js}}})}})"
+                        f".then(function(r){{return r.json();}})"
+                        f".then(function(j){{if(j.error){{b.textContent='⚠️ '+j.error;"
+                        f"b.style.pointerEvents='auto';}}}})"
+                        f".catch(function(){{b.textContent='⚠️ Backend unreachable — run Launch CRM, then retry';"
+                        f"b.style.pointerEvents='auto';}});return false;"
+                    )
+                    st.markdown(
+                        f"<a href='#' onclick=\"{_start_js}\" "
+                        f"style='display:block;text-align:center;"
+                        f"background:linear-gradient(180deg,#5E8A67,#49764F);color:#fff;"
+                        f"padding:13px;border-radius:8px;font-size:15px;font-weight:700;"
+                        f"text-decoration:none;'>▶ Start Dialing "
+                        f"({_batch_size} line{'s' if _batch_size != 1 else ''} at a time)</a>",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(
+                        "One click: the softphone opens, you hear it ringing, and after "
+                        "each call you dispose right in the softphone — the next batch "
+                        "dials automatically until the list is done."
+                    )
             else:
                 for i, p in enumerate(phones, 1):
                     pcid = _auto_caller_id(p)

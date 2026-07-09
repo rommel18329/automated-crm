@@ -104,6 +104,49 @@ def to_e164(raw: str) -> str:
     return f"+{digits}"
 
 
+# ── Ringback tone for the multi-line dialer ─────────────────────────────────
+# While the softphone waits in the conference for a lead to answer, Twilio
+# plays this instead of dead silence (US ringback: 440+480 Hz, 2s on / 4s off).
+_RINGBACK_WAV = PROJECT_ROOT / "static" / "ringback.wav"
+
+
+def _ensure_ringback() -> None:
+    """Generate static/ringback.wav once (stdlib only — no numpy needed)."""
+    if _RINGBACK_WAV.exists():
+        return
+    import math
+    import struct
+    import wave
+    _RINGBACK_WAV.parent.mkdir(exist_ok=True)
+    rate = 8000
+    frames = bytearray()
+    for i in range(rate * 2):            # 2s ring tone
+        t = i / rate
+        v = 0.25 * (math.sin(2 * math.pi * 440 * t) + math.sin(2 * math.pi * 480 * t))
+        frames += struct.pack("<h", int(v * 32767))
+    frames += b"\x00\x00" * (rate * 4)   # 4s silence
+    with wave.open(str(_RINGBACK_WAV), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+    log.info(f"Generated ringback tone: {_RINGBACK_WAV}")
+
+
+_ensure_ringback()
+
+
+@app.route("/voice/wait-music", methods=["GET", "POST"])
+def voice_wait_music():
+    """Conference waitUrl: loop the ringback tone until a lead answers."""
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?><Response>'
+        f'<Play loop="0">{PUBLIC_BASE_URL}/static/ringback.wav</Play>'
+        '</Response>'
+    )
+    return Response(twiml, mimetype="text/xml")
+
+
 @app.route("/twilio/inbound", methods=["POST"])
 def inbound_sms():
     from_raw = request.form.get("From", "")
@@ -370,11 +413,16 @@ def voice_browser_connect():
     conference = request.form.get("conference", "")
     if conference:
         log.info(f"Browser joining conference: {conference}")
+        # startConferenceOnEnter=false: the agent WAITS (hearing ringback via
+        # waitUrl) until a lead answers. The winner joins with start=true,
+        # which stops the ringback and bridges the audio. With start=true here
+        # the conference started instantly with the agent alone in it, and
+        # Twilio never plays wait music in a started conference → dead silence.
         twiml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<Response><Dial>'
-            f'<Conference startConferenceOnEnter="true" endConferenceOnExit="true"'
-            f' waitUrl="" beep="false">{conference}</Conference>'
+            f'<Conference startConferenceOnEnter="false" endConferenceOnExit="true"'
+            f' waitUrl="{PUBLIC_BASE_URL}/voice/wait-music" beep="false">{conference}</Conference>'
             '</Dial></Response>'
         )
         return Response(twiml, mimetype="text/xml")
@@ -434,18 +482,12 @@ def voice_browser_connect():
     return Response(twiml, mimetype="text/xml")
 
 
-@app.route("/dialer/multi-start", methods=["POST"])
-def dialer_multi_start():
+def _start_multi_batch(agent: str, lead_ids: list[int], amd: bool = True) -> str:
     """Fire N simultaneous outbound calls. First answer wins and joins
-    the conference where the browser softphone is waiting."""
-    data = request.get_json(force=True) or {}
-    lead_ids = data.get("lead_ids", [])
-    if not lead_ids:
-        return jsonify({"error": "No leads"}), 400
-
+    the conference where the browser softphone is waiting. Returns batch_id.
+    Used by /dialer/multi-start and the server-side queue."""
     batch_id = uuid.uuid4().hex[:12]
     conference = f"multi_{batch_id}"
-    agent = (data.get("agent") or "rom").lower()
     batch = {
         "batch_id": batch_id,
         "conference": conference,
@@ -458,7 +500,7 @@ def dialer_multi_start():
         "winner_phone": "",
         "dropped": [],
         "machines": [],       # lead_ids classified as voicemail by AMD
-        "amd": bool(data.get("amd", True)),
+        "amd": bool(amd),
         "resolved_count": 0,
         "total": len(lead_ids),
         "status": "waiting_agent",   # waiting for the softphone to join the room
@@ -550,7 +592,18 @@ def dialer_multi_start():
         "lines": len(lead_ids),
         "ts": datetime.utcnow().isoformat(),
     }
+    return batch_id
 
+
+@app.route("/dialer/multi-start", methods=["POST"])
+def dialer_multi_start():
+    """Fire N simultaneous outbound calls (one-shot batch, no queue)."""
+    data = request.get_json(force=True) or {}
+    lead_ids = data.get("lead_ids", [])
+    if not lead_ids:
+        return jsonify({"error": "No leads"}), 400
+    agent = (data.get("agent") or "rom").lower()
+    batch_id = _start_multi_batch(agent, lead_ids, bool(data.get("amd", True)))
     resp = jsonify({"batch_id": batch_id, "lines": len(lead_ids)})
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
@@ -1016,6 +1069,19 @@ def dialer_claim():
     except (TypeError, ValueError):
         return jsonify({"error": "bad payload"}), 400
 
+    to_dial, skipped = _claim_leads(agent, candidates, count)
+    if skipped:
+        log.info(f"Claim [{agent}]: dialing {to_dial}, skipped {len(skipped)} "
+                 f"(other agent / already dialed today)")
+    resp = jsonify({"to_dial": to_dial, "skipped": skipped})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+def _claim_leads(agent: str, candidates: list[int], count: int) -> tuple[list[int], list[int]]:
+    """Core claim logic shared by /dialer/claim and the server-side queue.
+    Returns (to_dial, skipped): skipped leads are claimed by the other agent
+    or already dialed today by anyone."""
     dialed_today = db.leads_dialed_today(DB_PATH)
     to_dial: list[int] = []
     skipped: list[int] = []
@@ -1032,12 +1098,108 @@ def dialer_claim():
             to_dial.append(lid)
         for lid in to_dial:
             _lead_claims[lid] = {"agent": agent, "ts": now}
-    if skipped:
-        log.info(f"Claim [{agent}]: dialing {to_dial}, skipped {len(skipped)} "
-                 f"(other agent / already dialed today)")
-    resp = jsonify({"to_dial": to_dial, "skipped": skipped})
+    return to_dial, skipped
+
+
+# ── Server-side dial queue (the softphone-cockpit flow) ─────────────────────
+# The dashboard loads a whole list here ONCE; from then on the softphone popup
+# drives itself: dispose → /dialer/queue/next → next batch fires → repeat.
+# The agent never has to switch back to the CRM between calls.
+_dial_queues: dict[str, dict] = {}   # agent -> {pending, total, lines, amd}
+
+
+def _cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "*"
     return resp
+
+
+def _agent_batch_busy(agent: str) -> bool:
+    """True while this agent has a batch still waiting/ringing (pre-answer)."""
+    with _batch_lock:
+        return any(
+            b.get("agent") == agent and b["status"] in ("waiting_agent", "ringing")
+            for b in _multi_batches.values()
+        )
+
+
+def _queue_next(agent: str) -> dict:
+    """Claim the next batch off the agent's queue and fire it."""
+    q = _dial_queues.get(agent)
+    if not q or not q["pending"]:
+        _dial_queues.pop(agent, None)
+        return {"done": True, "remaining": 0}
+    if _agent_batch_busy(agent):
+        return {"error": "busy", "remaining": len(q["pending"])}
+    while q["pending"]:
+        chunk = q["pending"][:100]
+        to_dial, skipped = _claim_leads(agent, chunk, q["lines"])
+        taken = set(to_dial) | set(skipped)
+        q["pending"] = [l for l in q["pending"] if l not in taken]
+        if to_dial:
+            batch_id = _start_multi_batch(agent, to_dial, q["amd"])
+            log.info(f"Queue [{agent}]: batch {batch_id} × {len(to_dial)} lines, "
+                     f"{len(q['pending'])} left in queue")
+            return {"batch_id": batch_id, "lines": len(to_dial),
+                    "remaining": len(q["pending"]), "total": q["total"]}
+    _dial_queues.pop(agent, None)
+    return {"done": True, "remaining": 0}
+
+
+@app.route("/dialer/queue/start", methods=["POST", "OPTIONS"])
+def dialer_queue_start():
+    """Load a dial list into the server queue and fire the first batch.
+    Body: {agent, lead_ids: [...], lines, amd}."""
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    data = request.get_json(force=True, silent=True) or {}
+    agent = (data.get("agent") or "rom").lower()
+    try:
+        lead_ids = [int(x) for x in data.get("lead_ids", [])]
+        lines = min(10, max(1, int(data.get("lines", 3))))
+    except (TypeError, ValueError):
+        return _cors(jsonify({"error": "bad payload"})), 400
+    if not lead_ids:
+        return _cors(jsonify({"error": "no leads"})), 400
+    if _agent_batch_busy(agent):
+        return _cors(jsonify({"error": "a batch is already ringing — finish or end it first"})), 409
+    _dial_queues[agent] = {"pending": lead_ids, "total": len(lead_ids),
+                           "lines": lines, "amd": bool(data.get("amd", True))}
+    result = _queue_next(agent)
+    log.info(f"Queue [{agent}]: loaded {len(lead_ids)} leads × {lines} lines")
+    return _cors(jsonify(result))
+
+
+@app.route("/dialer/queue/next", methods=["POST", "OPTIONS"])
+def dialer_queue_next():
+    """Softphone calls this after each disposition to dial the next batch."""
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    data = request.get_json(force=True, silent=True) or {}
+    agent = (data.get("agent") or "rom").lower()
+    return _cors(jsonify(_queue_next(agent)))
+
+
+@app.route("/dialer/queue/status")
+def dialer_queue_status():
+    agent = (request.args.get("agent") or "rom").lower()
+    q = _dial_queues.get(agent)
+    if not q:
+        return _cors(jsonify({"active": False}))
+    return _cors(jsonify({"active": True, "remaining": len(q["pending"]),
+                          "total": q["total"], "lines": q["lines"],
+                          "amd": q["amd"]}))
+
+
+@app.route("/dialer/queue/stop", methods=["POST", "OPTIONS"])
+def dialer_queue_stop():
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    data = request.get_json(force=True, silent=True) or {}
+    agent = (data.get("agent") or "rom").lower()
+    _dial_queues.pop(agent, None)
+    log.info(f"Queue [{agent}]: stopped")
+    return _cors(jsonify({"ok": True}))
 
 
 @app.route("/softphone")
@@ -1117,6 +1279,18 @@ def softphone_page():
   .log { margin-top:14px; font-size:12px; color:#999; max-height:80px;
          overflow-y:auto; border-top:1px solid #eee; padding-top:6px; }
   .log div { padding:1px 0; }
+  .queuebar { display:none; align-items:center; justify-content:space-between;
+              gap:6px; margin-bottom:10px; padding:8px 10px; border-radius:8px;
+              background:#eef4ef; border:1px solid #cfe0d2; }
+  .queuebar.show { display:flex; }
+  .q-info { font-size:13px; font-weight:700; color:#2f4a35; white-space:nowrap; }
+  .q-btns { display:flex; gap:5px; }
+  .q-btn { padding:6px 9px; border:1px solid #b9ccbc; border-radius:6px;
+           background:#fff; font-size:12px; font-weight:600; cursor:pointer;
+           color:#2f4a35; }
+  .q-btn:hover { background:#e4efe6; }
+  .q-btn.q-end { border-color:#d9b3b3; color:#8c3b3b; }
+  .q-btn.q-end:hover { background:#f7e9e9; }
 </style>
 </head><body>
 <h3>📞 CRM Softphone</h3>
@@ -1126,6 +1300,14 @@ def softphone_page():
 </div>
 <div class="timer" id="timer">00:00</div>
 <div class="status" id="status">Starting up...</div>
+<div class="queuebar" id="queueBar">
+  <span class="q-info" id="queueInfo"></span>
+  <span class="q-btns">
+    <button class="q-btn" id="btnQNext" title="Dial the next batch now">⏭ Next</button>
+    <button class="q-btn" id="btnQAuto" title="Toggle auto-dial after each disposition">⏸ Auto: ON</button>
+    <button class="q-btn q-end" id="btnQEnd" title="End the queue">⏹ End</button>
+  </span>
+</div>
 <div class="buttons">
   <button class="btn btn-call" id="btnCall" disabled>📞 Call</button>
   <button class="btn btn-mute" id="btnMute" disabled>🔇 Mute</button>
@@ -1206,6 +1388,20 @@ def softphone_page():
   let lastScriptInfo = null;    // {first_name, address} for the active lead
   let lastCallDuration = 0;     // seconds, for the KPI disposition row
   let dispBatchId = null;       // batch the disposition belongs to (multi-dial)
+
+  // ── Server-side queue (dispose → auto-dial next batch) ────────────────
+  const queueBar  = document.getElementById('queueBar');
+  const queueInfo = document.getElementById('queueInfo');
+  const btnQNext  = document.getElementById('btnQNext');
+  const btnQAuto  = document.getElementById('btnQAuto');
+  const btnQEnd   = document.getElementById('btnQEnd');
+  let queueActive = false, queueRemaining = 0, queueTotal = 0;
+  let nextTimer = null;                 // pending auto-advance countdown
+  let outcomeSaved = false;             // this call's outcome was logged
+  let statusSaved = false;              // this call's hot/warm/cold was set
+  let lastOutcomeNoStatus = false;      // outcome that needs no temperature
+  // Outcomes where there's no temperature to set — advance right after saving.
+  var NO_STATUS_OUTCOMES = ['Wrong Number', 'No Answer', 'Voicemail'];
 
   // Which agent this popup belongs to (rom / gabby). Each agent's popup polls
   // its own dial channel and registers its own Twilio identity.
@@ -1369,6 +1565,9 @@ def softphone_page():
     var _ss = document.getElementById('statusSection');
     if (_ss) _ss.style.display = '';   // restore status prompt for the next call
     savedParts = [];
+    outcomeSaved = false;
+    statusSaved = false;
+    lastOutcomeNoStatus = false;
   }
 
   // Outcomes that don't need a hot/warm/cold temperature — just log and move on.
@@ -1406,7 +1605,10 @@ def softphone_page():
         if (j.ok) {
           showSaved(label);
           logMsg('Outcome saved: ' + label);
-          if (terminal) { dispDoneEl.textContent = '✓ ' + label + ' — hit Next lead'; }
+          outcomeSaved = true;
+          lastOutcomeNoStatus = NO_STATUS_OUTCOMES.indexOf(label) !== -1;
+          if (terminal) { dispDoneEl.textContent = '✓ ' + label; }
+          maybeAdvance();
         } else {
           dispOutcomeEl.classList.remove('locked');
           logMsg('Dispose failed: ' + (j.error || ''));
@@ -1424,11 +1626,105 @@ def softphone_page():
         agent: (repNameEl.value || '').trim() || null }) })
       .then(function(r) { return r.json(); })
       .then(function(j) {
-        if (j.ok) { showSaved(status.toUpperCase()); logMsg('Status set: ' + status); }
+        if (j.ok) {
+          showSaved(status.toUpperCase()); logMsg('Status set: ' + status);
+          statusSaved = true;
+          maybeAdvance();
+        }
         else { dispStatusEl.classList.remove('locked'); logMsg('Status failed: ' + (j.error || '')); }
       })
       .catch(function(e) { dispStatusEl.classList.remove('locked'); logMsg('Status failed: ' + e); });
   };
+
+  // ── Queue engine: dispose → auto-dial the next batch ──────────────────
+  var autoAdvance = true;
+  try { autoAdvance = localStorage.getItem('crm_auto_adv_' + AGENT) !== '0'; } catch (e) {}
+
+  function updateQueueBar() {
+    if (!queueActive) { queueBar.classList.remove('show'); return; }
+    queueBar.classList.add('show');
+    queueInfo.textContent = '📋 ' + queueRemaining + ' of ' + queueTotal + ' left';
+    btnQAuto.textContent = autoAdvance ? '⏸ Auto: ON' : '▶ Auto: OFF';
+  }
+
+  function refreshQueue() {
+    fetch('/dialer/queue/status?agent=' + AGENT)
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        queueActive = !!j.active;
+        if (j.active) { queueRemaining = j.remaining; queueTotal = j.total; }
+        updateQueueBar();
+      })
+      .catch(function() {});
+  }
+
+  // Advance once the call is fully written up: outcome saved, plus a
+  // temperature unless the outcome doesn't need one (no answer / VM / wrong #).
+  function maybeAdvance() {
+    if (!queueActive || !autoAdvance) return;
+    if (!outcomeSaved) return;
+    if (!statusSaved && !lastOutcomeNoStatus) return;
+    scheduleNext(1500, 'Saved — dialing next batch');
+  }
+
+  function scheduleNext(ms, why) {
+    if (nextTimer) clearTimeout(nextTimer);
+    setStatus((why || 'Next batch') + ' in ' + (Math.round(ms / 500) / 2) + 's…', 'ready');
+    nextTimer = setTimeout(function() { nextTimer = null; doNext(); }, ms);
+  }
+
+  function doNext() {
+    if (nextTimer) { clearTimeout(nextTimer); nextTimer = null; }
+    if (call) { logMsg('Still on a call — hang up first.'); return; }
+    fetch('/dialer/queue/next', { method: 'POST', body: JSON.stringify({ agent: AGENT }) })
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        if (j.error === 'busy') { logMsg('A batch is already ringing.'); return; }
+        if (j.done) { queueDone(); return; }
+        if (!j.batch_id) return;
+        queueRemaining = j.remaining; queueTotal = j.total || queueTotal;
+        queueActive = true;
+        updateQueueBar();
+        hideDisposition();
+        setStatus('Dialing next ' + j.lines + ' line(s)…', 'connecting');
+        logMsg('Queue: next batch fired (' + j.remaining + ' left after this)');
+        // The /dialer/current poll sees the new batch and joins its conference.
+      })
+      .catch(function(e) { logMsg('Queue next failed: ' + e); });
+  }
+
+  function queueDone() {
+    queueActive = false;
+    updateQueueBar();
+    nameEl.textContent = 'Queue finished 🎉';
+    phoneEl.textContent = '';
+    setStatus('All leads dialed — load another list in the CRM', 'ready');
+    logMsg('Queue finished.');
+  }
+
+  btnQNext.addEventListener('click', doNext);
+  btnQAuto.addEventListener('click', function() {
+    autoAdvance = !autoAdvance;
+    try { localStorage.setItem('crm_auto_adv_' + AGENT, autoAdvance ? '1' : '0'); } catch (e) {}
+    if (!autoAdvance && nextTimer) {
+      clearTimeout(nextTimer); nextTimer = null;
+      setStatus('Auto-dial paused — hit ⏭ Next when ready', 'ended');
+    }
+    updateQueueBar();
+    logMsg('Auto-dial ' + (autoAdvance ? 'ON' : 'OFF'));
+  });
+  btnQEnd.addEventListener('click', function() {
+    if (nextTimer) { clearTimeout(nextTimer); nextTimer = null; }
+    fetch('/dialer/queue/stop', { method: 'POST', body: JSON.stringify({ agent: AGENT }) })
+      .then(function() {
+        queueActive = false; updateQueueBar();
+        setStatus('Queue ended', 'ended'); logMsg('Queue ended by agent.');
+      })
+      .catch(function() {});
+  });
+
+  refreshQueue();                      // restore the bar if a queue is running
+  setInterval(refreshQueue, 4000);     // stay in sync with the CRM
 
   function updateTimer() {
     if (!callStart) return;
@@ -1546,6 +1842,12 @@ def softphone_page():
             clearInterval(batchPollInterval);
             batchPollInterval = null;
             if (device) device.disconnectAll();
+            // Nobody to dispose — keep the queue churning automatically.
+            setTimeout(function() {
+              if (queueActive && autoAdvance && !call) {
+                scheduleNext(1600, 'No answer — next batch');
+              }
+            }, 600);
           }
         })
         .catch(function() {});
