@@ -147,6 +147,42 @@ def pick_number(lead_phone: str, db_path: Path = db.DB_PATH,
     return usable[0][0]["phone_number"]
 
 
+def pool_status(db_path: Path = db.DB_PATH) -> dict:
+    """Aggregate pool health for the dialer UI: how much dialing capacity
+    remains today and where the numbers are in their warm-up. The dialer
+    treats remaining_today as a HARD limit — when it hits 0, cold dialing
+    stops for the day rather than overflow onto the established numbers."""
+    pool = db.fetch_caller_pool(db_path)
+    out = {"numbers": 0, "active": 0, "warming": 0, "flagged": 0,
+           "used_today": 0, "cap_today": 0, "remaining_today": 0,
+           "warmup_days_left": None}
+    days_left = []
+    for num in pool:
+        if num["status"] in ("flagged", "retired"):
+            out["flagged"] += 1
+            continue
+        _maybe_graduate(num, db_path)
+        out["numbers"] += 1
+        cap = _effective_cap(num)
+        used = db.caller_calls_today(num["phone_number"], db_path)
+        out["cap_today"] += cap
+        out["used_today"] += min(used, cap)
+        out["remaining_today"] += max(0, cap - used)
+        if num["status"] == "warming":
+            out["warming"] += 1
+            if num["warmup_started"]:
+                try:
+                    started = date.fromisoformat(num["warmup_started"])
+                    days_left.append(max(0, WARMUP_DAYS - (date.today() - started).days))
+                except ValueError:
+                    pass
+        else:
+            out["active"] += 1
+    if days_left:
+        out["warmup_days_left"] = max(days_left)
+    return out
+
+
 def detect_flagged(db_path: Path = db.DB_PATH) -> list[dict]:
     """Return numbers whose answer rate has cratered vs. the pool median.
     These are likely carrier-flagged and should be pulled from rotation.

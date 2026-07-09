@@ -550,8 +550,17 @@ def _start_multi_batch(agent: str, lead_ids: list[int], amd: bool = True) -> str
                 with _batch_lock:
                     batch["resolved_count"] += 1
                 continue
-            frm = (caller_id_pool.pick_number(lead["phone"], DB_PATH, exclude=used_numbers)
-                   or pick_from_number(lead["phone"]))
+            frm = caller_id_pool.pick_number(lead["phone"], DB_PATH, exclude=used_numbers)
+            if not frm:
+                # HARD LIMIT: the pool is at its daily caps. NEVER overflow
+                # onto the established texting numbers for cold multi-dial —
+                # that's exactly how they'd get spam-flagged. This lead waits;
+                # release its claim so it's dialable when capacity returns.
+                log.warning(f"Multi [{batch_id}] pool at daily cap — lead {lid} NOT dialed")
+                with _batch_lock:
+                    batch["resolved_count"] += 1
+                    _lead_claims.pop(lid, None)
+                continue
             used_numbers.add(frm)
             assignments.append((lid, lead, frm))
 
@@ -1140,9 +1149,20 @@ def _queue_next(agent: str) -> dict:
         return {"done": True, "remaining": 0}
     if _agent_batch_busy(agent):
         return {"error": "busy", "remaining": len(q["pending"])}
+    # HARD daily limit: batches only dial what the caller ID pool has left
+    # today (warming numbers 15/day, warmed 50/day). At zero the queue pauses
+    # until tomorrow — cold calls never overflow onto the texting numbers.
+    capacity = caller_id_pool.pool_status(DB_PATH)["remaining_today"]
+    if capacity <= 0:
+        log.info(f"Queue [{agent}]: pool at daily cap — queue paused "
+                 f"({len(q['pending'])} leads remain)")
+        return {"error": "pool_exhausted",
+                "message": "Daily dial limit reached — the number pool is at "
+                           "its spam-safe cap. The queue resumes tomorrow.",
+                "remaining": len(q["pending"])}
     while q["pending"]:
         chunk = q["pending"][:100]
-        to_dial, skipped = _claim_leads(agent, chunk, q["lines"])
+        to_dial, skipped = _claim_leads(agent, chunk, min(q["lines"], capacity))
         taken = set(to_dial) | set(skipped)
         q["pending"] = [l for l in q["pending"] if l not in taken]
         if to_dial:
@@ -1198,6 +1218,13 @@ def dialer_queue_status():
     return _cors(jsonify({"active": True, "remaining": len(q["pending"]),
                           "total": q["total"], "lines": q["lines"],
                           "amd": q["amd"]}))
+
+
+@app.route("/dialer/pool-status")
+def dialer_pool_status():
+    """Caller ID pool health for the softphone bar: capacity used/left today,
+    warm-up progress. remaining_today == 0 means dialing is done for the day."""
+    return _cors(jsonify(caller_id_pool.pool_status(DB_PATH)))
 
 
 @app.route("/dialer/queue/stop", methods=["POST", "OPTIONS"])
@@ -1300,6 +1327,11 @@ def softphone_page():
   .q-btn:hover { background:#e4efe6; }
   .q-btn.q-end { border-color:#d9b3b3; color:#8c3b3b; }
   .q-btn.q-end:hover { background:#f7e9e9; }
+  .poolbar { display:none; margin-bottom:10px; padding:6px 10px; border-radius:7px;
+             font-size:12px; font-weight:600; color:#4a5a4e; background:#f2f5f2;
+             border:1px solid #dde5de; text-align:center; }
+  .poolbar.low  { background:#fff6e6; border-color:#ecd9ae; color:#8a6510; }
+  .poolbar.warn { background:#fdecea; border-color:#e5b8b3; color:#a03225; }
 </style>
 </head><body>
 <h3>📞 CRM Softphone</h3>
@@ -1317,6 +1349,7 @@ def softphone_page():
     <button class="q-btn q-end" id="btnQEnd" title="End the queue">⏹ End</button>
   </span>
 </div>
+<div class="poolbar" id="poolBar" title="Caller ID pool: today's call volume vs the spam-safe caps (warming numbers 15/day, warmed 50/day). Dialing hard-stops at the cap."></div>
 <div class="buttons">
   <button class="btn btn-call" id="btnCall" disabled>📞 Call</button>
   <button class="btn btn-mute" id="btnMute" disabled>🔇 Mute</button>
@@ -1692,6 +1725,12 @@ def softphone_page():
       .then(function(r) { return r.json(); })
       .then(function(j) {
         if (j.error === 'busy') { logMsg('A batch is already ringing.'); return; }
+        if (j.error === 'pool_exhausted') {
+          setStatus('🛑 Daily dial limit reached — queue paused until tomorrow', 'error');
+          logMsg('Pool at daily cap. ' + j.remaining + ' leads still queued — they keep their place.');
+          refreshPool();
+          return;
+        }
         if (j.done) { queueDone(); return; }
         if (!j.batch_id) return;
         queueRemaining = j.remaining; queueTotal = j.total || queueTotal;
@@ -1737,6 +1776,34 @@ def softphone_page():
 
   refreshQueue();                      // restore the bar if a queue is running
   setInterval(refreshQueue, 4000);     // stay in sync with the CRM
+
+  // ── Caller ID pool bar: warm-up + hard daily limit tracking ───────────
+  var poolBar = document.getElementById('poolBar');
+  function refreshPool() {
+    fetch('/dialer/pool-status')
+      .then(function(r) { return r.json(); })
+      .then(function(p) {
+        if (!p || !p.numbers) { poolBar.style.display = 'none'; return; }
+        poolBar.style.display = 'block';
+        if (p.remaining_today <= 0) {
+          poolBar.className = 'poolbar warn';
+          poolBar.textContent = '🛑 Daily dial limit hit (' + p.used_today + '/' +
+            p.cap_today + ') — paused to protect your numbers. Resumes tomorrow.';
+          return;
+        }
+        var txt = '☎️ ' + p.used_today + '/' + p.cap_today + ' calls today · ' +
+                  p.remaining_today + ' left · ' + p.active + ' warmed';
+        if (p.warming > 0) {
+          txt += ' · ' + p.warming + ' warming';
+          if (p.warmup_days_left !== null) txt += ' (' + p.warmup_days_left + 'd)';
+        }
+        poolBar.className = 'poolbar' + (p.remaining_today < 20 ? ' low' : '');
+        poolBar.textContent = txt;
+      })
+      .catch(function() {});
+  }
+  refreshPool();
+  setInterval(refreshPool, 30000);
 
   function updateTimer() {
     if (!callStart) return;

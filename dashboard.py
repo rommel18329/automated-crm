@@ -2477,9 +2477,11 @@ elif page == "dialer":
     }})
     .then(function(r) {{ return r.json(); }})
     .then(function(j) {{
-      if (j.error) {{
+      if (j.error === 'pool_exhausted') {{
+        btn.textContent = '🛑 ' + (j.message || 'Daily dial limit reached — resumes tomorrow');
+      }} else if (j.error) {{
         btn.disabled = false;
-        btn.textContent = '⚠️ ' + j.error + ' — click to retry';
+        btn.textContent = '⚠️ ' + (j.message || j.error) + ' — click to retry';
       }} else if (j.done) {{
         btn.textContent = '✅ Nothing left to dial (all already dialed today)';
       }}
