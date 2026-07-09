@@ -2339,6 +2339,17 @@ elif page == "dialer":
         st.session_state.setdefault("dialer_lines", 3)
         st.session_state.setdefault("dialer_batch_id", None)
 
+        # One-shot softphone popup: fired here (not on mode-select) so it only
+        # opens when the user actually hit Start Dialing. Cleared after firing.
+        _sp_pending = st.session_state.pop("_open_softphone_pending", None)
+        if _sp_pending:
+            _sp_url = f"{_base_url}/softphone?agent={_sp_pending}"
+            components.html(
+                f"<script>window.open('{_sp_url}','crm_softphone_{_sp_pending}',"
+                f"'width=380,height=400,resizable=yes');</script>",
+                height=0,
+            )
+
         if not st.session_state["dialer_on_call"]:
             # Which agent this browser session is (RJ toggle = Rom, GL = Gabby).
             # Drives lead claiming, the dial channel, and the softphone identity.
@@ -2368,22 +2379,12 @@ elif page == "dialer":
                     st.warning("Browser calling not set up. Run `python setup_twilio_app.py` first, then restart the webhook server.")
                 else:
                     _softphone_url = f"{_base_url}/softphone?agent={_agent}"
-                    # Auto-open the softphone popup once per session the moment
-                    # browser mode is active, so the user never has to know to
-                    # click it first. Popup blockers may catch it — the fallback
-                    # link below re-opens it on demand.
-                    _sp_opened_key = f"softphone_opened_{_agent}"
-                    if not st.session_state.get(_sp_opened_key):
-                        components.html(
-                            f"<script>window.open('{_softphone_url}',"
-                            f"'crm_softphone_{_agent}',"
-                            f"'width=380,height=400,resizable=yes');</script>",
-                            height=0,
-                        )
-                        st.session_state[_sp_opened_key] = True
+                    # The softphone opens automatically when you hit Start
+                    # Dialing (see the dial handler below). This link is just a
+                    # manual backup in case a popup blocker eats it.
                     _sp_col1, _sp_col2 = st.columns([3, 1])
                     _sp_col1.markdown(
-                        info_icon("⚡ ~500ms connect (softphone opens automatically)", _browser_tip),
+                        info_icon("⚡ ~500ms connect (softphone opens when you start)", _browser_tip),
                         unsafe_allow_html=True,
                     )
                     _sp_col2.markdown(
@@ -2393,7 +2394,7 @@ elif page == "dialer":
                         f"style='display:inline-block;background:transparent;color:#6b7a70;"
                         f"padding:6px 10px;border:1px solid #cdd6cf;border-radius:6px;font-size:12px;"
                         f"text-decoration:none;text-align:center;"
-                        f"width:100%'>Didn't open? Click</a>",
+                        f"width:100%'>Open Softphone</a>",
                         unsafe_allow_html=True,
                     )
             else:
@@ -2469,6 +2470,9 @@ elif page == "dialer":
                         st.session_state["dialer_on_call"] = True
                         st.session_state["dialer_batch_id"] = rdata["batch_id"]
                         st.session_state["dialer_batch_leads"] = _to_dial
+                        # Open the softphone popup now that dialing has actually
+                        # started (fires on the rerun below, near the dial card top).
+                        st.session_state["_open_softphone_pending"] = _agent
                         st.rerun()
                     else:
                         st.error(f"Multi-dial failed: {resp.text}")
