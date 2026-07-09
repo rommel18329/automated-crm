@@ -1792,10 +1792,14 @@ def softphone_page():
           return;
         }
         var txt = '☎️ ' + p.used_today + '/' + p.cap_today + ' calls today · ' +
-                  p.remaining_today + ' left · ' + p.active + ' warmed';
+                  p.remaining_today + ' left';
+        if (p.active > 0) txt += ' · ' + p.active + ' warmed';
         if (p.warming > 0) {
           txt += ' · ' + p.warming + ' warming';
-          if (p.warmup_days_left !== null) txt += ' (' + p.warmup_days_left + 'd)';
+          if (p.warmup_day) {
+            txt += ' — day ' + p.warmup_day + '/' + p.warmup_total_days +
+                   ' (' + p.warming_cap + '/number)';
+          }
         }
         poolBar.className = 'poolbar' + (p.remaining_today < 20 ? ' low' : '');
         poolBar.textContent = txt;

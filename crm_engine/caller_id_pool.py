@@ -17,9 +17,15 @@ from pathlib import Path
 
 from . import db
 
-# Warming numbers ramp up slowly before carrying full load.
-WARMUP_DAYS = 7
-WARMUP_DAILY_CAP = 15
+# Warming numbers ramp up slowly before carrying full load. Warm-up advances
+# on REAL usage, not the calendar: a warm-up day only counts once the number
+# actually placed MIN_CALLS_WARMUP_DAY calls that day. Idle days advance
+# nothing — a number that never dials never graduates.
+#   (completed dialing days below this, hard per-day cap)
+WARMUP_SCHEDULE = [(2, 10), (4, 15), (7, 25), (10, 40)]
+WARMUP_DAYS = 10          # real dialing days needed to graduate to full cap
+WARMUP_DAILY_CAP = 10     # hard cap on a brand-new number (stage 1)
+MIN_CALLS_WARMUP_DAY = 5  # a day advances warm-up only at >= this volume
 
 # Answer-rate detection: if a number with enough volume drops below this fraction
 # of the pool's median answer rate, treat it as a likely flag.
@@ -50,10 +56,14 @@ def _save_stats(stats: dict) -> None:
 
 
 def record_placed(phone_number: str) -> None:
-    """A call was fired from this number (counts toward answer-rate denominator)."""
+    """A call was fired from this number (counts toward answer-rate denominator
+    and toward today's warm-up progress)."""
     stats = _load_stats()
     s = stats.setdefault(phone_number, {"placed": 0, "connected": 0})
     s["placed"] += 1
+    daily = s.setdefault("daily", {})
+    day = date.today().isoformat()
+    daily[day] = daily.get(day, 0) + 1
     _save_stats(stats)
 
 
@@ -74,24 +84,45 @@ def answer_rate(phone_number: str) -> float | None:
 
 # ── Rotation ────────────────────────────────────────────────────────────────
 
-def _effective_cap(num: dict) -> int:
-    """Warming numbers carry a reduced cap until they graduate."""
-    if num["status"] == "warming":
-        return min(num["daily_cap"], WARMUP_DAILY_CAP)
-    return num["daily_cap"]
+def _warmup_days_completed(phone_number: str, stats: dict | None = None) -> int:
+    """Count past days (before today) where this number placed enough calls
+    (MIN_CALLS_WARMUP_DAY) to advance its warm-up. Idle days don't count."""
+    s = (stats if stats is not None else _load_stats()).get(phone_number) or {}
+    today = date.today().isoformat()
+    return sum(1 for d, c in (s.get("daily") or {}).items()
+               if d < today and c >= MIN_CALLS_WARMUP_DAY)
 
 
-def _maybe_graduate(num: dict, db_path: Path = db.DB_PATH) -> None:
-    """Promote a warming number to active once it's past WARMUP_DAYS."""
-    if num["status"] != "warming" or not num["warmup_started"]:
+def _stage_cap(days_completed: int) -> int | None:
+    """Hard per-day cap for a number at this warm-up stage; None = graduated."""
+    for upto, cap in WARMUP_SCHEDULE:
+        if days_completed < upto:
+            return cap
+    return None
+
+
+def _effective_cap(num: dict, stats: dict | None = None) -> int:
+    """Usage-based warm-up cap, computed from REAL dialing history for every
+    number — the status column is display-only (synced separately), so a
+    number mislabeled 'active' can never dial past its true warm-up stage."""
+    stage = _stage_cap(_warmup_days_completed(num["phone_number"], stats))
+    if stage is None:
+        return num["daily_cap"]
+    return min(num["daily_cap"], stage)
+
+
+def _sync_status(num: dict, db_path: Path = db.DB_PATH,
+                 stats: dict | None = None) -> None:
+    """Keep the status column truthful: 'warming' until the usage-based ramp
+    completes, 'active' after. Replaces the old calendar-based graduation
+    (which wrongly promoted numbers that had barely dialed)."""
+    if num["status"] in ("flagged", "retired"):
         return
-    try:
-        started = date.fromisoformat(num["warmup_started"])
-    except ValueError:
-        return
-    if (date.today() - started).days >= WARMUP_DAYS:
-        db.update_caller_number(num["id"], {"status": "active"}, db_path)
-        num["status"] = "active"
+    graduated = _stage_cap(_warmup_days_completed(num["phone_number"], stats)) is None
+    want = "active" if graduated else "warming"
+    if num["status"] != want:
+        db.update_caller_number(num["id"], {"status": want}, db_path)
+        num["status"] = want
 
 
 def _area_of(phone: str) -> str:
@@ -120,16 +151,18 @@ def pick_number(lead_phone: str, db_path: Path = db.DB_PATH,
         return None
 
     usable = []
+    stats = _load_stats()
     for num in pool:
         if num["status"] in ("flagged", "retired"):
             continue
         if num["phone_number"] in exclude:
             continue
-        _maybe_graduate(num, db_path)
+        _sync_status(num, db_path, stats)
         used = db.caller_calls_today(num["phone_number"], db_path)
-        if used >= _effective_cap(num):
+        cap = _effective_cap(num, stats)
+        if used >= cap:
             continue
-        usable.append((num, _effective_cap(num) - used))
+        usable.append((num, cap - used))
     if not usable:
         return None
 
@@ -149,37 +182,39 @@ def pick_number(lead_phone: str, db_path: Path = db.DB_PATH,
 
 def pool_status(db_path: Path = db.DB_PATH) -> dict:
     """Aggregate pool health for the dialer UI: how much dialing capacity
-    remains today and where the numbers are in their warm-up. The dialer
-    treats remaining_today as a HARD limit — when it hits 0, cold dialing
-    stops for the day rather than overflow onto the established numbers."""
+    remains today and where the numbers are in their (usage-based) warm-up.
+    The dialer treats remaining_today as a HARD limit — when it hits 0, cold
+    dialing stops for the day rather than overflow onto the texting numbers."""
     pool = db.fetch_caller_pool(db_path)
     out = {"numbers": 0, "active": 0, "warming": 0, "flagged": 0,
            "used_today": 0, "cap_today": 0, "remaining_today": 0,
-           "warmup_days_left": None}
-    days_left = []
+           "warmup_day": None, "warmup_total_days": WARMUP_DAYS,
+           "warming_cap": None, "warmup_days_left": None}
+    stats = _load_stats()
+    warm_days: list[int] = []
+    warm_caps: list[int] = []
     for num in pool:
         if num["status"] in ("flagged", "retired"):
             out["flagged"] += 1
             continue
-        _maybe_graduate(num, db_path)
+        _sync_status(num, db_path, stats)
         out["numbers"] += 1
-        cap = _effective_cap(num)
+        cap = _effective_cap(num, stats)
         used = db.caller_calls_today(num["phone_number"], db_path)
         out["cap_today"] += cap
         out["used_today"] += min(used, cap)
         out["remaining_today"] += max(0, cap - used)
-        if num["status"] == "warming":
-            out["warming"] += 1
-            if num["warmup_started"]:
-                try:
-                    started = date.fromisoformat(num["warmup_started"])
-                    days_left.append(max(0, WARMUP_DAYS - (date.today() - started).days))
-                except ValueError:
-                    pass
-        else:
+        days = _warmup_days_completed(num["phone_number"], stats)
+        if _stage_cap(days) is None:
             out["active"] += 1
-    if days_left:
-        out["warmup_days_left"] = max(days_left)
+        else:
+            out["warming"] += 1
+            warm_days.append(days)
+            warm_caps.append(cap)
+    if warm_days:
+        out["warmup_day"] = min(warm_days) + 1          # humans count from day 1
+        out["warmup_days_left"] = max(0, WARMUP_DAYS - min(warm_days))
+        out["warming_cap"] = min(warm_caps)
     return out
 
 

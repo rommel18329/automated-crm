@@ -2715,17 +2715,17 @@ elif page == "caller_health":
                     unsafe_allow_html=True,
                 )
                 _warm_note = ""
-                if num["status"] == "warming" and num["warmup_started"]:
-                    try:
-                        days_in = (date.today() - date.fromisoformat(num["warmup_started"])).days
-                        _warm_note = f" · warming day {days_in}/{caller_id_pool.WARMUP_DAYS}"
-                    except ValueError:
-                        pass
+                if num["status"] == "warming":
+                    # Usage-based: a warm-up day only counts once the number
+                    # placed enough real calls that day. Idle days don't count.
+                    _days_done = caller_id_pool._warmup_days_completed(phone)
+                    _warm_note = (f" · warm-up day {_days_done + 1}/{caller_id_pool.WARMUP_DAYS}"
+                                  f" · needs {caller_id_pool.MIN_CALLS_WARMUP_DAY}+ calls/day to advance")
                 st.caption(f"Area {num['area_code']}{_warm_note}")
             with c2:
-                _eff_cap = min(cap, caller_id_pool.WARMUP_DAILY_CAP) if num["status"] == "warming" else cap
+                _eff_cap = caller_id_pool._effective_cap(num)
                 st.markdown(f"**{used} / {_eff_cap}**")
-                st.caption("calls today")
+                st.caption("calls today (hard cap)")
             with c3:
                 st.markdown(f"**{int(rate*100)}%**" if rate is not None else "—")
                 st.caption("answer rate")
@@ -2744,9 +2744,12 @@ elif page == "caller_health":
         st.markdown(
             "- **Rotation:** each call picks a number matching the lead's area code, "
             "spreading load and respecting daily caps.\n"
-            "- **Daily caps:** ~50 calls/number (15 while warming) keeps you under "
-            "carrier auto-flag thresholds.\n"
-            "- **Warm-up:** new numbers ramp slowly for 7 days before full volume.\n"
+            "- **Daily caps:** 50 calls/number fully warmed — a hard limit; the "
+            "dialer stops for the day rather than exceed it.\n"
+            "- **Warm-up (usage-based):** a number advances only on days it "
+            "actually dials 5+ calls. Ramp: 10/day → 15 → 25 → 40 → 50 across "
+            "10 real dialing days. Idle days don't count — sitting unused "
+            "doesn't warm a number.\n"
             "- **Detection:** answer rate is tracked per number; a sudden crater vs. "
             "the pool median flags a likely carrier block, and the number is pulled.\n"
             "- **Proactive registration:** run `python register_voice_integrity.py` to "
