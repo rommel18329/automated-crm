@@ -917,6 +917,9 @@ _DISPOSITIONS = {
     # Answered but no audio either way (silent screening app, dead line,
     # or an audio-path glitch). Retry the next day.
     "Dead Air":       ("Call - answered but dead air (no audio)", 1),
+    # Reached the right person but they sold the property. Terminal — never
+    # auto re-queued. (Status stays as-is; mark the lead dead on its page.)
+    "No Longer Owns": ("Call - no longer owns the property", None),
 }
 
 
@@ -1330,6 +1333,7 @@ def softphone_page():
     <button class="disp-btn" onclick="dispose('Not Interested')">Not Interested</button>
     <button class="disp-btn" onclick="dispose('Wrong Number')">Wrong Number</button>
     <button class="disp-btn" onclick="dispose('Dead Air')">🔇 Dead Air</button>
+    <button class="disp-btn" onclick="dispose('No Longer Owns')">🚫 No Longer Owns</button>
   </div>
   <div id="statusSection">
     <div class="disp-title" style="margin-top:10px">Set lead status</div>
@@ -1409,7 +1413,7 @@ def softphone_page():
   let statusSaved = false;              // this call's hot/warm/cold was set
   let lastOutcomeNoStatus = false;      // outcome that needs no temperature
   // Outcomes where there's no temperature to set — advance right after saving.
-  var NO_STATUS_OUTCOMES = ['Wrong Number', 'No Answer', 'Voicemail', 'Dead Air'];
+  var NO_STATUS_OUTCOMES = ['Wrong Number', 'No Answer', 'Voicemail', 'Dead Air', 'No Longer Owns'];
 
   // Which agent this popup belongs to (rom / gabby). Each agent's popup polls
   // its own dial channel and registers its own Twilio identity.
@@ -1579,7 +1583,7 @@ def softphone_page():
   }
 
   // Outcomes that don't need a hot/warm/cold temperature — just log and move on.
-  var TERMINAL_OUTCOMES = ['Wrong Number', 'Dead Air'];
+  var TERMINAL_OUTCOMES = ['Wrong Number', 'Dead Air', 'No Longer Owns'];
   function showSaved(part) {
     savedParts.push(part);
     dispDoneEl.textContent = '✓ Saved: ' + savedParts.join('  ·  ');

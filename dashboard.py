@@ -2105,6 +2105,7 @@ elif page == "dialer":
         "Callback":       ("Call — wants callback", 1),
         "Connected":      ("Call — connected, talked", 3),
         "Dead Air":       ("Call — answered but dead air (no audio)", 1),
+        "No Longer Owns": ("Call — no longer owns the property", None),
     }
 
     def _dispose(lead_id: int, label: str) -> None:
