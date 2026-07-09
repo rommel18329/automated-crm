@@ -2441,31 +2441,54 @@ elif page == "dialer":
                     # itself: dispose → next batch dials automatically. Leads
                     # already dialed today / claimed by the other agent are
                     # skipped server-side at claim time.
+                    #
+                    # NOTE: this must be components.html (iframe), NOT st.markdown —
+                    # Streamlit's HTML sanitizer strips onclick handlers, so an
+                    # anchor with JS silently does nothing. Component iframes run
+                    # scripts, and window.open from a real click passes blockers.
                     _lead_js = "[" + ",".join(str(int(l)) for l in _remaining) + "]"
                     _amd_js = "true" if _amd_on else "false"
-                    _start_js = (
-                        f"window.open('{_softphone_url}','crm_softphone_{_agent}',"
-                        f"'width=390,height=640,resizable=yes');"
-                        f"var b=this;b.style.pointerEvents='none';"
-                        f"b.textContent='📞 Dialing — work from the softphone window';"
-                        f"fetch('{_base_url}/dialer/queue/start',{{method:'POST',"
-                        f"body:JSON.stringify({{agent:'{_agent}',lead_ids:{_lead_js},"
-                        f"lines:{_batch_size},amd:{_amd_js}}})}})"
-                        f".then(function(r){{return r.json();}})"
-                        f".then(function(j){{if(j.error){{b.textContent='⚠️ '+j.error;"
-                        f"b.style.pointerEvents='auto';}}}})"
-                        f".catch(function(){{b.textContent='⚠️ Backend unreachable — run Launch CRM, then retry';"
-                        f"b.style.pointerEvents='auto';}});return false;"
-                    )
-                    st.markdown(
-                        f"<a href='#' onclick=\"{_start_js}\" "
-                        f"style='display:block;text-align:center;"
-                        f"background:linear-gradient(180deg,#5E8A67,#49764F);color:#fff;"
-                        f"padding:13px;border-radius:8px;font-size:15px;font-weight:700;"
-                        f"text-decoration:none;'>▶ Start Dialing "
-                        f"({_batch_size} line{'s' if _batch_size != 1 else ''} at a time)</a>",
-                        unsafe_allow_html=True,
-                    )
+                    _lines_word = "line" if _batch_size == 1 else "lines"
+                    components.html(f"""
+<style>
+  body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }}
+  #startBtn {{
+    display:block; width:100%; padding:13px; border:none; cursor:pointer;
+    background:linear-gradient(180deg,#5E8A67,#49764F); color:#fff;
+    border-radius:8px; font-size:15px; font-weight:700; text-align:center;
+  }}
+  #startBtn:hover {{ filter:brightness(1.05); }}
+  #startBtn:disabled {{ opacity:.75; cursor:default; }}
+</style>
+<button id="startBtn">▶ Start Dialing ({_batch_size} {_lines_word} at a time)</button>
+<script>
+  var btn = document.getElementById('startBtn');
+  btn.addEventListener('click', function() {{
+    window.open('{_softphone_url}', 'crm_softphone_{_agent}',
+                'width=390,height=640,resizable=yes');
+    btn.disabled = true;
+    btn.textContent = '📞 Dialing — work from the softphone window';
+    fetch('{_base_url}/dialer/queue/start', {{
+      method: 'POST',
+      body: JSON.stringify({{agent: '{_agent}', lead_ids: {_lead_js},
+                             lines: {_batch_size}, amd: {_amd_js}}})
+    }})
+    .then(function(r) {{ return r.json(); }})
+    .then(function(j) {{
+      if (j.error) {{
+        btn.disabled = false;
+        btn.textContent = '⚠️ ' + j.error + ' — click to retry';
+      }} else if (j.done) {{
+        btn.textContent = '✅ Nothing left to dial (all already dialed today)';
+      }}
+    }})
+    .catch(function() {{
+      btn.disabled = false;
+      btn.textContent = '⚠️ Backend unreachable — run Launch CRM, then click to retry';
+    }});
+  }});
+</script>
+""", height=54)
                     st.caption(
                         "One click: the softphone opens, you hear it ringing, and after "
                         "each call you dispose right in the softphone — the next batch "

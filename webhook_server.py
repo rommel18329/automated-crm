@@ -1886,11 +1886,16 @@ def softphone_page():
       .catch(function() {});
   }
 
-  // Baseline first: ignore any command already sitting in the channel from a
-  // previous session — only commands issued AFTER this popup opened may dial.
+  // Baseline first: ignore any SINGLE-dial command already sitting in the
+  // channel from a previous session — only commands issued AFTER this popup
+  // opened may dial. Multi-batch commands are NOT baselined: the CRM's Start
+  // button fires the batch while this popup is still loading, so the command
+  // legitimately predates us. joinMulti's own staleness check (batch must be
+  // waiting_agent/ringing) rejects genuinely dead batches, and fresh batches
+  // wait 20s for us to join before firing — so letting multi through is safe.
   fetch('/dialer/current?agent=' + AGENT)
     .then(function(r) { return r.json(); })
-    .then(function(d) { if (d && d.ts) { lastDialTs = d.ts; } })
+    .then(function(d) { if (d && d.ts && d.mode !== 'multi') { lastDialTs = d.ts; } })
     .catch(function() {})
     .finally(function() { setInterval(pollForLead, 500); });
 
