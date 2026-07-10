@@ -717,12 +717,15 @@ def _finalize_winner(batch_id: str, batch: dict, lead_id: int, call_sid: str | N
 
 @app.route("/voice/multi-answer/<batch_id>/<int:lead_id>", methods=["POST"])
 def voice_multi_answer(batch_id: str, lead_id: int):
-    """A lead's line was answered.
+    """A lead's line was answered — first answer wins the conference
+    IMMEDIATELY (instant bridge: the agent hears the real first hello, no
+    screening delay).
 
-    AMD off: first answer wins the conference immediately (legacy behavior).
-    AMD on:  hold the call and stream its audio to the AMD server; the winner
-    is declared by /voice/amd-result (human) or /voice/amd-timeout (fail-open).
-    """
+    AMD on: the call's audio ALSO streams to the AMD server in parallel; if
+    a voicemail greeting emerges in the first seconds, /voice/amd-result
+    kills the live call, auto-disposes it, and the queue moves on. A human
+    verdict is a no-op — the agent is already talking. Fails open by
+    construction: AMD can never delay or drop a human."""
     call_sid = request.form.get("CallSid", "")
     lead = db.fetch_lead(lead_id, DB_PATH)
     with _batch_lock:
@@ -735,34 +738,28 @@ def voice_multi_answer(batch_id: str, lead_id: int):
             log.info(f"Multi [{batch_id}] lead {lead_id} answered but {batch['winner']} already won")
             return Response(_HANGUP_TWIML, mimetype="text/xml")
         amd_on = batch.get("amd", False)
-        if not amd_on:
-            batch["winner"] = lead_id
-            batch["status"] = "connected"
-            batch["winner_name"] = lead["name"] if lead else ""
-            batch["winner_phone"] = lead["phone"] if lead else ""
+        batch["winner"] = lead_id
+        batch["status"] = "connected"
+        batch["winner_name"] = lead["name"] if lead else ""
+        batch["winner_phone"] = lead["phone"] if lead else ""
         conference = batch["conference"]
 
+    _finalize_winner(batch_id, batch, lead_id, call_sid)
+    caller_id = pick_from_number(batch["winner_phone"])
+    twiml = _conference_twiml(conference, caller_id)
     if amd_on:
-        # Hold + screen: stream callee audio to the AMD server. If no verdict
-        # arrives, the Redirect fails open and connects like today.
+        # Fork the callee's audio to the AMD server alongside the live
+        # conference join (insert <Start><Stream> right after <Response>).
         stream_url = PUBLIC_BASE_URL.replace("https://", "wss://") + "/amd"
-        twiml = (
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<Response>'
+        stream = (
             f'<Start><Stream name="amd" url="{stream_url}">'
             f'<Parameter name="batch" value="{batch_id}"/>'
             f'<Parameter name="lead" value="{lead_id}"/>'
             '</Stream></Start>'
-            '<Pause length="6"/>'
-            f'<Redirect method="POST">{PUBLIC_BASE_URL}/voice/amd-timeout/{batch_id}/{lead_id}</Redirect>'
-            '</Response>'
         )
-        log.info(f"Multi [{batch_id}] lead {lead_id} answered — AMD screening")
-        return Response(twiml, mimetype="text/xml")
-
-    _finalize_winner(batch_id, batch, lead_id, call_sid)
-    caller_id = pick_from_number(batch["winner_phone"])
-    return Response(_conference_twiml(conference, caller_id), mimetype="text/xml")
+        twiml = twiml.replace('<Response>', '<Response>' + stream, 1)
+        log.info(f"Multi [{batch_id}] lead {lead_id} answered — instant bridge, AMD watching")
+    return Response(twiml, mimetype="text/xml")
 
 
 def _handle_machine(batch_id: str, batch: dict, lead_id: int, sid: str | None) -> None:
@@ -828,9 +825,26 @@ def _declare_winner_via_rest(batch_id: str, batch: dict, lead_id: int, sid: str 
     _finalize_winner(batch_id, batch, lead_id, sid)
 
 
+def _kill_machine_winner(batch_id: str, batch: dict, lead_id: int, sid: str | None) -> None:
+    """Instant-bridge mode: the connected 'winner' turned out to be a
+    voicemail. Hang it up mid-greeting (ending the conference — the agent's
+    leg drops with it), auto-dispose it, and flip the batch to machine_ended
+    so the softphone auto-advances instead of asking for a disposition.
+    Status flips BEFORE the hangup so the popup's disconnect handler always
+    sees machine_ended when it checks the batch."""
+    with _batch_lock:
+        if batch.get("winner") == lead_id and batch["status"] == "connected":
+            batch["status"] = "machine_ended"
+    _handle_machine(batch_id, batch, lead_id, sid)   # hangup + "Voicemail (auto)" dispo
+    log.info(f"AMD [{batch_id}] live winner {lead_id} was voicemail — killed, batch machine_ended")
+
+
 @app.route("/voice/amd-result/<batch_id>/<int:lead_id>", methods=["POST"])
 def voice_amd_result(batch_id: str, lead_id: int):
-    """Verdict from the AMD server: human/unknown connect, machine hangs up."""
+    """Verdict from the AMD server (instant-bridge mode): a machine verdict
+    kills the call — mid-conversation for the connected winner, silently for
+    a non-winner line. Human/unknown verdicts are no-ops: the agent is
+    already live with them, so there is nothing to connect or delay."""
     data = request.get_json(force=True, silent=True) or {}
     result = data.get("result", "unknown")
     detail = data.get("detail", "")
@@ -841,10 +855,11 @@ def voice_amd_result(batch_id: str, lead_id: int):
             return jsonify({"ok": False, "error": "batch not found"}), 404
         sid = batch["call_sids"].get(lead_id)
         already_winner = batch["winner"] == lead_id
-    if result == "machine" and not already_winner:
-        _handle_machine(batch_id, batch, lead_id, sid)
-    else:
-        _declare_winner_via_rest(batch_id, batch, lead_id, sid)
+    if result == "machine":
+        if already_winner:
+            _kill_machine_winner(batch_id, batch, lead_id, sid)
+        else:
+            _handle_machine(batch_id, batch, lead_id, sid)
     return jsonify({"ok": True})
 
 
@@ -1665,8 +1680,34 @@ def softphone_page():
     btnMute.classList.remove('active');
     logMsg('Call ended');
     if (currentLeadId) {
-      setStatus('Call ended — pick a disposition below', 'ended');
-      showDisposition();
+      // The disconnect may be AMD killing a voicemail winner (the room ends
+      // with it) — check the batch before asking for a disposition that the
+      // server already logged.
+      if (dispBatchId) {
+        fetch('/dialer/batch/' + dispBatchId)
+          .then(function(r) { return r.json(); })
+          .then(function(b) {
+            if (b && b.status === 'machine_ended') {
+              currentLeadId = null;
+              hideDisposition();
+              nameEl.textContent = 'Voicemail — auto-skipped';
+              phoneEl.textContent = '';
+              setStatus('🤖 Voicemail detected — hung up & logged automatically', 'no-answer');
+              logMsg('AMD: connected line was a voicemail — auto-disposed.');
+              if (queueActive && autoAdvance) scheduleNext(1500, 'VM skipped — next batch');
+            } else {
+              setStatus('Call ended — pick a disposition below', 'ended');
+              showDisposition();
+            }
+          })
+          .catch(function() {
+            setStatus('Call ended — pick a disposition below', 'ended');
+            showDisposition();
+          });
+      } else {
+        setStatus('Call ended — pick a disposition below', 'ended');
+        showDisposition();
+      }
     } else {
       setStatus('Call ended', 'ended');
     }
@@ -2018,6 +2059,24 @@ def softphone_page():
             batchPollInterval = null;
           } else if (b.status === 'ringing' && b.machines_count > 0) {
             setStatus('Ringing — ' + b.machines_count + ' voicemail(s) skipped', 'ringing');
+          } else if (b.status === 'machine_ended') {
+            // Instant-bridge AMD: the connected line turned out to be a
+            // voicemail — server already hung up and logged it.
+            stopRinging();
+            currentLeadId = null;          // dispo already logged server-side
+            hideDisposition();
+            nameEl.textContent = 'Voicemail — auto-skipped';
+            phoneEl.textContent = '';
+            setStatus('🤖 Voicemail detected — hung up & logged automatically', 'no-answer');
+            logMsg('AMD: connected line was a voicemail — auto-disposed.');
+            clearInterval(batchPollInterval);
+            batchPollInterval = null;
+            if (device) device.disconnectAll();
+            setTimeout(function() {
+              if (queueActive && autoAdvance && !call) {
+                scheduleNext(1500, 'VM skipped — next batch');
+              }
+            }, 600);
           } else if (b.status === 'no_answer') {
             nameEl.textContent = 'No one answered';
             phoneEl.textContent = '';

@@ -2449,11 +2449,12 @@ elif page == "dialer":
 
             if _is_browser and _browser_ready:
                 _amd_on = st.checkbox(
-                    "🤖 Skip voicemails (self-built AMD)", value=True, key="dialer_amd",
-                    help="Listens to the first seconds of each answered line: humans "
-                         "connect to you; voicemail greetings/beeps are hung up and "
-                         "auto-logged as 'Voicemail (auto)'. If detection is unsure it "
-                         "connects you anyway — a real person is never dropped.",
+                    "⚡ Instant connect + auto-skip voicemails (AMD)", value=True, key="dialer_amd",
+                    help="You're bridged the moment someone picks up — you hear the "
+                         "real first hello, zero screening delay. AMD listens alongside: "
+                         "if a voicemail greeting emerges, the line is hung up (~3s in), "
+                         "auto-logged as 'Voicemail (auto)', and the queue dials the "
+                         "next batch. A human can never be delayed or dropped.",
                 )
                 _remaining = queue[idx:]
                 _batch_size = min(_lines, len(_remaining))
