@@ -1030,6 +1030,9 @@ def dialer_lead(lead_id: int):
         "first_name": name.split()[0] if name else "",
         "phone": lead.get("phone", ""),
         "address": address,
+        # Prior dialing attempts (disposed calls) — the softphone shows
+        # "Attempt #N" plus VM-cadence advice from this.
+        "attempts": db.count_dispositions(lead_id, DB_PATH),
     })
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
@@ -1289,6 +1292,8 @@ def softphone_page():
   .lead-info { text-align:center; margin-bottom:8px; }
   .lead-name { font-size:18px; font-weight:700; color:#1a1a1a; }
   .lead-phone { font-size:14px; color:#666; }
+  .attempt-line { font-size:12px; color:#6b6b6b; margin-top:3px; }
+  .attempt-line b { color:#b8770a; }
   .timer { text-align:center; font-size:28px; font-weight:700; color:#1a1a1a;
            margin:8px 0; font-variant-numeric:tabular-nums; }
   .buttons { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; margin-top:10px; }
@@ -1362,6 +1367,7 @@ def softphone_page():
 <div class="lead-info">
   <div class="lead-name" id="leadName">Waiting for lead...</div>
   <div class="lead-phone" id="leadPhone"></div>
+  <div class="attempt-line" id="attemptLine"></div>
 </div>
 <div class="timer" id="timer">00:00</div>
 <div class="status" id="status">Starting up...</div>
@@ -1502,12 +1508,34 @@ def softphone_page():
       + "see if you'd ever consider selling this one, now or down the road.";
   }
 
+  var attemptLine = document.getElementById('attemptLine');
+
+  // Attempt counter + pro voicemail cadence: no VM on attempts 1-2 (protect
+  // pace, VMs rarely get returned early), leave a short VM on attempt 3 and
+  // every 3rd attempt after (3, 6, 9...) — familiarity builds callbacks.
+  function renderAttempt(info) {
+    if (!info || typeof info.attempts === 'undefined') { attemptLine.textContent = ''; return; }
+    var att = (info.attempts || 0) + 1;   // the attempt happening right now
+    var vmNow = att >= 3 && ((att - 3) % 3 === 0);
+    if (vmNow) {
+      attemptLine.innerHTML = '📞 Attempt #' + att +
+        ' · 💡 <b>VM round — leave a short voicemail if a machine picks up</b>';
+    } else if (att < 3) {
+      attemptLine.innerHTML = '📞 Attempt #' + att +
+        ' · 🚫 no voicemail yet — pros start VMs on attempt 3';
+    } else {
+      var nextVm = att + ((3 - ((att - 3) % 3)) % 3);
+      attemptLine.innerHTML = '📞 Attempt #' + att +
+        ' · 🚫 skip the VM this round (next VM: attempt ' + nextVm + ')';
+    }
+  }
+
   function loadScriptForLead(leadId) {
-    if (!leadId) { renderScript(null); return; }
+    if (!leadId) { renderScript(null); attemptLine.textContent = ''; return; }
     fetch('/dialer/lead/' + leadId)
       .then(function(r) { return r.json(); })
-      .then(function(info) { renderScript(info); })
-      .catch(function() { renderScript(null); });
+      .then(function(info) { renderScript(info); renderAttempt(info); })
+      .catch(function() { renderScript(null); attemptLine.textContent = ''; });
   }
 
   renderScript(null);   // show generic script until a lead is dialed

@@ -683,6 +683,16 @@ def fetch_recent_inbound_texts(since_hours: int = 24, db_path: Path = DB_PATH) -
     return [_to_dict(r) for r in rows]
 
 
+def count_dispositions(lead_id: int, db_path: Path = DB_PATH) -> int:
+    """How many dialing attempts (disposed calls) this lead has had — drives
+    the softphone's attempt counter / voicemail-cadence advice."""
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM dispositions WHERE lead_id=?", (lead_id,)
+        ).fetchone()
+    return int(row["c"])
+
+
 def set_thread_mark(lead_id: int, channel: str, state: str,
                     db_path: Path = DB_PATH) -> None:
     """Manually mark a lead's message/call thread read or unread.
