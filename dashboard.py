@@ -1309,16 +1309,12 @@ with st.sidebar:
     nav_item("Caller ID Health", "caller_health")
     nav_item("Follow-ups", "followups")
 
-    # Messages nav item with unread badge
-    _last_seen = st.session_state.get("messages_last_seen_ts") or (
-        datetime.utcnow() - timedelta(hours=24)
-    ).isoformat()
-    _unread_count = sum(
-        1 for _i in all_interactions
-        if _i["direction"] == "inbound"
-        and _i["type"] in ("text", "call")
-        and _i["timestamp"] > _last_seen
-    )
+    # Messages nav item with unread badge. Persistent: only replying (text
+    # back = message, call back = missed call) or an explicit "Mark read"
+    # clears an item — opening the page or clicking around never does.
+    _unread_msg_leads = db.unread_message_lead_ids()
+    _missed_calls_open = db.fetch_unacknowledged_missed_calls()
+    _unread_count = len(_unread_msg_leads) + len(_missed_calls_open)
     _msg_nav_col, _msg_badge_col = st.columns([5, 1])
     with _msg_nav_col:
         nav_item("Messages", "messages")
@@ -1388,6 +1384,23 @@ if page == "dashboard":
                 label = f"{c['name']}\n{c['phone']}\n{d} {t}"
                 if st.button(label, key="missed_call_badge_" + str(c["id"])):
                     nav_to("leads", c["lead_id"])
+                _mc1, _mc2 = st.columns(2)
+                if _mc1.button("📞 Call back", key=f"missed_cb_{c['id']}",
+                               use_container_width=True):
+                    _cb = place_call(c["lead_id"],
+                                     from_number=_FROM_OPTS[_auto_caller_id(c.get("phone", ""))])
+                    if _cb.get("called"):
+                        # Calling back clears it (the outbound call also
+                        # clears it naturally; the mark is belt-and-braces).
+                        db.set_thread_mark(c["lead_id"], "call", "read")
+                        st.toast(f"📞 Calling {c['name']} — your phone rings first.")
+                        st.rerun()
+                    else:
+                        st.error(f"Call failed: {_cb.get('error', 'unknown')}")
+                if _mc2.button("Mark read", key=f"missed_read_{c['id']}",
+                               use_container_width=True):
+                    db.set_thread_mark(c["lead_id"], "call", "read")
+                    st.rerun()
 
     # ── Unmatched inbox (texts/voicemails from unknown numbers) ──────────────
     unmatched = db.fetch_unmatched_inbox()
@@ -1417,18 +1430,33 @@ if page == "dashboard":
 
     st.markdown("### Today’s Priorities")
     pcols = st.columns(5)
+    # Hot-lead call LIST progress (the checklist on the Call List page) —
+    # not the dialer. Dialer volume is the ☎️ metric next to it.
     pcols[0].button(
-        f"Calls remaining today: {calls_remaining_today}",
+        f"Call list left today: {calls_remaining_today}",
         key="calls_remaining_today_button",
         on_click=go_to_call_list,
+        help="Hot leads on today's Call List you haven't checked off yet.",
     )
-    if pcols[1].button(f"Calls completed today: {calls_completed_today}", key="prio_calls_completed"):
-        nav_to("Call List")
+    try:
+        _pool_now = caller_id_pool.pool_status()
+        _dials_label = f"☎️ Dials today: {_pool_now['used_today']}/{_pool_now['cap_today']}"
+    except Exception:
+        _dials_label = "☎️ Dials today: —"
+    if pcols[1].button(_dials_label, key="prio_dials_today",
+                       help="Every line the multi-dialer fired today vs the pool's "
+                            "spam-safe hard cap. Includes unanswered/canceled lines — "
+                            "that's what carriers see."):
+        nav_to("caller_health")
     overdue_label = f"🔴 Overdue follow-ups: {overdue_count}" if overdue_count > 0 else f"Overdue follow-ups: {overdue_count}"
     if pcols[2].button(overdue_label, key="prio_overdue"):
         st.session_state["followup_overdue_only"] = True
         nav_to("Follow-ups")
-    pcols[3].empty()
+    if pcols[3].button(f"Calls logged today: {calls_completed_today}", key="prio_calls_completed",
+                       help="Calls that produced a record: connected, voicemail, or a "
+                            "disposition. Lines that rang unanswered and got canceled "
+                            "don't create a call log — see ☎️ Dials today for those."):
+        nav_to("Call List")
     if pcols[4].button(f"Follow-ups waiting approval: {waiting_approval}", key="prio_waiting_approval"):
         st.session_state["followup_overdue_only"] = False
         nav_to("Follow-ups")
@@ -1821,8 +1849,8 @@ elif page == "followups":
             st.markdown("</div>", unsafe_allow_html=True)
 
 elif page == "messages":
-    # Mark all current inbound messages as seen (clears the badge)
-    st.session_state["messages_last_seen_ts"] = datetime.utcnow().isoformat()
+    # NOTE: opening this page does NOT mark anything read. Unread state
+    # clears only when you reply (text/call back) or hit Mark read.
 
     # ── header ────────────────────────────────────────────────────────────────
     hdr_left, hdr_right = st.columns([6, 1])
@@ -1939,6 +1967,9 @@ elif page == "messages":
     # ── two-column layout: thread list | conversation ─────────────────────────
     thread_col, convo_col = st.columns([1, 2.4])
 
+    # Unread threads: blue dot until you reply or hit Mark read.
+    _unread_ids = db.unread_message_lead_ids()
+
     with thread_col:
         st.markdown("**Conversations**")
         with st.container(height=540):
@@ -1950,7 +1981,8 @@ elif page == "messages":
                 _d, _tm = fmt_date_time(_t["last_ts"])
                 _dir_icon = "← " if _t["direction"] == "inbound" else "→ "
                 _btn_type = "secondary" if _is_sel else "tertiary"
-                _label = ("● " if _is_sel else "") + _t["lead_name"]
+                _unread_dot = "🔵 " if _t["lead_id"] in _unread_ids else ""
+                _label = ("● " if _is_sel else "") + _unread_dot + _t["lead_name"]
                 if st.button(_label, key=f"msg_thread_{_t['lead_id']}", use_container_width=True, type=_btn_type):
                     st.session_state["msg_selected_lead"] = _t["lead_id"]
                     st.rerun()
@@ -1966,8 +1998,14 @@ elif page == "messages":
                 st.warning("Lead not found.")
             else:
                 # Conversation header
-                _ch_left, _ch_right = st.columns([4, 1])
+                _ch_left, _ch_mark, _ch_right = st.columns([3.2, 1.3, 1])
                 _ch_left.markdown(f"**{_sel_lead['name']}** · `{_sel_lead['phone']}`")
+                _sel_unread = _sel_lid in _unread_ids
+                _mark_label = "✓ Mark read" if _sel_unread else "Mark unread"
+                if _ch_mark.button(_mark_label, key=f"msg_mark_{_sel_lid}", type="secondary"):
+                    db.set_thread_mark(_sel_lid, "message",
+                                       "read" if _sel_unread else "unread")
+                    st.rerun()
                 if _ch_right.button("Open Lead →", key=f"msg_open_lead_{_sel_lid}", type="secondary"):
                     nav_to("Leads", _sel_lid)
 
@@ -2079,6 +2117,12 @@ elif page == "messages":
                     if st.button("Open thread", key=f"msg_call_open_{_c['id']}", type="tertiary"):
                         st.session_state["msg_selected_lead"] = _cl["id"]
                         st.rerun()
+                    # Resurface a handled missed call as needing follow-up.
+                    if "missed" in _lcontent:
+                        if st.button("↩ Mark unread", key=f"msg_call_unread_{_c['id']}", type="tertiary"):
+                            db.set_thread_mark(_cl["id"], "call", "unread")
+                            st.toast(f"📞 {_cl['name']} back on the missed-call list.")
+                            st.rerun()
 
             st.divider()
 
@@ -2106,6 +2150,7 @@ elif page == "dialer":
         "Connected":      ("Call — connected, talked", 3),
         "Dead Air":       ("Call — answered but dead air (no audio)", 1),
         "No Longer Owns": ("Call — no longer owns the property", None),
+        "Hung Up":        ("Call — answered, hung up quickly", 2),
     }
 
     def _dispose(lead_id: int, label: str) -> None:

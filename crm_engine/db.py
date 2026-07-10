@@ -159,6 +159,14 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 lead_id  INTEGER NOT NULL,
                 PRIMARY KEY (list_id, lead_id)
             );
+
+            CREATE TABLE IF NOT EXISTS thread_read_state (
+                lead_id    INTEGER NOT NULL,
+                channel    TEXT NOT NULL CHECK (channel IN ('message','call')),
+                state      TEXT NOT NULL CHECK (state IN ('read','unread')),
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (lead_id, channel)
+            );
             """
         )
         # Migration: add 'investor' to status CHECK (requires table recreation in SQLite)
@@ -675,10 +683,63 @@ def fetch_recent_inbound_texts(since_hours: int = 24, db_path: Path = DB_PATH) -
     return [_to_dict(r) for r in rows]
 
 
+def set_thread_mark(lead_id: int, channel: str, state: str,
+                    db_path: Path = DB_PATH) -> None:
+    """Manually mark a lead's message/call thread read or unread.
+    channel: 'message' | 'call'.  state: 'read' | 'unread'."""
+    with get_conn(db_path) as conn:
+        conn.execute(
+            """INSERT INTO thread_read_state (lead_id, channel, state, updated_at)
+               VALUES (?,?,?,?)
+               ON CONFLICT(lead_id, channel) DO UPDATE
+               SET state=excluded.state, updated_at=excluded.updated_at""",
+            (lead_id, channel, state,
+             datetime.utcnow().isoformat(timespec="seconds")),
+        )
+
+
+def fetch_thread_marks(db_path: Path = DB_PATH) -> dict:
+    """(lead_id, channel) -> {'state','updated_at'} for all manual marks."""
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT lead_id, channel, state, updated_at FROM thread_read_state"
+        ).fetchall()
+    return {(r["lead_id"], r["channel"]): {"state": r["state"], "updated_at": r["updated_at"]}
+            for r in rows}
+
+
+def unread_message_lead_ids(db_path: Path = DB_PATH) -> set:
+    """Leads whose text thread is unread. Latest event wins:
+    - unread if the last inbound text is newer than both your last outbound
+      text and any manual 'read' mark (replying = caught up, so an AI
+      follow-up or manual text clears it automatically);
+    - a manual 'unread' mark newer than those makes it unread regardless."""
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            """SELECT lead_id,
+                      MAX(CASE WHEN direction='inbound'  THEN timestamp END) AS last_in,
+                      MAX(CASE WHEN direction='outbound' THEN timestamp END) AS last_out
+               FROM interactions WHERE type='text' GROUP BY lead_id"""
+        ).fetchall()
+    marks = fetch_thread_marks(db_path)
+    unread: set = set()
+    for r in rows:
+        m = marks.get((r["lead_id"], "message"))
+        read_ts = m["updated_at"] if m and m["state"] == "read" else ""
+        unread_ts = m["updated_at"] if m and m["state"] == "unread" else ""
+        cleared = max(r["last_out"] or "", read_ts)
+        if unread_ts and unread_ts >= cleared:
+            unread.add(r["lead_id"])
+        elif r["last_in"] and r["last_in"] > cleared:
+            unread.add(r["lead_id"])
+    return unread
+
+
 def fetch_unacknowledged_missed_calls(db_path: Path = DB_PATH) -> list[dict[str, Any]]:
-    """Return missed inbound calls that haven't been followed up on yet
-    (no outbound call or text to that lead since the missed call). Stays
-    visible until you call or text them back — does not expire with time."""
+    """Missed inbound calls still needing follow-up (latest per lead).
+    Cleared by calling/texting the lead back after the miss, or by a manual
+    'read' mark. A manual 'unread' mark newer than the clear resurfaces it.
+    Never expires with time or by merely viewing it."""
     with get_conn(db_path) as conn:
         rows = conn.execute(
             """SELECT i.id, i.lead_id, i.content, i.timestamp, l.name, l.status, l.phone
@@ -686,16 +747,31 @@ def fetch_unacknowledged_missed_calls(db_path: Path = DB_PATH) -> list[dict[str,
                JOIN leads l ON l.id = i.lead_id
                WHERE i.type='note' AND i.direction='inbound'
                  AND i.content LIKE 'Missed inbound call%'
-                 AND NOT EXISTS (
-                     SELECT 1 FROM interactions o
-                     WHERE o.lead_id = i.lead_id
-                       AND o.direction='outbound'
-                       AND o.type IN ('call', 'text')
-                       AND o.timestamp > i.timestamp
-                 )
                ORDER BY i.timestamp DESC""",
         ).fetchall()
-    return [_to_dict(r) for r in rows]
+        outs = conn.execute(
+            """SELECT lead_id, MAX(timestamp) AS t FROM interactions
+               WHERE direction='outbound' AND type IN ('call','text')
+               GROUP BY lead_id""",
+        ).fetchall()
+    last_out = {r["lead_id"]: r["t"] for r in outs}
+    marks = fetch_thread_marks(db_path)
+    visible: list[dict[str, Any]] = []
+    seen_leads: set = set()
+    for r in rows:                       # newest-first → first hit per lead is its latest miss
+        lid = r["lead_id"]
+        if lid in seen_leads:
+            continue
+        seen_leads.add(lid)
+        m = marks.get((lid, "call"))
+        read_ts = m["updated_at"] if m and m["state"] == "read" else ""
+        unread_ts = m["updated_at"] if m and m["state"] == "unread" else ""
+        cleared = max(last_out.get(lid) or "", read_ts)
+        if unread_ts and unread_ts >= cleared:
+            visible.append(_to_dict(r))
+        elif not cleared or r["timestamp"] > cleared:
+            visible.append(_to_dict(r))
+    return visible
 
 
 def add_unmatched_message(

@@ -87,6 +87,10 @@ def _prune_claims() -> None:
 _multi_batches: dict[str, dict] = {}
 _batch_lock = threading.Lock()
 
+# Serializes caller-ID pick + daily-counter reservation so two agents firing
+# batches at the same moment can never oversubscribe a number's hard cap.
+_pool_pick_lock = threading.Lock()
+
 
 def normalize_phone(raw: str) -> str | None:
     digits = re.sub(r"\D", "", raw or "")
@@ -413,16 +417,18 @@ def voice_browser_connect():
     conference = request.form.get("conference", "")
     if conference:
         log.info(f"Browser joining conference: {conference}")
-        # startConferenceOnEnter=false: the agent WAITS (hearing ringback via
-        # waitUrl) until a lead answers. The winner joins with start=true,
-        # which stops the ringback and bridges the audio. With start=true here
-        # the conference started instantly with the agent alone in it, and
-        # Twilio never plays wait music in a started conference → dead silence.
+        # The agent STARTS the room; the winner joins the already-live room.
+        # Ringing feedback is played by the softphone itself (browser-side
+        # audio loop) — NOT via waitUrl: a start=false wait state allowed the
+        # winner to start a SECOND lifecycle of the same conference name when
+        # the agent's leg raced/dropped, leaving the agent hearing ringback
+        # while the lead spoke into an empty room ("connected but kept
+        # ringing", seen twice on 2026-07-09).
         twiml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<Response><Dial>'
-            f'<Conference startConferenceOnEnter="false" endConferenceOnExit="true"'
-            f' waitUrl="{PUBLIC_BASE_URL}/voice/wait-music" beep="false">{conference}</Conference>'
+            f'<Conference startConferenceOnEnter="true" endConferenceOnExit="true"'
+            f' waitUrl="" beep="false">{conference}</Conference>'
             '</Dial></Response>'
         )
         return Response(twiml, mimetype="text/xml")
@@ -550,7 +556,13 @@ def _start_multi_batch(agent: str, lead_ids: list[int], amd: bool = True) -> str
                 with _batch_lock:
                     batch["resolved_count"] += 1
                 continue
-            frm = caller_id_pool.pick_number(lead["phone"], DB_PATH, exclude=used_numbers)
+            # Atomic pick + reserve: the daily counter is incremented the
+            # moment the number is chosen, inside the lock, so a second
+            # agent's batch running concurrently sees the slot as taken.
+            with _pool_pick_lock:
+                frm = caller_id_pool.pick_number(lead["phone"], DB_PATH, exclude=used_numbers)
+                if frm:
+                    db.increment_caller_calls(frm, DB_PATH)
             if not frm:
                 # HARD LIMIT: the pool is at its daily caps. NEVER overflow
                 # onto the established texting numbers for cold multi-dial —
@@ -582,7 +594,7 @@ def _start_multi_batch(agent: str, lead_ids: list[int], amd: bool = True) -> str
                 with _batch_lock:
                     batch["call_sids"][lid] = call.sid
                     batch["from_numbers"][lid] = frm
-                db.increment_caller_calls(frm, DB_PATH)
+                # (daily counter already reserved at pick time, under the lock)
                 caller_id_pool.record_placed(frm)
                 log.info(f"Multi-dial [{batch_id}] → {lead['name']} ({phone}) from {frm} SID={call.sid}")
             except Exception as exc:
@@ -630,12 +642,21 @@ def dialer_agent_ready(batch_id: str):
         resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Access-Control-Allow-Headers"] = "*"
         return resp
+    # Exactly ONE softphone may own a batch: the first to report ready wins.
+    # A second popup (e.g. two browsers logged in as the same agent) gets
+    # owner=false and backs out instead of double-joining the conference.
+    data = request.get_json(force=True, silent=True) or {}
+    token = data.get("token") or ""
+    owner = False
     with _batch_lock:
         batch = _multi_batches.get(batch_id)
-        if batch and not batch.get("agent_ready"):
-            batch["agent_ready"] = True
-            log.info(f"Multi [{batch_id}] softphone joined — releasing calls")
-    resp = jsonify({"ok": True})
+        if batch:
+            if not batch.get("agent_ready"):
+                batch["agent_ready"] = True
+                batch["agent_token"] = token
+                log.info(f"Multi [{batch_id}] softphone joined — releasing calls")
+            owner = (batch.get("agent_token") == token)
+    resp = jsonify({"ok": True, "owner": owner})
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
@@ -929,6 +950,9 @@ _DISPOSITIONS = {
     # Reached the right person but they sold the property. Terminal — never
     # auto re-queued. (Status stays as-is; mark the lead dead on its page.)
     "No Longer Owns": ("Call - no longer owns the property", None),
+    # Live person answered, heard the agent, hung up (screen-out). The number
+    # is good and they answer — retry in 2 days, ideally same caller ID.
+    "Hung Up":        ("Call - answered, hung up quickly", 2),
 }
 
 
@@ -1367,6 +1391,7 @@ def softphone_page():
     <button class="disp-btn" onclick="dispose('Wrong Number')">Wrong Number</button>
     <button class="disp-btn" onclick="dispose('Dead Air')">🔇 Dead Air</button>
     <button class="disp-btn" onclick="dispose('No Longer Owns')">🚫 No Longer Owns</button>
+    <button class="disp-btn" onclick="dispose('Hung Up')">📴 Hung Up</button>
   </div>
   <div id="statusSection">
     <div class="disp-title" style="margin-top:10px">Set lead status</div>
@@ -1446,7 +1471,7 @@ def softphone_page():
   let statusSaved = false;              // this call's hot/warm/cold was set
   let lastOutcomeNoStatus = false;      // outcome that needs no temperature
   // Outcomes where there's no temperature to set — advance right after saving.
-  var NO_STATUS_OUTCOMES = ['Wrong Number', 'No Answer', 'Voicemail', 'Dead Air', 'No Longer Owns'];
+  var NO_STATUS_OUTCOMES = ['Wrong Number', 'No Answer', 'Voicemail', 'Dead Air', 'No Longer Owns', 'Hung Up'];
 
   // Which agent this popup belongs to (rom / gabby). Each agent's popup polls
   // its own dial channel and registers its own Twilio identity.
@@ -1496,6 +1521,25 @@ def softphone_page():
   let lastDialTs = null;
   let currentBatchId = null;
   let batchPollInterval = null;
+  let joinToken = '';               // per-join ownership token (agent-ready)
+
+  // Browser-side ringback: plays in the popup while lines ring, stops the
+  // instant a lead connects (or the batch ends). Twilio-side wait music was
+  // removed — it required a passive conference join that could double-create
+  // the room and strand the agent.
+  var ringAudio = null;
+  function startRinging() {
+    try {
+      if (!ringAudio) { ringAudio = new Audio('/static/ringback.wav'); ringAudio.loop = true; }
+      ringAudio.currentTime = 0;
+      ringAudio.play().catch(function() {
+        logMsg('Ring sound blocked by browser — click 🔊 Test once to enable audio.');
+      });
+    } catch (e) {}
+  }
+  function stopRinging() {
+    try { if (ringAudio) ringAudio.pause(); } catch (e) {}
+  }
 
   // Auto-retry-once state (absorbs transient funnel 502s without double-dialing)
   let acceptedFired = false;     // did this call ever connect to a human?
@@ -1521,7 +1565,21 @@ def softphone_page():
       acceptedFired = true;
       if (currentBatchId) {
         // Agent is now in the conference — tell the server to fire the calls.
-        fetch('/dialer/agent-ready/' + currentBatchId, { method: 'POST' }).catch(function(){});
+        // The token makes ownership exclusive: if another softphone (same
+        // agent in two browsers) got there first, we back out immediately
+        // instead of double-joining the room.
+        fetch('/dialer/agent-ready/' + currentBatchId, { method: 'POST',
+          body: JSON.stringify({ token: joinToken }) })
+          .then(function(r) { return r.json(); })
+          .then(function(j) {
+            if (j && j.owner === false) {
+              logMsg('Another softphone (same agent) owns this batch — backing out.');
+              setStatus('Batch taken by your other softphone window', 'ended');
+              stopRinging();
+              if (device) device.disconnectAll();
+            }
+          })
+          .catch(function(){});
         logMsg('In the room — firing lines...');
       } else {
         setStatus('Connected', 'connected');
@@ -1570,6 +1628,7 @@ def softphone_page():
     currentBatchId = null;
     muted = false;
     stopTimer();
+    stopRinging();
     if (batchPollInterval) { clearInterval(batchPollInterval); batchPollInterval = null; }
     btnCall.disabled = false;
     btnHangup.disabled = true;
@@ -1616,7 +1675,7 @@ def softphone_page():
   }
 
   // Outcomes that don't need a hot/warm/cold temperature — just log and move on.
-  var TERMINAL_OUTCOMES = ['Wrong Number', 'Dead Air', 'No Longer Owns'];
+  var TERMINAL_OUTCOMES = ['Wrong Number', 'Dead Air', 'No Longer Owns', 'Hung Up'];
   function showSaved(part) {
     savedParts.push(part);
     dispDoneEl.textContent = '✓ Saved: ' + savedParts.join('  ·  ');
@@ -1692,6 +1751,17 @@ def softphone_page():
     btnQAuto.textContent = autoAdvance ? '⏸ Auto: ON' : '▶ Auto: OFF';
   }
 
+  // Reopening the popup mid-queue resumes dialing automatically — no need
+  // to hit Next. Fires once per popup load; a batch already ringing just
+  // returns 'busy' harmlessly (and the /dialer/current poll rejoins it).
+  var autoResumed = false;
+  function maybeAutoResume() {
+    if (autoResumed || !queueActive || call || !deviceReady || !autoAdvance) return;
+    autoResumed = true;
+    logMsg('Queue is active — resuming automatically...');
+    scheduleNext(1500, 'Resuming queue');
+  }
+
   function refreshQueue() {
     fetch('/dialer/queue/status?agent=' + AGENT)
       .then(function(r) { return r.json(); })
@@ -1699,6 +1769,7 @@ def softphone_page():
         queueActive = !!j.active;
         if (j.active) { queueRemaining = j.remaining; queueTotal = j.total; }
         updateQueueBar();
+        maybeAutoResume();
       })
       .catch(function() {});
   }
@@ -1881,10 +1952,12 @@ def softphone_page():
     dispBatchId = data.batch_id;
     lastCallDuration = 0;
     currentBatchId = data.batch_id;
+    joinToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
     nameEl.textContent = data.lines + ' lines ringing...';
     phoneEl.textContent = '';
     timerEl.textContent = '00:00';
     setStatus('Ringing ' + data.lines + ' leads — waiting for first answer', 'ringing');
+    startRinging();
     btnCall.disabled = true;
     btnHangup.disabled = false;
     btnMute.disabled = false;
@@ -1905,6 +1978,7 @@ def softphone_page():
         .then(function(r) { return r.json(); })
         .then(function(b) {
           if (b.status === 'connected' && b.winner_name) {
+            stopRinging();
             nameEl.textContent = b.winner_name;
             phoneEl.textContent = b.winner_phone || '';
             currentLeadId = b.winner || null;   // dispose the winning lead
