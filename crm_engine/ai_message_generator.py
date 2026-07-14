@@ -104,6 +104,49 @@ def _build_conversation_text(conversation: list[dict], max_msgs: int = 20) -> st
     return "\n".join(lines) if lines else "No prior conversation."
 
 
+NOTE_SYSTEM_PROMPT = """You are the note-taker for a real-estate wholesaling CRM.
+After every text message (either direction), you write ONE short internal note
+for the lead's file so anyone glancing at it later understands the state of play.
+
+Format — exactly three lines, plain text, no markdown, no preamble:
+Said: <what the new message says / actually means in context — 1 short sentence>
+Change: <what this changes: temperature, timeline, price talk, motivation — or "nothing new">
+Next: <the single best next move and roughly when>
+
+Whole note under 55 words. Be concrete — use names, addresses, and numbers ONLY
+if they appear verbatim in the conversation above; NEVER write a phone number,
+address, price, or date that isn't literally in the conversation. If the message
+is trivial (ok / thumbs up), say so plainly and keep Next short."""
+
+
+def generate_interaction_note(lead: dict, conversation: list[dict],
+                              latest_content: str, direction: str) -> str:
+    """AI auto-note logged after every text: what was said, what it changes,
+    what to do next. Returns '' on any failure — a broken note generator must
+    never affect texting itself. ~$0.002 per note on Haiku."""
+    convo_text = _build_conversation_text(conversation, max_msgs=12)
+    who = "the SELLER texted US" if direction == "inbound" else "WE texted the seller"
+    user_msg = f"""LEAD: {lead.get('name', 'Unknown')} — status {lead.get('status', '?')}, motivation {lead.get('motivation_score', '?')}/10
+CONTEXT: {(lead.get('timeline') or 'unknown')[:250]}
+
+RECENT CONVERSATION:
+{convo_text}
+
+NEW MESSAGE ({who}): {latest_content[:400]}
+
+Write the note."""
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=120,
+            system=NOTE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        return (resp.content[0].text or "").strip()
+    except Exception:
+        return ""
+
+
 def _strip_ai_tells(text: str) -> str:
     """Hard-strip dashes/AI-giveaway punctuation, even if the model ignores instructions."""
     # Em dash (U+2014), en dash (U+2013), horizontal bar (U+2015) — explicit codepoints

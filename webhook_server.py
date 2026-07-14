@@ -36,7 +36,7 @@ load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 from crm_engine import db
 from crm_engine import caller_id_pool
-from crm_engine.messaging_gateway import place_call_number
+from crm_engine.messaging_gateway import place_call_number, auto_note_after_text
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -192,6 +192,10 @@ def inbound_sms():
         conn.execute(
             "DELETE FROM followup_suggestions WHERE lead_id=?", (lead["id"],)
         )
+
+    # AI auto-note: what they said, what it changes, next move (background).
+    threading.Thread(target=auto_note_after_text, args=(lead["id"], DB_PATH),
+                     daemon=True).start()
 
     log.info(f"Saved inbound text from {lead['name']} ({phone}): {body[:60]}")
     return _twiml_response()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -114,6 +115,29 @@ def place_call_number(to_number: str, from_number: str = "") -> dict:
         return {"called": False, "error": str(exc)}
 
 
+def auto_note_after_text(lead_id: int, db_path: Path = db.DB_PATH) -> None:
+    """AI auto-note on the latest text (either direction): what was said,
+    what it changes, and the next move — logged as a 🤖 note on the lead.
+    Called in a background thread after every inbound/outbound text; any
+    failure is swallowed so note-taking can never break texting."""
+    try:
+        from .ai_message_generator import generate_interaction_note
+        lead = db.fetch_lead(lead_id, db_path)
+        if not lead:
+            return
+        ixns = db.fetch_interactions(lead_id, db_path)
+        texts = [i for i in ixns if i["type"] == "text"]
+        if not texts:
+            return
+        latest = max(texts, key=lambda x: x["timestamp"])
+        note = generate_interaction_note(lead, ixns, latest["content"], latest["direction"])
+        if note:
+            db.add_interaction(lead_id, "note", "🤖 " + note, "outbound",
+                               db_path, ts=datetime.utcnow())
+    except Exception:
+        pass
+
+
 def send_sms(lead_id: int, message: str, db_path: Path = db.DB_PATH) -> dict:
     """Send an SMS via Twilio and log it as an outbound interaction."""
     clean_message = message.strip()
@@ -162,5 +186,9 @@ def send_sms(lead_id: int, message: str, db_path: Path = db.DB_PATH) -> dict:
             },
             db_path,
         )
+        # AI auto-note (what we said / what changed / next move) — background
+        # thread so the send returns instantly.
+        threading.Thread(target=auto_note_after_text, args=(lead_id, db_path),
+                         daemon=True).start()
 
     return {"lead_id": lead_id, "sent": sent, "message": clean_message, "error": error_msg}
