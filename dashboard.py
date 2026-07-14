@@ -1766,6 +1766,19 @@ elif page == "followups":
                 st.markdown(f"**{item['lead_name']}**")
             st.caption(f"Phone: {lead.get('phone', 'N/A')}  ·  {address}")
 
+            # They CALLED you and you haven't called back — a text reply is
+            # the wrong move. Uses the persistent missed-call state, so this
+            # clears the moment you call them back (or hit Mark read).
+            if any(m["lead_id"] == lid for m in _missed_calls_open):
+                st.markdown(
+                    "<div class='sl-flag' style='border-color:#e74c3c;"
+                    "color:#c0392b;background:#fdecea;font-weight:700'>"
+                    "📞 This lead CALLED YOU and you haven't called back — "
+                    "call them instead of texting. A caller is hotter than a "
+                    "texter; don't downgrade the conversation.</div>",
+                    unsafe_allow_html=True,
+                )
+
             # First text from this number → make sure the draft says who you
             # are and that this is the new number (the AI is instructed too).
             _never_texted = not any(
