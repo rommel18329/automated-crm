@@ -14,6 +14,7 @@ Set Twilio Voice webhook URL to: https://<your-url>/voice/incoming
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -1172,7 +1173,35 @@ def _claim_leads(agent: str, candidates: list[int], count: int) -> tuple[list[in
 # The dashboard loads a whole list here ONCE; from then on the softphone popup
 # drives itself: dispose → /dialer/queue/next → next batch fires → repeat.
 # The agent never has to switch back to the CRM between calls.
+# Persisted to disk on every change so a webhook restart mid-session can't
+# eat the remaining list (batches/claims are transient and rebuild fine).
 _dial_queues: dict[str, dict] = {}   # agent -> {pending, total, lines, amd}
+_QUEUE_STATE = PROJECT_ROOT / "dial_queue_state.json"
+
+
+def _save_queues() -> None:
+    try:
+        _QUEUE_STATE.write_text(json.dumps(_dial_queues))
+    except Exception:
+        pass
+
+
+def _load_queues() -> None:
+    try:
+        if _QUEUE_STATE.exists():
+            data = json.loads(_QUEUE_STATE.read_text())
+            for agent, q in data.items():
+                if q.get("pending"):
+                    _dial_queues[agent] = q
+            if _dial_queues:
+                log.info("Restored dial queues after restart: "
+                         + ", ".join(f"{a}={len(q['pending'])} left"
+                                     for a, q in _dial_queues.items()))
+    except Exception as exc:
+        log.warning(f"Could not restore dial queues: {exc}")
+
+
+_load_queues()
 
 
 def _cors(resp):
@@ -1205,12 +1234,14 @@ def _requeue_leads(agent: str, lead_ids: list[int]) -> None:
     counts = q.setdefault("requeued", {})
     back = []
     for lid in lead_ids:
-        if counts.get(lid, 0) < 2 and lid not in q["pending"]:
-            counts[lid] = counts.get(lid, 0) + 1
+        # str keys: survives the JSON round-trip of queue persistence
+        if counts.get(str(lid), 0) < 2 and lid not in q["pending"]:
+            counts[str(lid)] = counts.get(str(lid), 0) + 1
             back.append(lid)
     if back:
         q["pending"] = back + q["pending"]
         log.info(f"Queue [{agent}]: requeued {len(back)} ringing casualties {back}")
+    _save_queues()
 
 
 def _queue_next(agent: str) -> dict:
@@ -1267,6 +1298,7 @@ def dialer_queue_start():
     _dial_queues[agent] = {"pending": lead_ids, "total": len(lead_ids),
                            "lines": lines, "amd": bool(data.get("amd", True))}
     result = _queue_next(agent)
+    _save_queues()
     log.info(f"Queue [{agent}]: loaded {len(lead_ids)} leads × {lines} lines")
     return _cors(jsonify(result))
 
@@ -1278,7 +1310,9 @@ def dialer_queue_next():
         return _cors(Response(""))
     data = request.get_json(force=True, silent=True) or {}
     agent = (data.get("agent") or "rom").lower()
-    return _cors(jsonify(_queue_next(agent)))
+    result = _queue_next(agent)
+    _save_queues()
+    return _cors(jsonify(result))
 
 
 @app.route("/dialer/queue/status")
@@ -1306,6 +1340,7 @@ def dialer_queue_stop():
     data = request.get_json(force=True, silent=True) or {}
     agent = (data.get("agent") or "rom").lower()
     _dial_queues.pop(agent, None)
+    _save_queues()
     log.info(f"Queue [{agent}]: stopped")
     return _cors(jsonify({"ok": True}))
 
@@ -1888,12 +1923,14 @@ def softphone_page():
     nextTimer = setTimeout(function() { nextTimer = null; doNext(); }, ms);
   }
 
+  var nextRetries = 0;
   function doNext() {
     if (nextTimer) { clearTimeout(nextTimer); nextTimer = null; }
     if (call) { logMsg('Still on a call — hang up first.'); return; }
     fetch('/dialer/queue/next', { method: 'POST', body: JSON.stringify({ agent: AGENT }) })
       .then(function(r) { return r.json(); })
       .then(function(j) {
+        nextRetries = 0;
         if (j.error === 'busy') { logMsg('A batch is already ringing.'); return; }
         if (j.error === 'pool_exhausted') {
           setStatus('🛑 Daily dial limit reached — queue paused until tomorrow', 'error');
@@ -1911,7 +1948,22 @@ def softphone_page():
         logMsg('Queue: next batch fired (' + j.remaining + ' left after this)');
         // The /dialer/current poll sees the new batch and joins its conference.
       })
-      .catch(function(e) { logMsg('Queue next failed: ' + e); });
+      .catch(function(e) {
+        // Backend hiccup (restart / tunnel blip / empty response). Never
+        // freeze the queue on one bad response — back off and retry, then
+        // hand control back to the agent with a clear message.
+        nextRetries += 1;
+        if (nextRetries <= 3) {
+          var wait = 2000 * nextRetries;
+          setStatus('Backend hiccup — retrying in ' + (wait / 1000) + 's… (' + nextRetries + '/3)', 'connecting');
+          logMsg('Queue next failed (' + e + ') — retry ' + nextRetries + '/3');
+          nextTimer = setTimeout(function() { nextTimer = null; doNext(); }, wait);
+        } else {
+          nextRetries = 0;
+          setStatus('⚠️ Queue paused — backend unreachable. Hit ⏭ Next to resume.', 'error');
+          logMsg('Queue next failed 3x — paused. Your list is safe; hit Next to retry.');
+        }
+      });
   }
 
   function queueDone() {
