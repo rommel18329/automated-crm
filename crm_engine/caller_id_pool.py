@@ -25,7 +25,11 @@ from . import db
 WARMUP_SCHEDULE = [(2, 10), (4, 15), (7, 25), (10, 40)]
 WARMUP_DAYS = 10          # real dialing days needed to graduate to full cap
 WARMUP_DAILY_CAP = 10     # hard cap on a brand-new number (stage 1)
-MIN_CALLS_WARMUP_DAY = 5  # a day advances warm-up only at >= this volume
+MIN_CALLS_WARMUP_DAY = 5  # absolute floor for a day to advance warm-up
+ADVANCE_FRACTION = 0.6    # ...and it must carry >=60% of its current stage cap
+                          # that day. Prevents trickle-graduation: a number
+                          # can't earn a 50/day cap on 5-call days and then
+                          # spike 10x — the very pattern carrier ML flags.
 
 # Answer-rate detection: if a number with enough volume drops below this fraction
 # of the pool's median answer rate, treat it as a likely flag.
@@ -84,13 +88,34 @@ def answer_rate(phone_number: str) -> float | None:
 
 # ── Rotation ────────────────────────────────────────────────────────────────
 
+def advance_requirement(days_completed: int) -> int:
+    """Calls a number must place in a day for that day to advance its
+    warm-up, given how far along it already is: at least the floor, and at
+    least ADVANCE_FRACTION of its current stage cap (10→6, 15→9, 25→15,
+    40→24). Graduation therefore reflects genuinely carried volume."""
+    cap = _stage_cap(days_completed)
+    if cap is None:
+        return MIN_CALLS_WARMUP_DAY
+    return max(MIN_CALLS_WARMUP_DAY, int(cap * ADVANCE_FRACTION))
+
+
 def _warmup_days_completed(phone_number: str, stats: dict | None = None) -> int:
-    """Count past days (before today) where this number placed enough calls
-    (MIN_CALLS_WARMUP_DAY) to advance its warm-up. Idle days don't count."""
+    """Walk the number's real dialing history (past days only, in order) and
+    count the days that advanced its warm-up: each day must meet the volume
+    requirement of the stage the number was at ON THAT DAY. Idle days and
+    trickle days advance nothing; calendar time alone never graduates."""
     s = (stats if stats is not None else _load_stats()).get(phone_number) or {}
+    daily = s.get("daily") or {}
     today = date.today().isoformat()
-    return sum(1 for d, c in (s.get("daily") or {}).items()
-               if d < today and c >= MIN_CALLS_WARMUP_DAY)
+    days_done = 0
+    for d in sorted(daily):
+        if d >= today:
+            continue
+        if _stage_cap(days_done) is None:
+            break                          # already fully graduated
+        if daily[d] >= advance_requirement(days_done):
+            days_done += 1
+    return days_done
 
 
 def _stage_cap(days_completed: int) -> int | None:

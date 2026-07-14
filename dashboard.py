@@ -2763,10 +2763,11 @@ elif page == "caller_health":
                 _warm_note = ""
                 if num["status"] == "warming":
                     # Usage-based: a warm-up day only counts once the number
-                    # placed enough real calls that day. Idle days don't count.
+                    # carried enough volume for its current stage that day.
                     _days_done = caller_id_pool._warmup_days_completed(phone)
+                    _req = caller_id_pool.advance_requirement(_days_done)
                     _warm_note = (f" · warm-up day {_days_done + 1}/{caller_id_pool.WARMUP_DAYS}"
-                                  f" · needs {caller_id_pool.MIN_CALLS_WARMUP_DAY}+ calls/day to advance")
+                                  f" · needs {_req}+ calls today to advance")
                 st.caption(f"Area {num['area_code']}{_warm_note}")
             with c2:
                 _eff_cap = caller_id_pool._effective_cap(num)
@@ -2793,9 +2794,11 @@ elif page == "caller_health":
             "- **Daily caps:** 50 calls/number fully warmed — a hard limit; the "
             "dialer stops for the day rather than exceed it.\n"
             "- **Warm-up (usage-based):** a number advances only on days it "
-            "actually dials 5+ calls. Ramp: 10/day → 15 → 25 → 40 → 50 across "
-            "10 real dialing days. Idle days don't count — sitting unused "
-            "doesn't warm a number.\n"
+            "carries real volume — at least 60% of its current stage cap "
+            "(10/day needs 6+, 15 needs 9+, 25 needs 15+, 40 needs 24+). "
+            "Ramp: 10/day → 15 → 25 → 40 → 50 across 10 qualifying dialing "
+            "days. Idle or trickle days don't count — neither calendar time "
+            "nor token dialing warms a number.\n"
             "- **Detection:** answer rate is tracked per number; a sudden crater vs. "
             "the pool median flags a likely carrier block, and the number is pulled.\n"
             "- **Proactive registration:** run `python register_voice_integrity.py` to "
