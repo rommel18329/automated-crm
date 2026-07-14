@@ -710,6 +710,13 @@ def _finalize_winner(batch_id: str, batch: dict, lead_id: int, call_sid: str | N
                 pass
             with _batch_lock:
                 batch["dropped"].append(lid)
+        # The killed lines never got their shot (they were still ringing when
+        # the winner connected — which may have been a voicemail). Put them
+        # back at the FRONT of the agent's queue so they're redialed within
+        # minutes instead of falling through until tomorrow.
+        with _batch_lock:
+            requeue = [l for l in batch["dropped"] if l not in batch["machines"]]
+        _requeue_leads(batch.get("agent", ""), requeue)
 
     threading.Thread(target=_kill_others, daemon=True).start()
     log.info(f"Multi [{batch_id}] WINNER: lead {lead_id} ({batch['winner_name']})")
@@ -1183,6 +1190,29 @@ def _agent_batch_busy(agent: str) -> bool:
         )
 
 
+def _requeue_leads(agent: str, lead_ids: list[int]) -> None:
+    """Return un-dialed batch casualties (lines killed while still ringing)
+    to the FRONT of the agent's queue and release their claims, so a batch
+    'won' by a voicemail doesn't cost the other nine leads their shot today.
+    Capped at 2 requeues per lead per queue so nobody's phone rings all
+    morning; leads past the cap simply wait for tomorrow's list."""
+    with _batch_lock:
+        for lid in lead_ids:
+            _lead_claims.pop(lid, None)
+    q = _dial_queues.get(agent)
+    if not q or not lead_ids:
+        return
+    counts = q.setdefault("requeued", {})
+    back = []
+    for lid in lead_ids:
+        if counts.get(lid, 0) < 2 and lid not in q["pending"]:
+            counts[lid] = counts.get(lid, 0) + 1
+            back.append(lid)
+    if back:
+        q["pending"] = back + q["pending"]
+        log.info(f"Queue [{agent}]: requeued {len(back)} ringing casualties {back}")
+
+
 def _queue_next(agent: str) -> dict:
     """Claim the next batch off the agent's queue and fire it."""
     q = _dial_queues.get(agent)
@@ -1492,7 +1522,7 @@ def softphone_page():
   let statusSaved = false;              // this call's hot/warm/cold was set
   let lastOutcomeNoStatus = false;      // outcome that needs no temperature
   // Outcomes where there's no temperature to set — advance right after saving.
-  var NO_STATUS_OUTCOMES = ['Wrong Number', 'No Answer', 'Voicemail', 'Dead Air', 'No Longer Owns', 'Hung Up'];
+  var NO_STATUS_OUTCOMES = ['Wrong Number', 'No Answer', 'Voicemail', 'Dead Air', 'No Longer Owns', 'Hung Up', 'Not Interested'];
 
   // Which agent this popup belongs to (rom / gabby). Each agent's popup polls
   // its own dial channel and registers its own Twilio identity.
@@ -1744,7 +1774,7 @@ def softphone_page():
   }
 
   // Outcomes that don't need a hot/warm/cold temperature — just log and move on.
-  var TERMINAL_OUTCOMES = ['Wrong Number', 'Dead Air', 'No Longer Owns', 'Hung Up'];
+  var TERMINAL_OUTCOMES = ['Wrong Number', 'Dead Air', 'No Longer Owns', 'Hung Up', 'Not Interested'];
   function showSaved(part) {
     savedParts.push(part);
     dispDoneEl.textContent = '✓ Saved: ' + savedParts.join('  ·  ');
