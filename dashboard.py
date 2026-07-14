@@ -1766,6 +1766,20 @@ elif page == "followups":
                 st.markdown(f"**{item['lead_name']}**")
             st.caption(f"Phone: {lead.get('phone', 'N/A')}  ·  {address}")
 
+            # First text from this number → make sure the draft says who you
+            # are and that this is the new number (the AI is instructed too).
+            _never_texted = not any(
+                h.get("type") == "text" and h.get("direction") == "outbound"
+                for h in history
+            )
+            if _never_texted:
+                st.markdown(
+                    "<div class='sl-flag'>📱 First text from this number — the "
+                    "draft should say who you are + that this is your new number. "
+                    "Double-check before sending.</div>",
+                    unsafe_allow_html=True,
+                )
+
             if flags:
                 for flag in flags:
                     st.markdown(f"<div class='sl-flag'>{flag}</div>",
@@ -2022,6 +2036,10 @@ elif page == "messages":
 
                 # Compose row
                 st.markdown("---")
+                if not any(i.get("type") == "text" and i.get("direction") == "outbound"
+                           for i in _convo_items):
+                    st.caption("📱 First text to this lead from this number — say who you "
+                               "are and that this is your new number they can save.")
                 _compose_key = f"msg_compose_{_sel_lid}"
                 _msg_text = st.text_area(
                     "Compose",

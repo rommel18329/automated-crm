@@ -156,6 +156,23 @@ def generate_message(
 
     extra_block = f"\nADDITIONAL CONTEXT FROM AGENT: {extra_context.strip()}" if extra_context and extra_context.strip() else ""
 
+    # First text ever sent to this lead from our number: they won't recognize
+    # it (they know us from calls, Facebook, or an older number), so the
+    # message MUST identify the sender and flag this as the new/office number.
+    has_texted_before = any(
+        m.get("type", "text") == "text" and m.get("direction") == "outbound"
+        for m in conversation
+    )
+    new_number_note = ""
+    if not has_texted_before:
+        new_number_note = (
+            "\n⚠️ FIRST TEXT FROM THIS NUMBER: this lead has NEVER received a text "
+            "from this number. You MUST naturally work in (1) who this is, by name, "
+            "and (2) that this is your new number they can reach you at / save. "
+            "Example vibe: \"It's Rom by the way, this is my new office number, "
+            "feel free to save it.\" Keep it casual, not robotic."
+        )
+
     user_msg = f"""LEAD PROFILE:
 - Name: {lead.get('name', 'Unknown')}
 - Status: {lead.get('status', 'warm')}
@@ -165,7 +182,7 @@ def generate_message(
 - Deal stage: {lead.get('conversation_stage', 'unknown').replace('_', ' ')}
 
 OBJECTIVE: {objective}
-STRATEGY: {strategy}{gap_note}{extra_block}
+STRATEGY: {strategy}{gap_note}{new_number_note}{extra_block}
 
 CONVERSATION HISTORY (oldest → newest):
 {convo_text}
