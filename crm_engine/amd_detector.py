@@ -33,6 +33,15 @@ BEEP_MIN_HZ, BEEP_MAX_HZ = 500.0, 2200.0
 BEEP_DOMINANCE = 0.55          # fraction of spectral energy in the peak => tonal
 BEEP_RUN_WINDOWS = 5           # consecutive tonal windows (~100 ms) => beep
 
+# Live-bridge mode (the instant-connect dialer): the agent is ALREADY talking
+# to whoever answered, so speech-pattern rules are meaningless — conversation,
+# background noise, and far-end echo of the agent's own voice all read as
+# "continuous speech" (which got two real people hung up on, 2026-07-09).
+# The ONLY machine signal trusted on a live call is the voicemail BEEP, held
+# a bit longer so hold-music notes can't fake it.
+LIVE_DECISION_TIMEOUT = 25.0   # listen this long for a beep, then 'unknown'
+LIVE_BEEP_RUN_WINDOWS = 10     # ~200 ms sustained tone required in live mode
+
 _BIAS = 0x84
 
 
@@ -51,7 +60,10 @@ class AmdClassifier:
     """Feed audio chunks; returns 'human' / 'machine' / 'unknown' once, then
     keeps returning the same verdict. Returns None while undecided."""
 
-    def __init__(self) -> None:
+    def __init__(self, live_call: bool = True) -> None:
+        # live_call=True (the instant-bridge dialer, now the only flow):
+        # beep-only machine detection. False = legacy screen-first heuristics.
+        self.live_call = live_call
         self.verdict: str | None = None
         self.reason: str = ""
         self.t = 0.0                    # seconds of audio processed
@@ -107,11 +119,19 @@ class AmdClassifier:
                 lo, hi = max(0, peak_i - 2), peak_i + 3
                 dominance = float(power[lo:hi].sum()) / total
                 self._beep_run = self._beep_run + 1 if dominance >= BEEP_DOMINANCE else 0
-                if self._beep_run >= BEEP_RUN_WINDOWS:
+                _need = LIVE_BEEP_RUN_WINDOWS if self.live_call else BEEP_RUN_WINDOWS
+                if self._beep_run >= _need:
                     self._decide("machine", "beep")
                     return
         else:
             self._beep_run = 0
+
+        if self.live_call:
+            # Live bridged call: NO speech-pattern verdicts — the beep above
+            # is the only kill signal. Time out quietly to 'unknown'.
+            if self.t >= LIVE_DECISION_TIMEOUT:
+                self._decide("unknown", "timeout (live)")
+            return
 
         speech = rms > self._threshold()
         if speech:

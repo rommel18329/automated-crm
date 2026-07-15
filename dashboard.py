@@ -2631,10 +2631,12 @@ elif page == "dialer":
                 _amd_on = st.checkbox(
                     "⚡ Instant connect + auto-skip voicemails (AMD)", value=True, key="dialer_amd",
                     help="You're bridged the moment someone picks up — you hear the "
-                         "real first hello, zero screening delay. AMD listens alongside: "
-                         "if a voicemail greeting emerges, the line is hung up (~3s in), "
-                         "auto-logged as 'Voicemail (auto)', and the queue dials the "
-                         "next batch. A human can never be delayed or dropped.",
+                         "real first hello, zero screening delay. AMD listens alongside "
+                         "for the voicemail BEEP only (speech patterns are never "
+                         "trusted on a live call, so a real person can't be hung up "
+                         "on). On a beep: line hung up, auto-logged 'Voicemail (auto)', "
+                         "next batch dials. VM greetings without a quick beep — just "
+                         "tap 📴 Voicemail yourself.",
                 )
                 _remaining = queue[idx:]
                 _batch_size = min(_lines, len(_remaining))

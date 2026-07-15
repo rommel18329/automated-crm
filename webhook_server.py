@@ -868,6 +868,13 @@ def voice_amd_result(batch_id: str, lead_id: int):
         sid = batch["call_sids"].get(lead_id)
         already_winner = batch["winner"] == lead_id
     if result == "machine":
+        # HARD SAFETY GATE: on a live bridged call, only the voicemail BEEP
+        # is a trustworthy machine signal. Speech-pattern verdicts hung up on
+        # two real people (2026-07-09) — never act on them again.
+        if "beep" not in (detail or "").lower():
+            log.warning(f"AMD [{batch_id}] machine verdict IGNORED for lead "
+                        f"{lead_id} (reason '{detail}' is not a beep — live-call safety)")
+            return jsonify({"ok": True, "ignored": True})
         if already_winner:
             _kill_machine_winner(batch_id, batch, lead_id, sid)
         else:
