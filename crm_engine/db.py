@@ -167,6 +167,9 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (lead_id, channel)
             );
+
+            CREATE INDEX IF NOT EXISTS idx_interactions_lead_ts
+                ON interactions(lead_id, timestamp DESC);
             """
         )
         # Migration: add 'investor' to status CHECK (requires table recreation in SQLite)
@@ -604,6 +607,17 @@ def fetch_interactions(lead_id: int, db_path: Path = DB_PATH) -> list[dict[str, 
         rows = conn.execute(
             "SELECT * FROM interactions WHERE lead_id=? ORDER BY timestamp DESC",
             (lead_id,),
+        ).fetchall()
+    return [_to_dict(r) for r in rows]
+
+
+def fetch_all_interactions(db_path: Path = DB_PATH) -> list[dict[str, Any]]:
+    """Every interaction in ONE query (newest first). The dashboard groups
+    them per lead in memory — replaces the one-query-PER-LEAD pattern that
+    ran thousands of queries on every rerun and made each click crawl."""
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM interactions ORDER BY timestamp DESC"
         ).fetchall()
     return [_to_dict(r) for r in rows]
 

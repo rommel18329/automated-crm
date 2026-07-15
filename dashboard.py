@@ -907,6 +907,32 @@ def render_buy_box(lead_id: int, lead: dict) -> None:
         st.rerun()
 
 
+_STATUS_ICONS = {"hot": "🔥", "warm": "🌤", "cold": "❄️", "dead": "⚫",
+                 "contract": "✅", "investor": "💼"}
+
+
+def fmt_local_ts(ts_iso: str) -> str:
+    """UTC-stored timestamp → local human label ('Today 2:31 PM',
+    'Yesterday 4:10 PM', 'Jul 8, 4:10 PM'). Old imported rows that were
+    saved in local wall-clock will read a few hours off — day-level
+    accuracy is what matters for those."""
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromisoformat(ts_iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        loc = dt.astimezone()
+        days_ago = (datetime.now().astimezone().date() - loc.date()).days
+        t = loc.strftime("%I:%M %p").lstrip("0")
+        if days_ago == 0:
+            return f"Today {t}"
+        if days_ago == 1:
+            return f"Yesterday {t}"
+        return f"{loc.strftime('%b')} {loc.day}, {t}"
+    except Exception:
+        return (ts_iso or "")[:16]
+
+
 def lead_conversation_items(lead_id: int) -> list[dict]:
     interactions = db.fetch_interactions(lead_id)
     # Calls and texts only — notes live in the Notes panel, not the conversation
@@ -922,7 +948,8 @@ def auto_save_field(lead_id: int, field: str, key: str) -> None:
     db.update_lead(lead_id, {field: st.session_state[key]})
 
 
-def _build_display_result() -> dict:
+def _build_display_result(leads: list[dict] | None = None,
+                          all_ixns: dict | None = None) -> dict:
     """
     Read-only dashboard data builder.
     Uses DB-stored lead status as source of truth so manual overrides
@@ -930,11 +957,15 @@ def _build_display_result() -> dict:
     engine.evaluate_all_leads() writes suggested_status back to DB on every
     call — this version evaluates for signals/call-list/follow-ups without
     any DB writes.
+    Pass prefetched leads/interactions to avoid re-querying (the startup
+    block loads everything in two queries and shares it here).
     """
     from collections import Counter
 
-    leads = db.fetch_leads()
-    all_ixns: dict = {l["id"]: db.fetch_interactions(l["id"]) for l in leads}
+    if leads is None:
+        leads = db.fetch_leads()
+    if all_ixns is None:
+        all_ixns = {l["id"]: db.fetch_interactions(l["id"]) for l in leads}
     leads_with_eval = [
         (lead, engine.evaluate_lead(lead, all_ixns.get(lead["id"], [])))
         for lead in leads
@@ -1274,16 +1305,23 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
 
 
 st.markdown(THEME_CSS, unsafe_allow_html=True)
-db.init_db()
-result = _build_display_result()
+# Schema setup/migrations once per browser session, not on every click.
+if "db_ready" not in st.session_state:
+    db.init_db()
+    st.session_state["db_ready"] = True
+
+# TWO queries total per rerun (was one query per lead — thousands per click).
 all_leads = get_all_leads()
 lead_lookup = {lead["id"]: lead for lead in all_leads}
+all_interactions = db.fetch_all_interactions()
+_ixns_by_lead: dict[int, list[dict]] = {}
+for _ix in all_interactions:
+    _ixns_by_lead.setdefault(_ix["lead_id"], []).append(_ix)
+result = _build_display_result(all_leads, _ixns_by_lead)
+
 selected_id = st.session_state.get("selected_lead_id")
 if selected_id is not None and selected_id not in lead_lookup:
     st.session_state["selected_lead_id"] = None
-all_interactions = []
-for ld in all_leads:
-    all_interactions.extend(db.fetch_interactions(ld["id"]))
 
 if "page" not in st.session_state:
     st.session_state["page"] = "dashboard"
@@ -2004,6 +2042,8 @@ elif page == "messages":
         if not _lead:
             continue
         _latest = max(_txts, key=lambda x: x["timestamp"])
+        _last_in = max((x["timestamp"] for x in _txts if x["direction"] == "inbound"),
+                       default=None)
         _threads.append({
             "lead_id": _lid,
             "lead_name": _lead["name"],
@@ -2011,6 +2051,7 @@ elif page == "messages":
             "status": _lead["status"],
             "last_text": _latest["content"],
             "last_ts": _latest["timestamp"],
+            "last_in_ts": _last_in,      # when THEY last texted us
             "direction": _latest["direction"],
         })
     # Unread threads pin to the top (newest first within each group) and stay
@@ -2057,12 +2098,16 @@ elif page == "messages":
                         )
                 with _item_col:
                     _name = f"**{_t['lead_name']}**" if _is_unread else _t["lead_name"]
-                    _label = ("● " if _is_sel else "") + _name
+                    _sicon = _STATUS_ICONS.get(_t["status"], "")
+                    _label = ("● " if _is_sel else "") + _name + (f" {_sicon}" if _sicon else "")
                     if st.button(_label, key=f"msg_thread_{_t['lead_id']}",
                                  use_container_width=True, type=_btn_type):
                         st.session_state["msg_selected_lead"] = _t["lead_id"]
                         st.rerun()
-                    st.caption(f"{_dir_icon}{_preview}  ·  {_d} {_tm}")
+                    if _is_unread and _t.get("last_in_ts"):
+                        st.caption(f"← {_preview}  ·  they texted {fmt_local_ts(_t['last_in_ts'])}")
+                    else:
+                        st.caption(f"{_dir_icon}{_preview}  ·  {fmt_local_ts(_t['last_ts'])}")
 
     with convo_col:
         _sel_lid = st.session_state.get("msg_selected_lead")
@@ -2075,7 +2120,11 @@ elif page == "messages":
             else:
                 # Conversation header
                 _ch_left, _ch_mark, _ch_right = st.columns([3.2, 1.3, 1])
-                _ch_left.markdown(f"**{_sel_lead['name']}** · `{_sel_lead['phone']}`")
+                _sel_icon = _STATUS_ICONS.get(_sel_lead["status"], "")
+                _ch_left.markdown(
+                    f"**{_sel_lead['name']}** {_sel_icon} "
+                    f"{_sel_lead['status'].upper()} · `{_sel_lead['phone']}`"
+                )
                 _sel_unread = _sel_lid in _unread_ids
                 _mark_label = "✓ Mark read" if _sel_unread else "Mark unread"
                 if _ch_mark.button(_mark_label, key=f"msg_mark_{_sel_lid}", type="secondary"):
@@ -2103,6 +2152,11 @@ elif page == "messages":
                     st.caption("📱 First text to this lead from this number — say who you "
                                "are and that this is your new number they can save.")
                 _compose_key = f"msg_compose_{_sel_lid}"
+                # An AI draft staged on the previous run lands in the compose
+                # box here (widget keys can't be set after the widget renders).
+                _staged_draft = st.session_state.pop(f"msg_ai_stage_{_sel_lid}", None)
+                if _staged_draft is not None:
+                    st.session_state[_compose_key] = _staged_draft
                 _msg_text = st.text_area(
                     "Compose",
                     key=_compose_key,
@@ -2136,6 +2190,33 @@ elif page == "messages":
                         st.toast(f"📞 Calling from {_msg_cid} — your phone rings first.")
                     else:
                         st.error(f"Call failed: {_cr.get('error')}")
+
+                # AI-drafted reply, same engine as the Follow-ups page —
+                # lands in the compose box for editing before you hit Send.
+                _ai1, _ai2 = st.columns([1, 2.2])
+                if _ai1.button("✨ AI draft", key=f"msg_ai_{_sel_lid}",
+                               use_container_width=True):
+                    with st.spinner("Reading the thread and drafting..."):
+                        _ai_ixns = db.fetch_interactions(_sel_lid)
+                        _last_in_txt = next(
+                            (i["content"] for i in _ai_ixns
+                             if i["type"] == "text" and i["direction"] == "inbound"), "")
+                        _ai_draft = generate_followup_message(
+                            lead=_sel_lead,
+                            last_message=_last_in_txt,
+                            ignored_texts=0,
+                            strong_intent=False,
+                            conversation=_ai_ixns,
+                        )
+                    st.session_state[f"msg_ai_stage_{_sel_lid}"] = _ai_draft.message
+                    st.session_state[f"msg_ai_cost_{_sel_lid}"] = _ai_draft.cost_usd
+                    st.session_state["ai_cost_session_total"] = (
+                        st.session_state.get("ai_cost_session_total", 0.0)
+                        + _ai_draft.cost_usd)
+                    st.rerun()
+                _ai_cost = st.session_state.get(f"msg_ai_cost_{_sel_lid}")
+                if _ai_cost:
+                    _ai2.caption(f"💰 draft cost ${_ai_cost:.4f} — edit above, then Send ↑")
 
     # ── Recent Calls panel ────────────────────────────────────────────────────
     st.divider()
@@ -2178,8 +2259,9 @@ elif page == "messages":
             _cr1, _cr2, _cr3 = st.columns([0.4, 6, 1.6])
             _cr1.markdown(f"<div style='font-size:1.4rem;padding-top:4px'>{_icon}</div>", unsafe_allow_html=True)
             with _cr2:
+                _cl_icon = _STATUS_ICONS.get(_cl["status"], "") if _cl else ""
                 st.markdown(
-                    f"<div class='call-name'>{_cl_name}</div>"
+                    f"<div class='call-name'>{_cl_name} {_cl_icon}</div>"
                     f"<div class='call-preview'>{_call_preview}</div>",
                     unsafe_allow_html=True,
                 )
