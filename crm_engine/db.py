@@ -45,6 +45,22 @@ def get_conn(db_path: Path = DB_PATH):
 
 
 def init_db(db_path: Path = DB_PATH) -> None:
+    """Create/upgrade the schema. Retries through transient 'disk I/O error'
+    locks (Windows Defender/indexer briefly grabbing fresh SQLite journal
+    files) — safe because everything below is idempotent (IF NOT EXISTS +
+    guarded migration)."""
+    import time as _time
+    for _attempt in range(3):
+        try:
+            _init_db_once(db_path)
+            return
+        except sqlite3.OperationalError:
+            if _attempt == 2:
+                raise
+            _time.sleep(0.3 * (_attempt + 1))
+
+
+def _init_db_once(db_path: Path = DB_PATH) -> None:
     with get_conn(db_path) as conn:
         conn.executescript(
             """
