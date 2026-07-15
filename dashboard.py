@@ -940,6 +940,42 @@ def lead_conversation_items(lead_id: int) -> list[dict]:
     return sorted(items, key=lambda x: x["timestamp"])
 
 
+def render_ai_draft_row(lead: dict, stage_key: str, widget_prefix: str) -> None:
+    """✨ AI draft button + context box — the same engine as the Follow-ups
+    page (full history, strategy rotation, new-number rule). Stages the draft
+    into `stage_key`; the caller pops that into its compose box just before
+    rendering the text widget."""
+    _c1, _c2 = st.columns([1, 2.4])
+    ctx_key = f"{widget_prefix}_ctx"
+    _c2.text_input(
+        "Context for the AI",
+        key=ctx_key,
+        placeholder="context for the AI — e.g. she just called about the shed price",
+        label_visibility="collapsed",
+    )
+    if _c1.button("✨ AI draft", key=f"{widget_prefix}_btn", use_container_width=True):
+        with st.spinner("Reading the thread and drafting..."):
+            _ixns = db.fetch_interactions(lead["id"])
+            _last_in = next((i["content"] for i in _ixns
+                             if i["type"] == "text" and i["direction"] == "inbound"), "")
+            _draft = generate_followup_message(
+                lead=lead,
+                last_message=_last_in,
+                ignored_texts=0,
+                strong_intent=False,
+                conversation=_ixns,
+                extra_context=st.session_state.get(ctx_key, ""),
+            )
+        st.session_state[stage_key] = _draft.message
+        st.session_state[f"{widget_prefix}_cost"] = _draft.cost_usd
+        st.session_state["ai_cost_session_total"] = (
+            st.session_state.get("ai_cost_session_total", 0.0) + _draft.cost_usd)
+        st.rerun()
+    _cost = st.session_state.get(f"{widget_prefix}_cost")
+    if _cost:
+        st.caption(f"💰 draft cost ${_cost:.4f} — edit the message above, then send")
+
+
 def update_status(lead_id: int, key: str) -> None:
     db.update_lead(lead_id, {"status": st.session_state[key]})
 
@@ -1261,6 +1297,10 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown("**Send a Text**")
         manual_msg_key = f"manual_text_{lead_id}"
+        # An AI draft staged on the previous run lands in the compose box here.
+        _staged_lead_draft = st.session_state.pop(f"manual_text_stage_{lead_id}", None)
+        if _staged_lead_draft is not None:
+            st.session_state[manual_msg_key] = _staged_lead_draft
         st.text_area("Message", key=manual_msg_key, height=80, label_visibility="collapsed",
                      placeholder="Type a custom message to send right now…")
         send_col1, send_col2 = st.columns([1, 1])
@@ -1290,6 +1330,7 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
                 st.success(f"Calling from {_cid_pick} — your phone rings first, then bridges to lead.")
             else:
                 st.error(f"Call failed: {result.get('error', 'unknown error')}")
+        render_ai_draft_row(lead, f"manual_text_stage_{lead_id}", f"lead_ai_{lead_id}")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with right:
@@ -2191,32 +2232,9 @@ elif page == "messages":
                     else:
                         st.error(f"Call failed: {_cr.get('error')}")
 
-                # AI-drafted reply, same engine as the Follow-ups page —
+                # AI-drafted reply, same engine + context box as Follow-ups —
                 # lands in the compose box for editing before you hit Send.
-                _ai1, _ai2 = st.columns([1, 2.2])
-                if _ai1.button("✨ AI draft", key=f"msg_ai_{_sel_lid}",
-                               use_container_width=True):
-                    with st.spinner("Reading the thread and drafting..."):
-                        _ai_ixns = db.fetch_interactions(_sel_lid)
-                        _last_in_txt = next(
-                            (i["content"] for i in _ai_ixns
-                             if i["type"] == "text" and i["direction"] == "inbound"), "")
-                        _ai_draft = generate_followup_message(
-                            lead=_sel_lead,
-                            last_message=_last_in_txt,
-                            ignored_texts=0,
-                            strong_intent=False,
-                            conversation=_ai_ixns,
-                        )
-                    st.session_state[f"msg_ai_stage_{_sel_lid}"] = _ai_draft.message
-                    st.session_state[f"msg_ai_cost_{_sel_lid}"] = _ai_draft.cost_usd
-                    st.session_state["ai_cost_session_total"] = (
-                        st.session_state.get("ai_cost_session_total", 0.0)
-                        + _ai_draft.cost_usd)
-                    st.rerun()
-                _ai_cost = st.session_state.get(f"msg_ai_cost_{_sel_lid}")
-                if _ai_cost:
-                    _ai2.caption(f"💰 draft cost ${_ai_cost:.4f} — edit above, then Send ↑")
+                render_ai_draft_row(_sel_lead, f"msg_ai_stage_{_sel_lid}", f"msg_ai_{_sel_lid}")
 
     # ── Recent Calls panel ────────────────────────────────────────────────────
     st.divider()
