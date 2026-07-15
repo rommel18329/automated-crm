@@ -1116,6 +1116,42 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
     c_top1.markdown(f"**Phone:** {lead['phone']}")
     c_top2.markdown(f"**Stage:** {human_stage(lead['conversation_stage'])}")
 
+    with st.expander("✏️ Rename · 🗑 Delete lead", expanded=False):
+        _rn1, _rn2 = st.columns([3, 1])
+        _new_name = _rn1.text_input("Lead name", value=lead["name"],
+                                    key=f"rename_{lead_id}",
+                                    label_visibility="collapsed")
+        if _rn2.button("Save name", key=f"rename_save_{lead_id}",
+                       use_container_width=True):
+            if _new_name.strip() and _new_name.strip() != lead["name"]:
+                db.update_lead(lead_id, {"name": _new_name.strip()})
+                st.toast(f"Renamed to {_new_name.strip()}")
+                st.rerun()
+        st.divider()
+        st.caption(f"Delete **{lead['name']}** and ALL their history — texts, "
+                   "calls, notes, dispositions. crm.db has no backup; this "
+                   "cannot be undone.")
+        _del_key = f"confirm_del_lead_{lead_id}"
+        if st.session_state.get(_del_key):
+            _dc1, _dc2 = st.columns(2)
+            if _dc1.button("🗑 Yes — delete permanently",
+                           key=f"del_lead_yes_{lead_id}", type="primary",
+                           use_container_width=True):
+                db.delete_lead(lead_id)
+                st.session_state.pop(_del_key, None)
+                st.session_state.pop("selected_lead_id", None)
+                st.session_state["lead_list_collapsed"] = False
+                st.toast(f"Deleted {lead['name']} and all their history.")
+                st.rerun()
+            if _dc2.button("Cancel", key=f"del_lead_no_{lead_id}",
+                           use_container_width=True):
+                st.session_state.pop(_del_key, None)
+                st.rerun()
+        else:
+            if st.button("🗑 Delete this lead…", key=f"del_lead_{lead_id}"):
+                st.session_state[_del_key] = True
+                st.rerun()
+
     c_edit1, c_edit2, c_edit3, c_edit4 = st.columns(4)
     _status_opts = ["hot", "warm", "cold", "dead", "contract", "investor"]
     _status_idx = _status_opts.index(lead["status"]) if lead["status"] in _status_opts else 0
@@ -1977,7 +2013,11 @@ elif page == "messages":
             "last_ts": _latest["timestamp"],
             "direction": _latest["direction"],
         })
+    # Unread threads pin to the top (newest first within each group) and stay
+    # there until replied to or marked read.
+    _unread_ids = db.unread_message_lead_ids()
     _threads.sort(key=lambda t: t["last_ts"], reverse=True)
+    _threads.sort(key=lambda t: t["lead_id"] in _unread_ids, reverse=True)
 
     if msg_q:
         _threads = [
@@ -1994,9 +2034,6 @@ elif page == "messages":
     # ── two-column layout: thread list | conversation ─────────────────────────
     thread_col, convo_col = st.columns([1, 2.4])
 
-    # Unread threads: blue dot until you reply or hit Mark read.
-    _unread_ids = db.unread_message_lead_ids()
-
     with thread_col:
         st.markdown("**Conversations**")
         with st.container(height=540):
@@ -2004,16 +2041,28 @@ elif page == "messages":
                 st.caption("No text conversations yet.")
             for _t in _threads:
                 _is_sel = st.session_state["msg_selected_lead"] == _t["lead_id"]
+                _is_unread = _t["lead_id"] in _unread_ids
                 _preview = (_t["last_text"][:48] + "…") if len(_t["last_text"]) > 48 else _t["last_text"]
                 _d, _tm = fmt_date_time(_t["last_ts"])
                 _dir_icon = "← " if _t["direction"] == "inbound" else "→ "
                 _btn_type = "secondary" if _is_sel else "tertiary"
-                _unread_dot = "🔵 " if _t["lead_id"] in _unread_ids else ""
-                _label = ("● " if _is_sel else "") + _unread_dot + _t["lead_name"]
-                if st.button(_label, key=f"msg_thread_{_t['lead_id']}", use_container_width=True, type=_btn_type):
-                    st.session_state["msg_selected_lead"] = _t["lead_id"]
-                    st.rerun()
-                st.caption(f"{_dir_icon}{_preview}  ·  {_d} {_tm}")
+                # iMessage-style unread: small blue dot in the gutter + bold name
+                _dot_col, _item_col = st.columns([0.09, 1])
+                with _dot_col:
+                    if _is_unread:
+                        st.markdown(
+                            "<div style='width:9px;height:9px;border-radius:50%;"
+                            "background:#0A84FF;margin-top:15px'></div>",
+                            unsafe_allow_html=True,
+                        )
+                with _item_col:
+                    _name = f"**{_t['lead_name']}**" if _is_unread else _t["lead_name"]
+                    _label = ("● " if _is_sel else "") + _name
+                    if st.button(_label, key=f"msg_thread_{_t['lead_id']}",
+                                 use_container_width=True, type=_btn_type):
+                        st.session_state["msg_selected_lead"] = _t["lead_id"]
+                        st.rerun()
+                    st.caption(f"{_dir_icon}{_preview}  ·  {_d} {_tm}")
 
     with convo_col:
         _sel_lid = st.session_state.get("msg_selected_lead")

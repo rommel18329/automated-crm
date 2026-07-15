@@ -683,6 +683,21 @@ def fetch_recent_inbound_texts(since_hours: int = 24, db_path: Path = DB_PATH) -
     return [_to_dict(r) for r in rows]
 
 
+def delete_lead(lead_id: int, db_path: Path = DB_PATH) -> None:
+    """Permanently delete a lead and ALL its data — interactions, dispositions,
+    suggestions, list memberships, read-state, call completions. Irreversible
+    (crm.db has no backup); the UI double-confirms before calling this."""
+    with get_conn(db_path) as conn:
+        for table in ("interactions", "dispositions", "followup_suggestions",
+                      "dial_list_members", "thread_read_state", "daily_calls",
+                      "performance_logs"):
+            try:
+                conn.execute(f"DELETE FROM {table} WHERE lead_id=?", (lead_id,))
+            except Exception:
+                pass   # table may not have a lead_id column in older DBs
+        conn.execute("DELETE FROM leads WHERE id=?", (lead_id,))
+
+
 def count_dispositions(lead_id: int, db_path: Path = DB_PATH) -> int:
     """How many dialing attempts (disposed calls) this lead has had — drives
     the softphone's attempt counter / voicemail-cadence advice."""
