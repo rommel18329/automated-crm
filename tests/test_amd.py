@@ -1,7 +1,14 @@
 """Unit tests for the self-built AMD classifier (crm_engine/amd_detector.py).
 
-Synthesizes 8 kHz audio for the canonical cases and checks the verdict:
+Two modes:
+
+LIVE mode (default — the instant-bridge dialer, where the agent is already
+talking to whoever answered):
 - a sustained pure tone (voicemail beep)          -> machine
+- ANY amount of speech / conversation             -> NO verdict (never kill)
+- silence/speech until the live timeout           -> unknown (fail-open)
+
+LEGACY screen-first mode (live_call=False):
 - a short greeting followed by silence            -> human
 - a long continuous greeting (VM message)         -> machine
 - pure silence                                    -> unknown (fail-open)
@@ -12,6 +19,7 @@ import numpy as np
 
 from crm_engine.amd_detector import (
     AmdClassifier, mulaw_to_float, SAMPLE_RATE, DECISION_TIMEOUT,
+    LIVE_DECISION_TIMEOUT,
 )
 
 rng = np.random.default_rng(42)
@@ -44,24 +52,53 @@ def run(clf: AmdClassifier, audio: np.ndarray, chunk: int = 160) -> str | None:
     return clf.verdict
 
 
-def test_beep_is_machine():
+# ── LIVE mode (default): beep is the ONLY machine signal ───────────────────
+
+def test_live_beep_is_machine():
     audio = np.concatenate([silence(0.4), tone(0.5)])
-    assert run(AmdClassifier(), audio) == "machine"
+    clf = AmdClassifier()
+    assert run(clf, audio) == "machine"
+    assert clf.reason == "beep"
 
 
-def test_short_greeting_then_silence_is_human():
-    audio = np.concatenate([silence(0.3), speech_like(0.7), silence(1.2)])
-    assert run(AmdClassifier(), audio) == "human"
+def test_live_conversation_never_killed():
+    # The 2026-07-09 regression: continuous conversation audio must NOT be
+    # classified as machine on a live call — this hung up on real people.
+    audio = np.concatenate([silence(0.3), speech_like(6.0)])
+    assert run(AmdClassifier(), audio) is None
 
 
-def test_long_continuous_greeting_is_machine():
-    audio = np.concatenate([silence(0.3), speech_like(3.2)])
-    assert run(AmdClassifier(), audio) == "machine"
+def test_live_short_greeting_gets_no_human_verdict_either():
+    # Live mode issues no speech-pattern verdicts at all.
+    audio = np.concatenate([silence(0.3), speech_like(0.7), silence(1.5)])
+    assert run(AmdClassifier(), audio) is None
 
 
-def test_pure_silence_times_out_unknown():
-    audio = silence(DECISION_TIMEOUT + 0.5)
+def test_live_times_out_unknown():
+    audio = silence(LIVE_DECISION_TIMEOUT + 0.5)
     assert run(AmdClassifier(), audio) == "unknown"
+
+
+# ── LEGACY screen-first mode ────────────────────────────────────────────────
+
+def test_legacy_beep_is_machine():
+    audio = np.concatenate([silence(0.4), tone(0.5)])
+    assert run(AmdClassifier(live_call=False), audio) == "machine"
+
+
+def test_legacy_short_greeting_then_silence_is_human():
+    audio = np.concatenate([silence(0.3), speech_like(0.7), silence(1.2)])
+    assert run(AmdClassifier(live_call=False), audio) == "human"
+
+
+def test_legacy_long_continuous_greeting_is_machine():
+    audio = np.concatenate([silence(0.3), speech_like(3.2)])
+    assert run(AmdClassifier(live_call=False), audio) == "machine"
+
+
+def test_legacy_pure_silence_times_out_unknown():
+    audio = silence(DECISION_TIMEOUT + 0.5)
+    assert run(AmdClassifier(live_call=False), audio) == "unknown"
 
 
 def test_mulaw_roundtrip_shape_and_range():
