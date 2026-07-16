@@ -1804,10 +1804,20 @@ def softphone_page():
     statusEl.className = 'status ' + (cls || '');
   }
 
+  // Hard lock: while a real (human) call is waiting to be written up, NOTHING
+  // may auto-dial the next batch. Cleared only by disposing or an explicit
+  // Next click. This is what stops a manual hang-up from skipping straight to
+  // the next person without a disposition.
+  var awaitingDisposition = false;
+
   function showDisposition() {
-    if (currentLeadId) { dispEl.classList.add('show'); }
+    if (currentLeadId) {
+      awaitingDisposition = true;
+      dispEl.classList.add('show');
+    }
   }
   function hideDisposition() {
+    awaitingDisposition = false;
     dispEl.classList.remove('show');
     dispDoneEl.classList.remove('show');
     dispDoneEl.textContent = '';
@@ -1904,6 +1914,7 @@ def softphone_page():
   var autoResumed = false;
   function maybeAutoResume() {
     if (autoResumed || !queueActive || call || !deviceReady || !autoAdvance) return;
+    if (awaitingDisposition) return;   // a call is waiting to be written up
     autoResumed = true;
     logMsg('Queue is active — resuming automatically...');
     scheduleNext(1500, 'Resuming queue');
@@ -1927,10 +1938,13 @@ def softphone_page():
     if (!queueActive || !autoAdvance) return;
     if (!outcomeSaved) return;
     if (!statusSaved && !lastOutcomeNoStatus) return;
+    awaitingDisposition = false;   // fully written up — release the lock
     scheduleNext(1500, 'Saved — dialing next batch');
   }
 
   function scheduleNext(ms, why) {
+    // Never auto-advance over a pending disposition.
+    if (awaitingDisposition) return;
     if (nextTimer) clearTimeout(nextTimer);
     setStatus((why || 'Next batch') + ' in ' + (Math.round(ms / 500) / 2) + 's…', 'ready');
     nextTimer = setTimeout(function() { nextTimer = null; doNext(); }, ms);
@@ -1988,7 +2002,10 @@ def softphone_page():
     logMsg('Queue finished.');
   }
 
-  btnQNext.addEventListener('click', doNext);
+  btnQNext.addEventListener('click', function() {
+    awaitingDisposition = false;   // explicit skip — user chose to move on
+    doNext();
+  });
   btnQAuto.addEventListener('click', function() {
     autoAdvance = !autoAdvance;
     try { localStorage.setItem('crm_auto_adv_' + AGENT, autoAdvance ? '1' : '0'); } catch (e) {}
