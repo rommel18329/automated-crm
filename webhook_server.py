@@ -52,6 +52,10 @@ API_SECRET = os.getenv("TWILIO_API_SECRET", "")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")
 FROM_IL_NUMBER = os.getenv("TWILIO_FROM_IL_NUMBER", "")
+VI_SERVICE_SID = os.getenv("VOICE_INTELLIGENCE_SERVICE_SID", "")  # call transcription
+
+# transcript_sid -> lead_id, so the transcript webhook can find its lead
+_transcript_to_lead: dict[str, int] = {}
 
 IL_AREA_CODES = {"217","224","309","312","331","618","630","708","773","779","815","847"}
 
@@ -375,9 +379,80 @@ def voice_recording():
         db.update_call_recording(lead_id, recording_url, DB_PATH)
         log.info(f"Attached recording {recording_sid} to lead {lead_id}")
         _call_sid_to_lead.pop(call_sid, None)
+        if VI_SERVICE_SID and recording_sid:
+            threading.Thread(target=_start_transcription,
+                             args=(recording_sid, lead_id), daemon=True).start()
     else:
         log.info(f"No lead mapping for CallSid {call_sid} — recording not attached")
     return ("", 204)
+
+
+def _start_transcription(recording_sid: str, lead_id: int) -> None:
+    """Kick off a Voice Intelligence transcript for a finished recording.
+    Background thread; failures are logged, never affect the call."""
+    try:
+        from twilio.rest import Client as TwilioClient
+        twilio = TwilioClient(ACCOUNT_SID, AUTH_TOKEN)
+        tr = twilio.intelligence.v2.transcripts.create(
+            service_sid=VI_SERVICE_SID,
+            channel={"media_properties": {"source_sid": recording_sid}},
+            customer_key=str(lead_id),   # survives a webhook restart
+        )
+        _transcript_to_lead[tr.sid] = lead_id
+        log.info(f"Transcription started {tr.sid} for lead {lead_id} (rec {recording_sid})")
+    except Exception as exc:
+        log.warning(f"Transcription start failed for rec {recording_sid}: {exc}")
+
+
+@app.route("/voice/transcript", methods=["POST"])
+def voice_transcript():
+    """Voice Intelligence webhook: fires when a transcript's status changes.
+    On completion we assemble the sentences and save them to the lead."""
+    transcript_sid = request.form.get("transcript_sid") or request.form.get("TranscriptSid", "")
+    status = request.form.get("status") or request.form.get("Status", "")
+    log.info(f"Transcript webhook: {transcript_sid} status={status}")
+    if transcript_sid and status == "completed":
+        threading.Thread(target=_save_transcript, args=(transcript_sid,),
+                         daemon=True).start()
+    return ("", 204)
+
+
+def _save_transcript(transcript_sid: str) -> None:
+    """Fetch a completed transcript's sentences, assemble readable text, and
+    log it on the lead (+ an AI note). Background thread."""
+    try:
+        from twilio.rest import Client as TwilioClient
+        twilio = TwilioClient(ACCOUNT_SID, AUTH_TOKEN)
+        sentences = twilio.intelligence.v2.transcripts(transcript_sid).sentences.list()
+        parts = []
+        for s in sorted(sentences, key=lambda x: (x.media_channel or 0, x.sentence_index or 0)):
+            who = "Them" if (s.media_channel or 0) == 1 else "Rom"
+            parts.append(f"{who}: {s.transcript}")
+        text = "\n".join(parts).strip()
+        lead_id = _transcript_to_lead.pop(transcript_sid, None)
+        if lead_id is None:
+            # In-memory map lost (webhook restarted) — recover from customer_key
+            try:
+                tr = twilio.intelligence.v2.transcripts(transcript_sid).fetch()
+                lead_id = int(tr.customer_key) if tr.customer_key else None
+            except Exception:
+                lead_id = None
+        if lead_id is None:
+            log.warning(f"Transcript {transcript_sid} has no lead mapping — skipping")
+            return
+        if not text:
+            log.info(f"Transcript {transcript_sid}: empty, nothing to save")
+            return
+        db.add_interaction(lead_id, "note", "📝 Call transcript:\n" + text[:4000],
+                           "outbound", DB_PATH, ts=datetime.utcnow())
+        log.info(f"Saved transcript {transcript_sid} to lead {lead_id} ({len(text)} chars)")
+        # Enrich: let the AI note summarize what changed (best-effort).
+        try:
+            auto_note_after_text(lead_id, DB_PATH)
+        except Exception:
+            pass
+    except Exception as exc:
+        log.warning(f"Saving transcript {transcript_sid} failed: {exc}")
 
 
 @app.route("/recordings/<recording_sid>")
