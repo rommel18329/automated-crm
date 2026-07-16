@@ -1192,6 +1192,24 @@ def dialer_set_status():
     return resp
 
 
+@app.route("/dialer/note", methods=["POST", "OPTIONS"])
+def dialer_note():
+    """Save a free-text note typed on the softphone during a call."""
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    data = request.get_json(force=True, silent=True) or {}
+    lead_id = data.get("lead_id")
+    note = (data.get("note") or "").strip()
+    if not lead_id or not note:
+        return _cors(jsonify({"ok": False, "error": "missing lead_id or note"})), 400
+    who = (data.get("agent") or "").strip()
+    prefix = f"📞 {who}: " if who else "📞 "
+    db.add_interaction(int(lead_id), "note", prefix + note, "outbound",
+                       DB_PATH, ts=datetime.utcnow())
+    log.info(f"Saved call note on lead {lead_id} ({len(note)} chars)")
+    return _cors(jsonify({"ok": True}))
+
+
 @app.route("/dialer/current", methods=["GET", "POST"])
 def dialer_current():
     """Per-agent dial channel between Streamlit and each softphone popup.
@@ -1582,6 +1600,13 @@ def softphone_page():
       <button class="disp-btn st-cold" onclick="setLeadStatus('cold')">❄️ Cold</button>
     </div>
   </div>
+  <div class="disp-title" style="margin-top:10px">Note (optional)</div>
+  <textarea id="dispNote" placeholder="Type a quick note about this call…"
+            style="width:100%;box-sizing:border-box;min-height:52px;padding:7px 9px;
+                   border:1px solid #ccc;border-radius:7px;font-size:13px;
+                   font-family:inherit;resize:vertical"></textarea>
+  <button class="btn btn-call" id="btnDispNext"
+          style="width:100%;margin-top:8px">✓ Save & Next lead</button>
 </div>
 <div class="disp-done" id="dispDone"></div>
 <details class="script" id="scriptBox" open>
@@ -1628,6 +1653,8 @@ def softphone_page():
   const dispDoneEl = document.getElementById('dispDone');
   const dispOutcomeEl = document.getElementById('dispOutcome');
   const dispStatusEl  = document.getElementById('dispStatus');
+  const dispNote  = document.getElementById('dispNote');
+  const btnDispNext = document.getElementById('btnDispNext');
   const repNameEl = document.getElementById('repName');
   const scOpen1 = document.getElementById('scOpen1');
   const scOpen2 = document.getElementById('scOpen2');
@@ -1907,6 +1934,7 @@ def softphone_page():
     dispStatusEl.classList.remove('locked');
     var _ss = document.getElementById('statusSection');
     if (_ss) _ss.style.display = '';   // restore status prompt for the next call
+    if (dispNote) dispNote.value = '';
     savedParts = [];
     outcomeSaved = false;
     statusSaved = false;
@@ -2017,11 +2045,41 @@ def softphone_page():
   // Advance once the call is fully written up: outcome saved, plus a
   // temperature unless the outcome doesn't need one (no answer / VM / wrong #).
   function maybeAdvance() {
-    if (!queueActive || !autoAdvance) return;
     if (!outcomeSaved) return;
     if (!statusSaved && !lastOutcomeNoStatus) return;
-    awaitingDisposition = false;   // fully written up — release the lock
-    scheduleNext(1500, 'Saved — dialing next batch');
+    // Temperature outcomes (warm/hot/cold): don't auto-jump — let the agent
+    // write a note, then advance with the ✓ Save & Next button.
+    if (!lastOutcomeNoStatus) {
+      setStatus('Add a note (optional), then hit ✓ Save & Next', 'ended');
+      return;
+    }
+    if (!queueActive || !autoAdvance) return;
+    // No-status outcomes auto-advance — unless the agent started a note.
+    if (dispNote && dispNote.value.trim()) return;
+    awaitingDisposition = false;
+    scheduleNext(2200, 'Saved — dialing next batch');
+  }
+
+  // Save the typed note (if any) then advance. This is the button the agent
+  // hits after warm/hot/cold + note; also works for any outcome.
+  function saveNoteThenNext() {
+    if (nextTimer) { clearTimeout(nextTimer); nextTimer = null; }
+    var txt = dispNote ? dispNote.value.trim() : '';
+    function go() {
+      awaitingDisposition = false;
+      if (dispNote) dispNote.value = '';
+      if (queueActive && autoAdvance) scheduleNext(600, 'Next lead');
+      else { hideDisposition(); setStatus('Saved — hit ⏭ Next when ready', 'ended'); }
+    }
+    if (txt && currentLeadId) {
+      fetch('/dialer/note', { method: 'POST', body: JSON.stringify({
+        lead_id: currentLeadId, note: txt,
+        agent: (repNameEl.value || '').trim() || null }) })
+        .then(function() { showSaved('note'); logMsg('Note saved.'); go(); })
+        .catch(function() { logMsg('Note save failed — advancing anyway.'); go(); });
+    } else {
+      go();
+    }
   }
 
   function scheduleNext(ms, why) {
@@ -2087,6 +2145,17 @@ def softphone_page():
   btnQNext.addEventListener('click', function() {
     awaitingDisposition = false;   // explicit skip — user chose to move on
     doNext();
+  });
+
+  // Save & Next lead (after a disposition + optional note).
+  if (btnDispNext) btnDispNext.addEventListener('click', saveNoteThenNext);
+  // Typing a note cancels any pending auto-advance so it can't jump away
+  // mid-sentence — the agent finishes and hits Save & Next.
+  if (dispNote) dispNote.addEventListener('input', function() {
+    if (nextTimer) {
+      clearTimeout(nextTimer); nextTimer = null;
+      setStatus('Writing a note — hit ✓ Save & Next when done', 'ended');
+    }
   });
   btnQAuto.addEventListener('click', function() {
     autoAdvance = !autoAdvance;
