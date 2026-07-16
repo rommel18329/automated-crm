@@ -446,11 +446,18 @@ def _save_transcript(transcript_sid: str) -> None:
         db.add_interaction(lead_id, "note", "📝 Call transcript:\n" + text[:4000],
                            "outbound", DB_PATH, ts=datetime.utcnow())
         log.info(f"Saved transcript {transcript_sid} to lead {lead_id} ({len(text)} chars)")
-        # Enrich: let the AI note summarize what changed (best-effort).
+        # AI call note: Call / Said / Change / Next, summarized from the
+        # transcript (best-effort — never blocks or fails the save).
         try:
-            auto_note_after_text(lead_id, DB_PATH)
-        except Exception:
-            pass
+            from crm_engine.ai_message_generator import generate_call_note
+            lead = db.fetch_lead(lead_id, DB_PATH)
+            note = generate_call_note(lead or {}, text)
+            if note:
+                db.add_interaction(lead_id, "note", "🤖 " + note, "outbound",
+                                   DB_PATH, ts=datetime.utcnow())
+                log.info(f"Saved AI call note for lead {lead_id}")
+        except Exception as exc:
+            log.warning(f"AI call note failed for lead {lead_id}: {exc}")
     except Exception as exc:
         log.warning(f"Saving transcript {transcript_sid} failed: {exc}")
 

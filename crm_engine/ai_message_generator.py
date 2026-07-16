@@ -147,6 +147,49 @@ Write the note."""
         return ""
 
 
+CALL_NOTE_SYSTEM_PROMPT = """You are the note-taker for a real-estate
+wholesaling CRM. You are given the transcript of a phone call (speaker-labeled;
+"Them" is the person we called, "Rom"/"Gabby" is our caller). Write ONE short
+internal note summarizing the call for the lead's file.
+
+Format — exactly four lines, plain text, no markdown, no preamble:
+Call: <what happened on this call in 1 sentence — who they are, seller/buyer/not interested>
+Said: <the most important thing THEY said — motivation, criteria, price, timeline, objection>
+Change: <what this changes: status, are they a buyer vs seller, temperature — or "nothing new">
+Next: <the single best next move and roughly when>
+
+Whole note under 70 words. Be concrete — use names, streets, towns, prices, and
+bed/bath counts ONLY if they appear verbatim in the transcript. NEVER invent a
+phone number, address, price, or date not literally in the transcript. If the
+transcript is empty or unintelligible, say "Call didn't transcribe clearly" and
+keep the rest short."""
+
+
+def generate_call_note(lead: dict, transcript_text: str) -> str:
+    """AI auto-note summarizing a phone call from its transcript: what happened,
+    what they said, what it changes, next move. Returns '' on failure so a
+    broken generator never affects the call flow. ~$0.003 per note on Haiku."""
+    if not (transcript_text or "").strip():
+        return ""
+    user_msg = f"""LEAD: {lead.get('name', 'Unknown')} — status {lead.get('status', '?')}
+CONTEXT: {(lead.get('timeline') or 'unknown')[:250]}
+
+CALL TRANSCRIPT (speaker-labeled):
+{transcript_text[:3500]}
+
+Write the note."""
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=200,
+            system=CALL_NOTE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        return (resp.content[0].text or "").strip()
+    except Exception:
+        return ""
+
+
 def _strip_ai_tells(text: str) -> str:
     """Hard-strip dashes/AI-giveaway punctuation, even if the model ignores instructions."""
     # Em dash (U+2014), en dash (U+2013), horizontal bar (U+2015) — explicit codepoints
