@@ -2944,12 +2944,11 @@ elif page == "caller_health":
                 )
                 _warm_note = ""
                 if num["status"] == "warming":
-                    # Usage-based: a warm-up day only counts once the number
-                    # carried enough volume for its current stage that day.
-                    _days_done = caller_id_pool._warmup_days_completed(phone)
-                    _req = caller_id_pool.advance_requirement(_days_done)
+                    # Pool-level, from the DB: a warm-up day = a past day the
+                    # pool placed 10+ real calls. Every number ramps together.
+                    _days_done = caller_id_pool.pool_warmup_days_completed()
                     _warm_note = (f" · warm-up day {_days_done + 1}/{caller_id_pool.WARMUP_DAYS}"
-                                  f" · needs {_req}+ calls today to advance")
+                                  f" · dial {caller_id_pool.MIN_POOL_CALLS_PER_DAY}+ today to advance")
                 st.caption(f"Area {num['area_code']}{_warm_note}")
             with c2:
                 _eff_cap = caller_id_pool._effective_cap(num)
@@ -2975,12 +2974,11 @@ elif page == "caller_health":
             "spreading load and respecting daily caps.\n"
             "- **Daily caps:** 50 calls/number fully warmed — a hard limit; the "
             "dialer stops for the day rather than exceed it.\n"
-            "- **Warm-up (usage-based):** a number advances only on days it "
-            "carries real volume — at least 60% of its current stage cap "
-            "(10/day needs 6+, 15 needs 9+, 25 needs 15+, 40 needs 24+). "
-            "Ramp: 10/day → 15 → 25 → 40 → 50 across 10 qualifying dialing "
-            "days. Idle or trickle days don't count — neither calendar time "
-            "nor token dialing warms a number.\n"
+            "- **Warm-up (pool-level, from real dialing):** the whole pool "
+            "advances one warm-up day for each past day it placed 10+ calls "
+            "(read from the call record, so it survives restarts). Per-number "
+            "caps ramp together: 10/day → 15 → 25 → 40 → 50 over 10 dialing "
+            "days. A day with only a few test calls doesn't count.\n"
             "- **Detection:** answer rate is tracked per number; a sudden crater vs. "
             "the pool median flags a likely carrier block, and the number is pulled.\n"
             "- **Proactive registration:** run `python register_voice_integrity.py` to "

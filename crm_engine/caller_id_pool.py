@@ -21,15 +21,18 @@ from . import db
 # on REAL usage, not the calendar: a warm-up day only counts once the number
 # actually placed MIN_CALLS_WARMUP_DAY calls that day. Idle days advance
 # nothing — a number that never dials never graduates.
-#   (completed dialing days below this, hard per-day cap)
+#   (completed dialing days below this, hard per-day cap PER NUMBER)
 WARMUP_SCHEDULE = [(2, 10), (4, 15), (7, 25), (10, 40)]
 WARMUP_DAYS = 10          # real dialing days needed to graduate to full cap
 WARMUP_DAILY_CAP = 10     # hard cap on a brand-new number (stage 1)
-MIN_CALLS_WARMUP_DAY = 5  # absolute floor for a day to advance warm-up
-ADVANCE_FRACTION = 0.6    # ...and it must carry >=60% of its current stage cap
-                          # that day. Prevents trickle-graduation: a number
-                          # can't earn a 50/day cap on 5-call days and then
-                          # spike 10x — the very pattern carrier ML flags.
+# Warm-up is POOL-level and counted from the database (dispositions), NOT the
+# stats JSON. Rationale: the pool spreads each day's calls across 20 numbers,
+# so no single number ever hits a meaningful per-number daily count — a
+# per-number warm-up can never advance. What actually warms reputation is the
+# operation dialing consistently over days, so a "warm-up day" is any past
+# calendar day the pool placed >= MIN_POOL_CALLS_PER_DAY calls (real dialing,
+# not a handful of test calls). The per-number caps below still gate volume.
+MIN_POOL_CALLS_PER_DAY = 10
 
 # Answer-rate detection: if a number with enough volume drops below this fraction
 # of the pool's median answer rate, treat it as a likely flag.
@@ -88,34 +91,38 @@ def answer_rate(phone_number: str) -> float | None:
 
 # ── Rotation ────────────────────────────────────────────────────────────────
 
-def advance_requirement(days_completed: int) -> int:
-    """Calls a number must place in a day for that day to advance its
-    warm-up, given how far along it already is: at least the floor, and at
-    least ADVANCE_FRACTION of its current stage cap (10→6, 15→9, 25→15,
-    40→24). Graduation therefore reflects genuinely carried volume."""
-    cap = _stage_cap(days_completed)
-    if cap is None:
-        return MIN_CALLS_WARMUP_DAY
-    return max(MIN_CALLS_WARMUP_DAY, int(cap * ADVANCE_FRACTION))
+_warmup_cache: dict = {}   # {date_str: days_completed} — recompute once/day
 
 
-def _warmup_days_completed(phone_number: str, stats: dict | None = None) -> int:
-    """Walk the number's real dialing history (past days only, in order) and
-    count the days that advanced its warm-up: each day must meet the volume
-    requirement of the stage the number was at ON THAT DAY. Idle days and
-    trickle days advance nothing; calendar time alone never graduates."""
-    s = (stats if stats is not None else _load_stats()).get(phone_number) or {}
-    daily = s.get("daily") or {}
+def pool_warmup_days_completed(db_path: Path = db.DB_PATH) -> int:
+    """Count PAST calendar days on which the pool did real dialing (>=
+    MIN_POOL_CALLS_PER_DAY calls), read from the dispositions table — the
+    authoritative record, immune to caller_id_stats.json resets. This is the
+    pool's shared warm-up progress; every number's cap derives from it."""
     today = date.today().isoformat()
-    days_done = 0
-    for d in sorted(daily):
-        if d >= today:
-            continue
-        if _stage_cap(days_done) is None:
-            break                          # already fully graduated
-        if daily[d] >= advance_requirement(days_done):
-            days_done += 1
-    return days_done
+    if _warmup_cache.get("_day") == today and "n" in _warmup_cache:
+        return _warmup_cache["n"]
+    try:
+        with db.get_conn(db_path) as conn:
+            rows = conn.execute(
+                """SELECT date(created_at) d, COUNT(*) c FROM dispositions
+                   WHERE from_number IS NOT NULL AND date(created_at) < ?
+                   GROUP BY d""",
+                (today,),
+            ).fetchall()
+        n = sum(1 for r in rows if r["c"] >= MIN_POOL_CALLS_PER_DAY)
+    except Exception:
+        n = 0
+    _warmup_cache.clear()
+    _warmup_cache.update({"_day": today, "n": n})
+    return n
+
+
+def _warmup_days_completed(phone_number: str = "", stats: dict | None = None,
+                           db_path: Path = db.DB_PATH) -> int:
+    """Pool-level warm-up days completed (the phone_number arg is ignored now;
+    kept so existing callers/tests keep working)."""
+    return pool_warmup_days_completed(db_path)
 
 
 def _stage_cap(days_completed: int) -> int | None:
@@ -126,11 +133,12 @@ def _stage_cap(days_completed: int) -> int | None:
     return None
 
 
-def _effective_cap(num: dict, stats: dict | None = None) -> int:
-    """Usage-based warm-up cap, computed from REAL dialing history for every
-    number — the status column is display-only (synced separately), so a
-    number mislabeled 'active' can never dial past its true warm-up stage."""
-    stage = _stage_cap(_warmup_days_completed(num["phone_number"], stats))
+def _effective_cap(num: dict, stats: dict | None = None,
+                   db_path: Path = db.DB_PATH) -> int:
+    """Per-number hard cap for today, from the pool's shared warm-up stage
+    (pool_warmup_days_completed). Every number ramps together: 10→15→25→40→50
+    as the pool logs more real dialing days."""
+    stage = _stage_cap(pool_warmup_days_completed(db_path))
     if stage is None:
         return num["daily_cap"]
     return min(num["daily_cap"], stage)
@@ -138,12 +146,11 @@ def _effective_cap(num: dict, stats: dict | None = None) -> int:
 
 def _sync_status(num: dict, db_path: Path = db.DB_PATH,
                  stats: dict | None = None) -> None:
-    """Keep the status column truthful: 'warming' until the usage-based ramp
-    completes, 'active' after. Replaces the old calendar-based graduation
-    (which wrongly promoted numbers that had barely dialed)."""
+    """Keep the status column truthful: 'warming' until the pool's warm-up
+    completes, 'active' after."""
     if num["status"] in ("flagged", "retired"):
         return
-    graduated = _stage_cap(_warmup_days_completed(num["phone_number"], stats)) is None
+    graduated = _stage_cap(pool_warmup_days_completed(db_path)) is None
     want = "active" if graduated else "warming"
     if num["status"] != want:
         db.update_caller_number(num["id"], {"status": want}, db_path)
@@ -215,31 +222,27 @@ def pool_status(db_path: Path = db.DB_PATH) -> dict:
            "used_today": 0, "cap_today": 0, "remaining_today": 0,
            "warmup_day": None, "warmup_total_days": WARMUP_DAYS,
            "warming_cap": None, "warmup_days_left": None}
-    stats = _load_stats()
-    warm_days: list[int] = []
-    warm_caps: list[int] = []
+    days = pool_warmup_days_completed(db_path)       # pool-shared warm-up stage
+    graduated = _stage_cap(days) is None
     for num in pool:
         if num["status"] in ("flagged", "retired"):
             out["flagged"] += 1
             continue
-        _sync_status(num, db_path, stats)
+        _sync_status(num, db_path)
         out["numbers"] += 1
-        cap = _effective_cap(num, stats)
+        cap = _effective_cap(num, db_path=db_path)
         used = db.caller_calls_today(num["phone_number"], db_path)
         out["cap_today"] += cap
         out["used_today"] += min(used, cap)
         out["remaining_today"] += max(0, cap - used)
-        days = _warmup_days_completed(num["phone_number"], stats)
-        if _stage_cap(days) is None:
+        if graduated:
             out["active"] += 1
         else:
             out["warming"] += 1
-            warm_days.append(days)
-            warm_caps.append(cap)
-    if warm_days:
-        out["warmup_day"] = min(warm_days) + 1          # humans count from day 1
-        out["warmup_days_left"] = max(0, WARMUP_DAYS - min(warm_days))
-        out["warming_cap"] = min(warm_caps)
+            out["warming_cap"] = cap
+    if not graduated:
+        out["warmup_day"] = days + 1                 # humans count from day 1
+        out["warmup_days_left"] = max(0, WARMUP_DAYS - days)
     return out
 
 

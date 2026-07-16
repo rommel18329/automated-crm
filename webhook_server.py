@@ -524,8 +524,10 @@ def _start_multi_batch(agent: str, lead_ids: list[int], amd: bool = True) -> str
     def _fire_calls():
         # Wait until the softphone has actually joined the conference, so the
         # winning call never drops into an empty room (the cause of the silence).
+        # 35s: Twilio Device.connect() is occasionally slow (~2 min seen once);
+        # the softphone's own watchdog handles the rare join that outlasts this.
         waited = 0.0
-        while waited < 20:
+        while waited < 35:
             with _batch_lock:
                 if batch.get("agent_ready"):
                     break
@@ -2135,10 +2137,35 @@ def softphone_page():
     }
 
     if (batchPollInterval) clearInterval(batchPollInterval);
+    var batchStart = Date.now();
     batchPollInterval = setInterval(function() {
+      // Watchdog: a batch that never resolves (Twilio Device join hung, or
+      // every line failed silently with no status callback) must not freeze
+      // the softphone on "ringing" forever — recover after 45s.
+      if (Date.now() - batchStart > 45000 && !call) {
+        clearInterval(batchPollInterval); batchPollInterval = null;
+        stopRinging();
+        setStatus('No connection this batch — moving on', 'no-answer');
+        logMsg('Batch stuck 45s with no answer — recovering, next batch.');
+        if (device) device.disconnectAll();
+        if (queueActive && autoAdvance) scheduleNext(1500, 'Recovering — next batch');
+        return;
+      }
       fetch('/dialer/batch/' + currentBatchId)
         .then(function(r) { return r.json(); })
         .then(function(b) {
+          if (b.status === 'no_agent') {
+            // The batch aborted before this softphone finished joining (slow
+            // connect) — NO calls were fired. Recover to a fresh batch.
+            clearInterval(batchPollInterval); batchPollInterval = null;
+            stopRinging();
+            nameEl.textContent = '';
+            setStatus('Line was slow to connect — retrying batch', 'no-answer');
+            logMsg('Batch aborted (softphone joined too late) — dialing a fresh batch.');
+            if (device) device.disconnectAll();
+            if (queueActive && autoAdvance) scheduleNext(1200, 'Retrying batch');
+            return;
+          }
           if (b.status === 'connected' && b.winner_name) {
             stopRinging();
             nameEl.textContent = b.winner_name;
