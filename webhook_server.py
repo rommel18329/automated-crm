@@ -843,18 +843,11 @@ def voice_multi_answer(batch_id: str, lead_id: int):
     _finalize_winner(batch_id, batch, lead_id, call_sid)
     caller_id = pick_from_number(batch["winner_phone"])
     twiml = _conference_twiml(conference, caller_id)
-    if amd_on:
-        # Fork the callee's audio to the AMD server alongside the live
-        # conference join (insert <Start><Stream> right after <Response>).
-        stream_url = PUBLIC_BASE_URL.replace("https://", "wss://") + "/amd"
-        stream = (
-            f'<Start><Stream name="amd" url="{stream_url}">'
-            f'<Parameter name="batch" value="{batch_id}"/>'
-            f'<Parameter name="lead" value="{lead_id}"/>'
-            '</Stream></Start>'
-        )
-        twiml = twiml.replace('<Response>', '<Response>' + stream, 1)
-        log.info(f"Multi [{batch_id}] lead {lead_id} answered — instant bridge, AMD watching")
+    # AMD auto-kill is RETIRED (2026-07-17). Even beep-only detection false-
+    # fired on a live human voice ("well you got the wrong—" → killed mid-
+    # sentence; 4 real people hung up on across two days). Voicemail skipping
+    # is manual now: the agent hears the greeting and taps 📴 Voicemail, which
+    # auto-advances. No audio fork, no classifier in the call path.
     return Response(twiml, mimetype="text/xml")
 
 
@@ -952,17 +945,12 @@ def voice_amd_result(batch_id: str, lead_id: int):
         sid = batch["call_sids"].get(lead_id)
         already_winner = batch["winner"] == lead_id
     if result == "machine":
-        # HARD SAFETY GATE: on a live bridged call, only the voicemail BEEP
-        # is a trustworthy machine signal. Speech-pattern verdicts hung up on
-        # two real people (2026-07-09) — never act on them again.
-        if "beep" not in (detail or "").lower():
-            log.warning(f"AMD [{batch_id}] machine verdict IGNORED for lead "
-                        f"{lead_id} (reason '{detail}' is not a beep — live-call safety)")
-            return jsonify({"ok": True, "ignored": True})
-        if already_winner:
-            _kill_machine_winner(batch_id, batch, lead_id, sid)
-        else:
-            _handle_machine(batch_id, batch, lead_id, sid)
+        # AUTO-KILL RETIRED (2026-07-17): speech-pattern verdicts hung up on
+        # real people (2026-07-09), then even a beep verdict false-fired on a
+        # live voice mid-sentence. Machine verdicts are now LOG-ONLY — nothing
+        # is ever hung up automatically. VM skipping is the agent's 📴 tap.
+        log.warning(f"AMD [{batch_id}] machine verdict ({detail}) for lead "
+                    f"{lead_id} — LOG ONLY, auto-kill retired")
     return jsonify({"ok": True})
 
 

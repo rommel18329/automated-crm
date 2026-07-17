@@ -2628,16 +2628,14 @@ elif page == "dialer":
                 st.session_state["dialer_lines"] = _lines
 
             if _is_browser and _browser_ready:
-                _amd_on = st.checkbox(
-                    "⚡ Instant connect + auto-skip voicemails (AMD)", value=True, key="dialer_amd",
-                    help="You're bridged the moment someone picks up — you hear the "
-                         "real first hello, zero screening delay. AMD listens alongside "
-                         "for the voicemail BEEP only (speech patterns are never "
-                         "trusted on a live call, so a real person can't be hung up "
-                         "on). On a beep: line hung up, auto-logged 'Voicemail (auto)', "
-                         "next batch dials. VM greetings without a quick beep — just "
-                         "tap 📴 Voicemail yourself.",
-                )
+                # AMD auto-kill retired 2026-07-17: even beep-only detection
+                # hung up on a live person mid-sentence. Instant connect stays;
+                # voicemails are skipped manually (📴 tap → auto-advances).
+                _amd_on = False
+                st.caption("⚡ Instant connect — you hear every pickup live. "
+                           "Voicemails: tap 📴 Voicemail on the softphone (it "
+                           "auto-advances). Auto-skip was retired after it hung "
+                           "up on live people.")
                 _remaining = queue[idx:]
                 _batch_size = min(_lines, len(_remaining))
 
