@@ -1198,6 +1198,80 @@ def dialer_note():
     return _cors(jsonify({"ok": True}))
 
 
+@app.route("/dialer/vm-drop-audio", methods=["POST", "OPTIONS"])
+def dialer_vm_drop_audio():
+    """Save the agent's recorded VM-drop message (WAV from the softphone
+    recorder). Stored per agent; its existence is what unlocks the 📼 button."""
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    agent = re.sub(r"[^a-z0-9]", "", (request.args.get("agent") or "rom").lower()) or "rom"
+    data = request.get_data()
+    if not data or len(data) < 1000:
+        return _cors(jsonify({"ok": False, "error": "no audio received"})), 400
+    if len(data) > 8_000_000:
+        return _cors(jsonify({"ok": False, "error": "recording too large"})), 400
+    path = PROJECT_ROOT / "static" / f"vm_drop_{agent}.wav"
+    path.write_bytes(data)
+    log.info(f"Saved VM drop message for {agent} ({len(data)} bytes)")
+    return _cors(jsonify({"ok": True}))
+
+
+@app.route("/dialer/vm-drop", methods=["POST", "OPTIONS"])
+def dialer_vm_drop():
+    """AGENT-triggered voicemail drop (no AMD involved — the agent's ears are
+    the detector). Redirects the connected lead leg out of the conference to
+    play the recorded message into the voicemail and hang up, logs the
+    disposition, and frees the agent to dial on immediately."""
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    data = request.get_json(force=True, silent=True) or {}
+    agent = re.sub(r"[^a-z0-9]", "", (data.get("agent") or "rom").lower()) or "rom"
+    batch_id = data.get("batch_id") or ""
+    try:
+        lead_id = int(data.get("lead_id"))
+    except (TypeError, ValueError):
+        return _cors(jsonify({"ok": False, "error": "bad lead_id"})), 400
+
+    audio = PROJECT_ROOT / "static" / f"vm_drop_{agent}.wav"
+    if not audio.exists():
+        return _cors(jsonify({"ok": False, "error": "no VM drop message recorded"})), 400
+    with _batch_lock:
+        batch = _multi_batches.get(batch_id)
+        sid = batch["call_sids"].get(lead_id) if batch else None
+    if not sid:
+        return _cors(jsonify({"ok": False, "error": "call not found for this batch"})), 404
+
+    # Redirect the LEAD leg out of the conference: short pause (beep buffer),
+    # play the message into the voicemail, hang up. The leg is independent of
+    # the conference after this, so the agent leaving can't cut it off.
+    try:
+        from twilio.rest import Client as TwilioClient
+        TwilioClient(ACCOUNT_SID, AUTH_TOKEN).calls(sid).update(
+            twiml=(f'<Response><Pause length="1"/>'
+                   f'<Play>{PUBLIC_BASE_URL}/static/vm_drop_{agent}.wav</Play>'
+                   f'<Hangup/></Response>')
+        )
+    except Exception as exc:
+        log.warning(f"VM drop redirect failed for lead {lead_id}: {exc}")
+        return _cors(jsonify({"ok": False, "error": f"redirect failed: {exc}"})), 502
+
+    lead = db.fetch_lead(lead_id, DB_PATH)
+    if lead:
+        db.add_interaction(lead_id, "call", "Call - voicemail, drop message played",
+                           "outbound", DB_PATH, ts=datetime.utcnow())
+        fields = {"last_contact_date": date.today().isoformat(),
+                  "next_action_date": (date.today() + timedelta(days=3)).isoformat()}
+        if lead.get("conversation_stage") == "not_contacted":
+            fields["conversation_stage"] = "initial_contact"
+        db.update_lead(lead_id, fields, DB_PATH)
+        db.log_disposition(lead_id, "Voicemail (drop)", source="popup", agent=agent,
+                           batch_id=batch_id, to_number=lead.get("phone"))
+    with _batch_lock:
+        _lead_claims.pop(lead_id, None)
+    log.info(f"VM drop playing for lead {lead_id} (agent {agent})")
+    return _cors(jsonify({"ok": True}))
+
+
 @app.route("/dialer/current", methods=["GET", "POST"])
 def dialer_current():
     """Per-agent dial channel between Streamlit and each softphone popup.
@@ -1566,6 +1640,8 @@ def softphone_page():
   <button class="btn btn-mute" id="btnMute" disabled>🔇 Mute</button>
   <button class="btn btn-hangup" id="btnHangup" disabled>📕 Hang Up</button>
   <button class="btn btn-mute" id="btnSound" title="Speaker test — plays a ring tone through your browser. If you hear it, your audio output works; dead air on a call means the other side was silent.">🔊 Test</button>
+  <button class="btn btn-call" id="btnDropVm" style="display:none" disabled
+          title="Hear a voicemail greeting? Tap at the beep: your recorded message plays into the voicemail while you move on to the next batch.">📼 Drop VM</button>
 </div>
 <div class="disp" id="disp">
   <div class="disp-title">Call outcome — saves to CRM</div>
@@ -1623,6 +1699,19 @@ def softphone_page():
     <div class="sc-obj"><b>How'd you get my #:</b> Property records are public with the county. I focus on this area and yours came up — no pressure at all.</div>
     <div class="sc-obj"><b>I'll think about it:</b> Of course — what's the main thing you'd want to figure out before deciding?</div>
   </div>
+</details>
+<details class="script" id="vmDropBox">
+  <summary>📼 VM drop message (record once — unlocks the Drop VM button)</summary>
+  <div id="vmRecStatus" style="font-size:12px;color:#666;margin:6px 0">
+    Record a ~15s message once. On voicemail rounds you tap 📼 at the beep and
+    it plays into the voicemail while you keep dialing.
+  </div>
+  <div style="display:flex;gap:6px">
+    <button class="q-btn" id="btnVmRec">● Record</button>
+    <button class="q-btn" id="btnVmStop" disabled>■ Stop</button>
+    <button class="q-btn" id="btnVmSave" disabled>💾 Save</button>
+  </div>
+  <audio id="vmPreview" controls style="width:100%;margin-top:6px;display:none"></audio>
 </details>
 <div class="log" id="log"></div>
 
@@ -1851,6 +1940,7 @@ def softphone_page():
     btnCall.disabled = false;
     btnHangup.disabled = true;
     btnMute.disabled = true;
+    if (typeof btnDropVm !== 'undefined') btnDropVm.disabled = true;
     btnMute.textContent = '🔇 Mute';
     btnMute.classList.remove('active');
     logMsg('Call ended');
@@ -2327,6 +2417,7 @@ def softphone_page():
             nameEl.textContent = b.winner_name;
             phoneEl.textContent = b.winner_phone || '';
             currentLeadId = b.winner || null;   // dispose the winning lead
+            if (hasDropAudio && currentLeadId) btnDropVm.disabled = false;
             loadScriptForLead(currentLeadId);   // fill script for the person who answered
             setStatus('Connected — ' + b.winner_name, 'connected');
             logMsg('Connected to ' + b.winner_name);
@@ -2408,6 +2499,118 @@ def softphone_page():
         testAudio = null;
       });
     } catch (e) { logMsg('Speaker test error: ' + e); }
+  });
+
+  // ── 📼 VM drop: agent-triggered, no AMD anywhere ──────────────────────
+  var btnDropVm = document.getElementById('btnDropVm');
+  var hasDropAudio = false;
+  function checkDropAudio() {
+    fetch('/static/vm_drop_' + AGENT + '.wav', { method: 'HEAD' })
+      .then(function(r) {
+        hasDropAudio = r.ok;
+        btnDropVm.style.display = hasDropAudio ? '' : 'none';
+      })
+      .catch(function() {});
+  }
+  checkDropAudio();
+
+  btnDropVm.addEventListener('click', function() {
+    if (!call || !dispBatchId || !currentLeadId) return;
+    btnDropVm.disabled = true;
+    fetch('/dialer/vm-drop', { method: 'POST', body: JSON.stringify({
+      agent: AGENT, batch_id: dispBatchId, lead_id: currentLeadId }) })
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        if (!j.ok) {
+          logMsg('VM drop failed: ' + (j.error || ''));
+          btnDropVm.disabled = false;
+          return;
+        }
+        logMsg('📼 Message dropping into the voicemail — moving on.');
+        currentLeadId = null;            // server already logged the dispo
+        awaitingDisposition = false;
+        hideDisposition();
+        setStatus('📼 VM dropped — next lead', 'no-answer');
+        if (device) device.disconnectAll();
+        if (queueActive && autoAdvance) scheduleNext(1800, 'VM dropped — next batch');
+      })
+      .catch(function(e) { logMsg('VM drop failed: ' + e); btnDropVm.disabled = false; });
+  });
+
+  // Recorder: capture mic → 16-bit WAV (Twilio <Play> needs wav/mp3, so we
+  // build the WAV in the browser — no server-side conversion needed).
+  var vmRecBtn = document.getElementById('btnVmRec');
+  var vmStopBtn = document.getElementById('btnVmStop');
+  var vmSaveBtn = document.getElementById('btnVmSave');
+  var vmPreview = document.getElementById('vmPreview');
+  var vmStatus = document.getElementById('vmRecStatus');
+  var vmCtx = null, vmProc = null, vmStream = null, vmChunks = [], vmRate = 44100, vmBlob = null;
+
+  function encodeWav(chunks, rate) {
+    var len = 0;
+    chunks.forEach(function(c) { len += c.length; });
+    var pcm = new Float32Array(len), off = 0;
+    chunks.forEach(function(c) { pcm.set(c, off); off += c.length; });
+    var buf = new ArrayBuffer(44 + pcm.length * 2);
+    var v = new DataView(buf);
+    function ws(o, s) { for (var i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); }
+    ws(0, 'RIFF'); v.setUint32(4, 36 + pcm.length * 2, true); ws(8, 'WAVE');
+    ws(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+    v.setUint16(22, 1, true); v.setUint32(24, rate, true);
+    v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    ws(36, 'data'); v.setUint32(40, pcm.length * 2, true);
+    for (var i = 0; i < pcm.length; i++) {
+      var s = Math.max(-1, Math.min(1, pcm[i]));
+      v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    return new Blob([buf], { type: 'audio/wav' });
+  }
+
+  vmRecBtn.addEventListener('click', function() {
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+      vmStream = stream;
+      vmCtx = new (window.AudioContext || window.webkitAudioContext)();
+      vmRate = vmCtx.sampleRate;
+      var src = vmCtx.createMediaStreamSource(stream);
+      vmProc = vmCtx.createScriptProcessor(4096, 1, 1);
+      vmChunks = [];
+      vmProc.onaudioprocess = function(e) {
+        vmChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+      };
+      src.connect(vmProc); vmProc.connect(vmCtx.destination);
+      vmRecBtn.disabled = true; vmStopBtn.disabled = false; vmSaveBtn.disabled = true;
+      vmStatus.textContent = '● Recording… speak your VM message, then hit Stop.';
+    }).catch(function(e) { vmStatus.textContent = 'Mic error: ' + e; });
+  });
+
+  vmStopBtn.addEventListener('click', function() {
+    try { if (vmProc) vmProc.disconnect(); } catch (e) {}
+    try { if (vmStream) vmStream.getTracks().forEach(function(t) { t.stop(); }); } catch (e) {}
+    try { if (vmCtx) vmCtx.close(); } catch (e) {}
+    vmBlob = encodeWav(vmChunks, vmRate);
+    vmChunks = [];
+    vmPreview.src = URL.createObjectURL(vmBlob);
+    vmPreview.style.display = '';
+    vmRecBtn.disabled = false; vmStopBtn.disabled = true; vmSaveBtn.disabled = false;
+    vmStatus.textContent = 'Listen back below. Happy with it? Hit 💾 Save. Or re-record.';
+  });
+
+  vmSaveBtn.addEventListener('click', function() {
+    if (!vmBlob) return;
+    vmSaveBtn.disabled = true;
+    fetch('/dialer/vm-drop-audio?agent=' + AGENT, { method: 'POST', body: vmBlob })
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        if (j.ok) {
+          vmStatus.textContent = '✅ Saved — the 📼 Drop VM button is now live on calls.';
+          logMsg('VM drop message saved.');
+          checkDropAudio();
+        } else {
+          vmStatus.textContent = 'Save failed: ' + (j.error || '');
+          vmSaveBtn.disabled = false;
+        }
+      })
+      .catch(function(e) { vmStatus.textContent = 'Save failed: ' + e; vmSaveBtn.disabled = false; });
   });
 
   // ── Poll /dialer/current for new leads / multi-batches ────────────────
