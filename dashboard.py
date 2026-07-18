@@ -16,6 +16,7 @@ from crm_engine.followup_engine import generate_followup_message
 from crm_engine.messaging_gateway import send_sms, place_call, place_call_number
 from crm_engine.dialer_import import parse_contacts
 from crm_engine import caller_id_pool
+from crm_engine import buyer_match
 
 st.set_page_config(page_title="Silverline CRM", page_icon="🌿", layout="wide")
 
@@ -1261,6 +1262,71 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
         render_buy_box(lead_id, lead)
         st.markdown("</div>", unsafe_allow_html=True)
 
+    # 🤝 Buyer matching — sellers worth moving get scanned against every
+    # investor buy box on file (one cheap AI call for the whole list).
+    if lead["status"] in ("warm", "hot", "contract"):
+        with st.expander("🤝 Match Buyers — AI scans every investor buy box", expanded=False):
+            _bm_key = f"buyer_matches_{lead_id}"
+            if st.button("🔎 Find matching buyers", key=f"bm_run_{lead_id}"):
+                with st.spinner("Scanning buy boxes..."):
+                    _bm_res = buyer_match.match_buyers(lead, interactions)
+                st.session_state[_bm_key] = _bm_res
+                st.session_state["ai_cost_session_total"] = (
+                    st.session_state.get("ai_cost_session_total", 0.0)
+                    + _bm_res.get("cost_usd", 0.0))
+                st.rerun()
+            _bm_res = st.session_state.get(_bm_key)
+            if _bm_res:
+                if _bm_res.get("error"):
+                    st.error(_bm_res["error"])
+                elif not _bm_res.get("matches"):
+                    st.caption(f"No buyers scored 5+ across "
+                               f"{_bm_res.get('buyers_scanned', 0)} buy boxes.")
+                else:
+                    st.caption(f"Scanned {_bm_res['buyers_scanned']} buy boxes "
+                               f"· ${_bm_res.get('cost_usd', 0):.4f}")
+                    for m in _bm_res["matches"]:
+                        _bmc1, _bmc2 = st.columns([4, 1.4])
+                        with _bmc1:
+                            st.markdown(f"**{m['name']}** · `{m['phone']}` "
+                                        f"· match {m['score']}/10")
+                            st.caption(m["reason"])
+                        with _bmc2:
+                            if st.button("Open", key=f"bm_open_{lead_id}_{m['lead_id']}",
+                                         use_container_width=True):
+                                nav_to("Leads", m["lead_id"])
+                            if st.button("✍️ Draft text",
+                                         key=f"bm_draft_{lead_id}_{m['lead_id']}",
+                                         use_container_width=True):
+                                with st.spinner("Drafting..."):
+                                    _bd = buyer_match.draft_buyer_text(
+                                        m, lead, interactions, m["reason"],
+                                        sender="Rom" if st.session_state.get("user", "RJ") == "RJ" else "Gabby")
+                                if _bd.get("message"):
+                                    st.session_state[f"bm_edit_{lead_id}_{m['lead_id']}"] = _bd["message"]
+                                    st.session_state["ai_cost_session_total"] = (
+                                        st.session_state.get("ai_cost_session_total", 0.0)
+                                        + _bd.get("cost_usd", 0.0))
+                                    st.rerun()
+                                else:
+                                    st.error(_bd.get("error", "draft failed"))
+                        _bm_edit_key = f"bm_edit_{lead_id}_{m['lead_id']}"
+                        if _bm_edit_key in st.session_state:
+                            st.text_area("Text to buyer", key=_bm_edit_key, height=70,
+                                         label_visibility="collapsed")
+                            if st.button(f"📤 Send to {m['name'].split()[0]}",
+                                         key=f"bm_send_{lead_id}_{m['lead_id']}",
+                                         type="primary"):
+                                _sms = send_sms(m["lead_id"],
+                                                st.session_state[_bm_edit_key].strip())
+                                if _sms.get("sent"):
+                                    st.toast(f"✓ Sent to {m['name']}")
+                                    st.session_state.pop(_bm_edit_key, None)
+                                    st.rerun()
+                                else:
+                                    st.error(f"Send failed: {_sms.get('error')}")
+                        st.divider()
+
     left, right = st.columns([1.2, 1])
     with left:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -1542,6 +1608,28 @@ if page == "dashboard":
                     db.mark_unmatched_handled(entry["id"])
                     st.rerun()
                 st.markdown("---")
+
+    # 🧠 AI call coaching — reads the week's transcripts and reports what's
+    # working, what's costing calls, and the objections heard.
+    with st.expander("🧠 Call Coaching — AI review of this week's transcripts", expanded=False):
+        if st.button("Generate this week's report", key="coach_gen"):
+            _cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+            _tx = [i["content"].replace("📝 Call transcript:\n", "")
+                   for i in all_interactions
+                   if i["type"] == "note"
+                   and i["content"].startswith("📝 Call transcript:")
+                   and i["timestamp"] >= _cutoff]
+            with st.spinner(f"Reading {len(_tx)} transcripts..."):
+                from crm_engine.ai_message_generator import generate_coaching_report
+                _report, _ccost = generate_coaching_report(_tx)
+            st.session_state["coach_report"] = (_report, _ccost, len(_tx))
+            st.session_state["ai_cost_session_total"] = (
+                st.session_state.get("ai_cost_session_total", 0.0) + _ccost)
+            st.rerun()
+        if "coach_report" in st.session_state:
+            _report, _ccost, _n = st.session_state["coach_report"]
+            st.caption(f"Based on {_n} transcripts · ${_ccost:.4f}")
+            st.markdown(_report)
 
     st.markdown("### Today’s Priorities")
     pcols = st.columns(5)

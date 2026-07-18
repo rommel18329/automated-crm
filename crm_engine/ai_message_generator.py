@@ -190,6 +190,80 @@ Write the note."""
         return ""
 
 
+EXTRACT_SYSTEM_PROMPT = """You extract structured facts from a real-estate
+cold-call transcript ("Them" = the person called; "Rom"/"Gabby" = our caller).
+
+Return STRICT JSON only:
+{"motivation_score": <int 1-10 or null>,
+ "facts": "<one line of concrete facts they stated, or empty string>"}
+
+motivation_score: how motivated THEY are to sell, judged ONLY from what they
+said (10 = must sell now, 5 = open if price right, 1 = firm no / not owner /
+wrong number). null if the call reveals nothing about selling interest.
+facts: only things literally said — price expectations, condition, timeline,
+occupancy, other properties, buyer criteria. Never invent numbers or names.
+No text outside the JSON."""
+
+
+def extract_call_facts(lead: dict, transcript_text: str) -> dict:
+    """Mine a call transcript for structured lead facts. Returns
+    {"motivation_score": int|None, "facts": str} — {} on failure."""
+    if not (transcript_text or "").strip():
+        return {}
+    user_msg = (f"LEAD: {lead.get('name', 'Unknown')} — current motivation "
+                f"{lead.get('motivation_score', '?')}/10\n\nTRANSCRIPT:\n"
+                + transcript_text[:3500] + "\n\nReturn the JSON now.")
+    try:
+        import json as _json
+        resp = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=150,
+            system=EXTRACT_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        raw = (resp.content[0].text or "").strip()
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        start, end = raw.find("{"), raw.rfind("}") + 1
+        return _json.loads(raw[start:end]) if start >= 0 else {}
+    except Exception:
+        return {}
+
+
+COACHING_SYSTEM_PROMPT = """You are a cold-calling coach for a two-person
+real-estate wholesaling team (Rom and Gabby). You get transcripts of their
+recent seller calls ("Them" = the prospect). Write a tight coaching report:
+
+## What's working
+## What's costing you calls
+## Objections you heard (and a better response for each)
+## One thing to change this week
+
+Ground EVERY point in something that actually happened in the transcripts —
+quote short fragments. No generic sales advice that isn't tied to a call.
+Under 350 words, markdown."""
+
+
+def generate_coaching_report(transcripts: list[str]) -> tuple[str, float]:
+    """Weekly coaching from real call transcripts. Returns (markdown, cost)."""
+    if not transcripts:
+        return ("No call transcripts in this period yet — make some calls "
+                "and check back.", 0.0)
+    body = "\n\n---\n\n".join(t[:2500] for t in transcripts[:25])
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=800,
+            system=COACHING_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content":
+                       f"TRANSCRIPTS ({len(transcripts)} calls):\n\n{body}"}],
+        )
+        cost = (resp.usage.input_tokens * 1.00
+                + resp.usage.output_tokens * 5.00) / 1_000_000
+        return ((resp.content[0].text or "").strip(), round(cost, 4))
+    except Exception as exc:
+        return (f"Coaching report failed: {exc}", 0.0)
+
+
 def _strip_ai_tells(text: str) -> str:
     """Hard-strip dashes/AI-giveaway punctuation, even if the model ignores instructions."""
     # Em dash (U+2014), en dash (U+2013), horizontal bar (U+2015) — explicit codepoints

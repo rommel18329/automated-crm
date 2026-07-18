@@ -57,6 +57,30 @@ VI_SERVICE_SID = os.getenv("VOICE_INTELLIGENCE_SERVICE_SID", "")  # call transcr
 # transcript_sid -> lead_id, so the transcript webhook can find its lead
 _transcript_to_lead: dict[str, int] = {}
 
+# ── Speed-to-lead alerts: ping the user's cell the moment a seller reaches
+# out (inbound text / missed call / voicemail). Replying in minutes instead
+# of hours is the highest-proven conversion lever in outbound real estate.
+_last_alert: dict[str, float] = {}     # key -> monotonic ts (rate limit)
+_ALERT_COOLDOWN = 300                  # max one alert per lead per 5 min
+
+
+def _alert_cell(key: str, message: str) -> None:
+    """SMS the user's cell (MY_CELL_NUMBER) from the established number.
+    Background-threaded by callers; rate-limited per source key."""
+    if not MY_CELL_NUMBER or not FROM_NUMBER:
+        return
+    now = time.monotonic()
+    if now - _last_alert.get(key, -_ALERT_COOLDOWN) < _ALERT_COOLDOWN:
+        return
+    _last_alert[key] = now
+    try:
+        from twilio.rest import Client as TwilioClient
+        TwilioClient(ACCOUNT_SID, AUTH_TOKEN).messages.create(
+            body=message[:320], from_=FROM_NUMBER, to=to_e164(MY_CELL_NUMBER))
+        log.info(f"Speed-to-lead alert sent: {message[:60]}")
+    except Exception as exc:
+        log.warning(f"Cell alert failed: {exc}")
+
 IL_AREA_CODES = {"217","224","309","312","331","618","630","708","773","779","815","847"}
 
 def pick_from_number(to_phone: str) -> str:
@@ -181,6 +205,11 @@ def inbound_sms():
         # Unknown number — don't drop it, log it to the unmatched inbox
         db.add_unmatched_message(phone, "text", body, DB_PATH)
         log.info(f"No lead found for {phone} — logged to unmatched inbox")
+        if phone != normalize_phone(MY_CELL_NUMBER):
+            threading.Thread(target=_alert_cell, args=(
+                f"sms:{phone}",
+                f"💬 CRM: text from unknown {phone}: \"{body[:120]}\""),
+                daemon=True).start()
         return _twiml_response()
 
     # Save inbound text
@@ -200,6 +229,14 @@ def inbound_sms():
     # AI auto-note: what they said, what it changes, next move (background).
     threading.Thread(target=auto_note_after_text, args=(lead["id"], DB_PATH),
                      daemon=True).start()
+
+    # Speed-to-lead: ping the user's cell so the reply happens in minutes.
+    if phone != normalize_phone(MY_CELL_NUMBER):
+        threading.Thread(target=_alert_cell, args=(
+            f"lead:{lead['id']}",
+            f"💬 CRM: {lead['name']} ({lead['status']}) texted: \"{body[:130]}\" "
+            f"— reply from Messages or text them at {lead['phone']}"),
+            daemon=True).start()
 
     log.info(f"Saved inbound text from {lead['name']} ({phone}): {body[:60]}")
     return _twiml_response()
@@ -315,6 +352,16 @@ def voice_status():
                 db.add_interaction(
                     lead["id"], "note", "Missed inbound call (no answer)", "inbound", DB_PATH
                 )
+                threading.Thread(target=_alert_cell, args=(
+                    f"call:{lead['id']}",
+                    f"📞 CRM: MISSED CALL from {lead['name']} ({lead['status']}) "
+                    f"{lead['phone']} — call back ASAP, they're live right now"),
+                    daemon=True).start()
+            else:
+                threading.Thread(target=_alert_cell, args=(
+                    f"call:{phone}",
+                    f"📞 CRM: missed call from unknown {phone} — likely a "
+                    f"callback from the dialer"), daemon=True).start()
         return Response(
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<Response>'
@@ -343,6 +390,13 @@ def voice_voicemail():
 
     phone = normalize_phone(from_raw)
     content = f"Voicemail: {transcription}"
+
+    # Speed-to-lead: the VM text tells the user WHAT they want, right on their cell.
+    if phone and phone != normalize_phone(MY_CELL_NUMBER):
+        threading.Thread(target=_alert_cell, args=(
+            f"vm:{phone}",
+            f"🎙 CRM: voicemail from {phone}: \"{transcription[:180]}\""),
+            daemon=True).start()
 
     if phone:
         leads = db.fetch_leads(DB_PATH)
@@ -458,6 +512,27 @@ def _save_transcript(transcript_sid: str) -> None:
                 log.info(f"Saved AI call note for lead {lead_id}")
         except Exception as exc:
             log.warning(f"AI call note failed for lead {lead_id}: {exc}")
+        # Structured extraction: update motivation from what THEY actually
+        # said, and log the concrete facts — feeds the priority engine and
+        # the follow-up AI with real data instead of import defaults.
+        try:
+            from crm_engine.ai_message_generator import extract_call_facts
+            lead = db.fetch_lead(lead_id, DB_PATH)
+            facts = extract_call_facts(lead or {}, text)
+            ms = facts.get("motivation_score")
+            fact_line = (facts.get("facts") or "").strip()
+            parts = []
+            if isinstance(ms, int) and 1 <= ms <= 10 and lead and ms != lead.get("motivation_score"):
+                db.update_lead(lead_id, {"motivation_score": ms}, DB_PATH)
+                parts.append(f"motivation {lead.get('motivation_score')}→{ms}")
+            if fact_line:
+                parts.append(fact_line)
+            if parts:
+                db.add_interaction(lead_id, "note", "📊 From the call: " + " · ".join(parts),
+                                   "outbound", DB_PATH, ts=datetime.utcnow())
+                log.info(f"Extracted call facts for lead {lead_id}: {parts}")
+        except Exception as exc:
+            log.warning(f"Call fact extraction failed for lead {lead_id}: {exc}")
     except Exception as exc:
         log.warning(f"Saving transcript {transcript_sid} failed: {exc}")
 
