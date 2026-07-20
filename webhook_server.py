@@ -2785,7 +2785,16 @@ def softphone_page():
   // wait 20s for us to join before firing — so letting multi through is safe.
   fetch('/dialer/current?agent=' + AGENT)
     .then(function(r) { return r.json(); })
-    .then(function(d) { if (d && d.ts && d.mode !== 'multi') { lastDialTs = d.ts; } })
+    .then(function(d) {
+      if (d && d.ts && d.mode !== 'multi') {
+        // A single-dial command pushed within the last 15s is the click that
+        // just OPENED this popup (CRM call buttons open + push in one click)
+        // — let it dial. Anything older is a stale leftover: baseline it.
+        var t = /^\\d+$/.test(d.ts) ? parseInt(d.ts, 10) : Date.parse(d.ts);
+        var age = Date.now() - t;
+        if (!(age >= 0 && age < 15000)) { lastDialTs = d.ts; }
+      }
+    })
     .catch(function() {})
     .finally(function() { setInterval(pollForLead, 500); });
 

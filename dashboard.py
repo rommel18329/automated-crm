@@ -498,6 +498,40 @@ def render_sent_popup() -> None:
     )
 
 
+def softphone_call_button(lead: dict, from_number: str, label: str | None = None,
+                          height: int = 46) -> None:
+    """A call button that dials through the SOFTPHONE (instant connect,
+    recorded + transcribed) instead of the phone bridge. Must be an HTML
+    button in a component frame: the popup can only open on the same real
+    click, and the same click pushes the lead into the agent's dial channel."""
+    import json as _j
+    _agent = "rom" if st.session_state.get("user", "RJ") == "RJ" else "gabby"
+    _base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+    _sp_url = f"{_base}/softphone?agent={_agent}"
+    _label = label or f"📞 Call {html.escape((lead.get('name') or '').split(' ')[0])}"
+    _payload = _j.dumps({
+        "agent": _agent, "lead_id": lead["id"], "caller_id": from_number,
+        "lead_name": lead.get("name", ""), "lead_phone": lead.get("phone", ""),
+    })
+    components.html(f"""
+<style>body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }}
+#cb {{ display:block; width:100%; padding:9px 6px; border:none; cursor:pointer;
+  background:linear-gradient(180deg,#34a853,#288f43); color:#fff; border-radius:8px;
+  font-size:13.5px; font-weight:700; }}
+#cb:hover {{ filter:brightness(1.06); }}</style>
+<button id="cb">{_label}</button>
+<script>
+document.getElementById('cb').addEventListener('click', function() {{
+  window.open('{_sp_url}', 'crm_softphone_{_agent}', 'width=390,height=640,resizable=yes');
+  var p = {_payload};
+  p.ts = Date.now().toString();
+  fetch('{_base}/dialer/current', {{ method: 'POST', body: JSON.stringify(p) }})
+    .then(() => {{ this.textContent = '📞 Dialing in softphone…'; }})
+    .catch(() => {{ this.textContent = '⚠️ Backend unreachable'; }});
+}});
+</script>""", height=height + 8)
+
+
 def nav_to(page: str, lead_id: int | None = None) -> None:
     page_map = {
         "Dashboard": "dashboard",
@@ -1438,12 +1472,17 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
             key=f"cid_pick_{lead_id}",
             label_visibility="collapsed",
         )
-        if send_col2.button("📞 Call This Lead", key=f"click_to_call_{lead_id}"):
-            result = place_call(lead_id, from_number=_FROM_OPTS[_cid_pick])
-            if result.get("called"):
-                st.success(f"Calling from {_cid_pick} — your phone rings first, then bridges to lead.")
-            else:
-                st.error(f"Call failed: {result.get('error', 'unknown error')}")
+        with send_col2:
+            # Primary: softphone call (instant connect, recorded + transcribed).
+            softphone_call_button(lead, _FROM_OPTS[_cid_pick], label="📞 Call This Lead")
+            # Fallback: two-leg bridge to the cell (for when away from the PC).
+            if st.button("📱 Bridge to my cell instead", key=f"click_to_call_{lead_id}",
+                         type="tertiary"):
+                result = place_call(lead_id, from_number=_FROM_OPTS[_cid_pick])
+                if result.get("called"):
+                    st.success(f"Calling from {_cid_pick} — your phone rings first, then bridges to lead.")
+                else:
+                    st.error(f"Call failed: {result.get('error', 'unknown error')}")
         render_ai_draft_row(lead, f"manual_text_stage_{lead_id}", f"lead_ai_{lead_id}")
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1615,18 +1654,14 @@ if page == "dashboard":
                 if st.button(label, key="missed_call_badge_" + str(c["id"])):
                     nav_to("leads", c["lead_id"])
                 _mc1, _mc2 = st.columns(2)
-                if _mc1.button("📞 Call back", key=f"missed_cb_{c['id']}",
-                               use_container_width=True):
-                    _cb = place_call(c["lead_id"],
-                                     from_number=_FROM_OPTS[_auto_caller_id(c.get("phone", ""))])
-                    if _cb.get("called"):
-                        # Calling back clears it (the outbound call also
-                        # clears it naturally; the mark is belt-and-braces).
-                        db.set_thread_mark(c["lead_id"], "call", "read")
-                        st.toast(f"📞 Calling {c['name']} — your phone rings first.")
-                        st.rerun()
-                    else:
-                        st.error(f"Call failed: {_cb.get('error', 'unknown')}")
+                with _mc1:
+                    # Softphone callback — the outbound call it logs clears
+                    # this missed-call banner automatically.
+                    _mc_lead = lead_lookup.get(c["lead_id"])
+                    if _mc_lead:
+                        softphone_call_button(
+                            _mc_lead, _FROM_OPTS[_auto_caller_id(c.get("phone", ""))],
+                            label="📞 Call back", height=40)
                 if _mc2.button("Mark read", key=f"missed_read_{c['id']}",
                                use_container_width=True):
                     db.set_thread_mark(c["lead_id"], "call", "read")
@@ -2369,12 +2404,10 @@ elif page == "messages":
                     key=f"msg_cid_{_sel_lid}",
                     label_visibility="collapsed",
                 )
-                if _sc2.button("📞 Call", key=f"msg_call_{_sel_lid}", use_container_width=True):
-                    _cr = place_call(_sel_lid, from_number=_FROM_OPTS[_msg_cid])
-                    if _cr.get("called"):
-                        st.toast(f"📞 Calling from {_msg_cid} — your phone rings first.")
-                    else:
-                        st.error(f"Call failed: {_cr.get('error')}")
+                with _sc2:
+                    # Softphone call — instant connect, recorded + transcribed.
+                    softphone_call_button(_sel_lead, _FROM_OPTS[_msg_cid],
+                                          label="📞 Call", height=40)
 
                 # AI-drafted reply, same engine + context box as Follow-ups —
                 # lands in the compose box for editing before you hit Send.
