@@ -81,6 +81,79 @@ def _alert_cell(key: str, message: str) -> None:
     except Exception as exc:
         log.warning(f"Cell alert failed: {exc}")
 
+
+# ── Daily "sellers are waiting on you" reminder ─────────────────────────────
+# Every morning (DAILY_REMINDER_HOUR local, default 9), text the user's cell a
+# digest of every thread where a seller had the last word and every missed
+# call not yet returned. Reuses the persistent read-state, so an item stops
+# nagging the moment it's actually replied to / called back / marked read —
+# and keeps nagging daily until then.
+DAILY_REMINDER_HOUR = int(os.getenv("DAILY_REMINDER_HOUR", "9"))
+_DIGEST_STATE = PROJECT_ROOT / "daily_digest_state.json"
+
+
+def _waiting_digest() -> str:
+    """Compose the digest, or '' when nobody is waiting."""
+    try:
+        unread_ids = db.unread_message_lead_ids(DB_PATH)
+        missed = db.fetch_unacknowledged_missed_calls(DB_PATH)
+    except Exception as exc:
+        log.warning(f"digest query failed: {exc}")
+        return ""
+    if not unread_ids and not missed:
+        return ""
+    parts = []
+    if unread_ids:
+        with db.get_conn(DB_PATH) as conn:
+            rows = conn.execute(
+                """SELECT i.lead_id, l.name, MAX(i.timestamp) t
+                   FROM interactions i JOIN leads l ON l.id = i.lead_id
+                   WHERE i.type='text' AND i.direction='inbound'
+                     AND i.lead_id IN (%s)
+                   GROUP BY i.lead_id ORDER BY t DESC"""
+                % ",".join("?" * len(unread_ids)),
+                tuple(unread_ids),
+            ).fetchall()
+        names = []
+        for r in rows[:5]:
+            try:
+                days = (date.today() - datetime.fromisoformat(r["t"]).date()).days
+                names.append(f"{r['name']} ({days}d)" if days > 0 else r["name"])
+            except Exception:
+                names.append(r["name"])
+        more = f" +{len(unread_ids) - 5} more" if len(unread_ids) > 5 else ""
+        parts.append(f"{len(unread_ids)} awaiting a text reply: "
+                     + ", ".join(names) + more)
+    if missed:
+        mnames = ", ".join(m["name"] for m in missed[:4])
+        more = f" +{len(missed) - 4} more" if len(missed) > 4 else ""
+        parts.append(f"{len(missed)} missed call(s) not returned: {mnames}{more}")
+    return "⏰ CRM daily: " + " | ".join(parts) + " — open Messages."
+
+
+def _daily_digest_loop() -> None:
+    while True:
+        try:
+            now = datetime.now()
+            sent_day = ""
+            try:
+                sent_day = json.loads(_DIGEST_STATE.read_text()).get("sent", "")
+            except Exception:
+                pass
+            if now.hour >= DAILY_REMINDER_HOUR and sent_day != now.date().isoformat():
+                msg = _waiting_digest()
+                if msg:
+                    _alert_cell("daily-digest", msg)
+                # mark the day handled either way; fresh events during the day
+                # get instant speed-to-lead alerts anyway
+                _DIGEST_STATE.write_text(json.dumps({"sent": now.date().isoformat()}))
+        except Exception as exc:
+            log.warning(f"daily digest loop error: {exc}")
+        time.sleep(600)
+
+
+threading.Thread(target=_daily_digest_loop, daemon=True).start()
+
 IL_AREA_CODES = {"217","224","309","312","331","618","630","708","773","779","815","847"}
 
 def pick_from_number(to_phone: str) -> str:
