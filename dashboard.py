@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 import base64
+import html
 import io
 import os
 import re
@@ -449,6 +450,52 @@ def fmt_date_time(iso_value: str) -> tuple[str, str]:
     current_year = datetime.now().year
     date_str = dt.strftime("%m-%d") if dt.year == current_year else dt.strftime("%m-%d-%Y")
     return date_str, dt.strftime("%I:%M %p").lstrip("0")
+
+
+def flag_sent(name: str, message: str) -> None:
+    """Queue the verified-send popup for the run AFTER st.rerun(). Call this
+    ONLY when send_sms returned sent=True (Twilio accepted the message) —
+    never optimistically."""
+    st.session_state["_sent_popup"] = {"name": name, "preview": message[:110]}
+
+
+def render_sent_popup() -> None:
+    """Render the one-shot 'Message sent' card (top-right, slides in, fades
+    out). Shows exactly once, only after a server-verified send."""
+    data = st.session_state.pop("_sent_popup", None)
+    if not data:
+        return
+    _name = html.escape(data["name"])
+    _prev = html.escape(data["preview"])
+    st.markdown(
+        f"""<div class='sent-pop'>
+  <div class='sent-pop-ico'>✓</div>
+  <div>
+    <div class='sent-pop-title'>Message sent</div>
+    <div class='sent-pop-sub'>to {_name}</div>
+    <div class='sent-pop-msg'>“{_prev}”</div>
+  </div>
+</div>
+<style>
+.sent-pop {{ position:fixed; top:74px; right:26px; z-index:99999;
+  display:flex; gap:12px; align-items:flex-start; background:#fff;
+  border:1px solid #cfe0d2; border-left:5px solid #2e9e52;
+  border-radius:12px; padding:14px 18px; max-width:340px;
+  box-shadow:0 10px 34px rgba(18,42,24,.20); pointer-events:none;
+  animation: sentpop-in .35s cubic-bezier(.2,.9,.3,1.15),
+             sentpop-out .6s ease 4.5s forwards; }}
+.sent-pop-ico {{ width:30px; height:30px; border-radius:50%; background:#2e9e52;
+  color:#fff; display:flex; align-items:center; justify-content:center;
+  font-weight:800; font-size:16px; flex:0 0 30px; }}
+.sent-pop-title {{ font-weight:700; color:#183f24; font-size:.95rem; }}
+.sent-pop-sub {{ font-size:.85rem; color:#4a5a4e; }}
+.sent-pop-msg {{ font-size:.8rem; color:#8a8a8a; margin-top:4px; font-style:italic; }}
+@keyframes sentpop-in {{ from {{ transform:translateX(46px); opacity:0 }}
+                         to   {{ transform:none; opacity:1 }} }}
+@keyframes sentpop-out {{ to {{ opacity:0; transform:translateY(-10px); visibility:hidden }} }}
+</style>""",
+        unsafe_allow_html=True,
+    )
 
 
 def nav_to(page: str, lead_id: int | None = None) -> None:
@@ -1320,11 +1367,11 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
                                 _sms = send_sms(m["lead_id"],
                                                 st.session_state[_bm_edit_key].strip())
                                 if _sms.get("sent"):
-                                    st.toast(f"✓ Sent to {m['name']}")
+                                    flag_sent(m["name"], st.session_state[_bm_edit_key].strip())
                                     st.session_state.pop(_bm_edit_key, None)
                                     st.rerun()
                                 else:
-                                    st.error(f"Send failed: {_sms.get('error')}")
+                                    st.error(f"❌ NOT sent to {m['name']}: {_sms.get('error')}")
                         st.divider()
 
     left, right = st.columns([1.2, 1])
@@ -1375,11 +1422,12 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
             if text_to_send:
                 result = send_sms(lead_id, text_to_send)
                 if result.get("sent"):
+                    flag_sent(lead["name"], text_to_send)
                     st.session_state.pop(manual_msg_key, None)
-                    st.success("Sent!")
+                    st.rerun()
                 else:
-                    st.error(f"Send failed: {result.get('error', 'unknown error')}")
-                st.rerun()
+                    # No rerun on failure — keep the error (and the draft) visible.
+                    st.error(f"❌ NOT sent: {result.get('error', 'unknown error')}")
             else:
                 st.warning("Type a message first.")
         _auto_cid = _auto_caller_id(lead.get("phone", ""))
@@ -1512,6 +1560,7 @@ with st.sidebar:
 
 st.divider()
 page = st.session_state["page"]
+render_sent_popup()   # one-shot verified-send confirmation (any page)
 
 if page == "dashboard":
     calls_completed_today = sum(
@@ -2031,7 +2080,13 @@ elif page == "followups":
                 if lid > 0:
                     ts = datetime.utcnow()
                     approved_text = st.session_state[msg_key]
-                    send_sms(lid, approved_text)  # logs the text interaction internally
+                    _send_res = send_sms(lid, approved_text)  # logs the text interaction internally
+                    if not _send_res.get("sent"):
+                        # Send FAILED: no note, no snooze, keep the draft so
+                        # the agent can retry. Never claim "sent" unverified.
+                        st.error(f"❌ NOT sent: {_send_res.get('error', 'unknown error')} "
+                                 f"— nothing was logged or snoozed; fix and retry.")
+                        st.stop()
                     user_value = st.session_state.get("user", "RJ")
                     user_dot = "🔴" if user_value == "RJ" else "🟢"
 
@@ -2060,7 +2115,7 @@ elif page == "followups":
                     st.session_state.pop(flags_key, None)
                     st.session_state.pop(reasoning_key, None)
                     autoplay_audio()
-                    st.success(f"Sent! Snoozed {snooze} days.")
+                    flag_sent(item["lead_name"], approved_text)
                 st.rerun()
             if c2.button("Edit", key=f"f_edit_{lid}"):
                 st.info("Edit the text above, then hit Approve & Send.")
@@ -2298,11 +2353,12 @@ elif page == "messages":
                     if (_msg_text or "").strip():
                         _res = send_sms(_sel_lid, _msg_text.strip())
                         if _res.get("sent"):
+                            flag_sent(_sel_lead["name"], _msg_text.strip())
                             st.session_state.pop(_compose_key, None)
-                            st.toast(f"✓ Sent to {_sel_lead['name']}")
+                            st.rerun()
                         else:
-                            st.error(f"Send failed: {_res.get('error')}")
-                        st.rerun()
+                            # No rerun on failure — error and draft stay visible.
+                            st.error(f"❌ NOT sent: {_res.get('error')}")
                     else:
                         st.warning("Type a message first.")
                 _msg_auto_cid = _auto_caller_id(_sel_lead.get("phone", ""))
