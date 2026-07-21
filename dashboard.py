@@ -1260,7 +1260,14 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
     conversation = lead_conversation_items(lead_id)
     timeline_text, address_text, situation_text, _ = parse_timeline_parts(lead["timeline"])
 
-    st.markdown(f"### {lead['name']}")
+    _u_qs = "gl" if st.session_state.get("user") == "GL" else "rom"
+    st.markdown(
+        f"### {html.escape(lead['name'])} "
+        f"<a href='?page=leads&lead={lead_id}&u={_u_qs}' target='_blank' "
+        f"style='font-size:13px;font-weight:600;text-decoration:none;color:#5E8A67'>"
+        f"⧉ new tab</a>",
+        unsafe_allow_html=True,
+    )
     c_top1, c_top2 = st.columns(2)
     c_top1.markdown(f"**Phone:** {lead['phone']}")
     c_top2.markdown(f"**Stage:** {human_stage(lead['conversation_stage'])}")
@@ -1522,6 +1529,18 @@ if "page" not in st.session_state:
 query_params = st.query_params
 if "page" in query_params:
     st.session_state["page"] = query_params["page"]
+# Agent (Rom/Gabby) persists in the URL so a new tab / reload keeps whoever
+# you are — nav is now real links (full reload), which would otherwise reset it.
+if query_params.get("u") in ("rom", "gl"):
+    st.session_state["user"] = "GL" if query_params["u"] == "gl" else "RJ"
+# Deep-link a specific lead so it can be opened in its own tab.
+if "lead" in query_params:
+    try:
+        _qlead = int(query_params["lead"])
+        st.session_state["selected_lead_id"] = _qlead
+        st.session_state["lead_list_collapsed"] = True
+    except (ValueError, TypeError):
+        pass
 if "lead_list_collapsed" not in st.session_state:
     st.session_state["lead_list_collapsed"] = False
 if "completed_calls" not in st.session_state:
@@ -1539,6 +1558,10 @@ with head_right:
         st.session_state["user"] = "RJ"
     is_gl = st.toggle("", value=st.session_state["user"] == "GL", key="user_toggle", label_visibility="collapsed")
     st.session_state["user"] = "GL" if is_gl else "RJ"
+    # Keep the agent in the URL so nav links (and new tabs) stay this agent.
+    _u_want = "gl" if is_gl else "rom"
+    if st.query_params.get("u") != _u_want:
+        st.query_params["u"] = _u_want
     st.markdown("##### Quick Search")
     render_global_search(all_leads)
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1561,41 +1584,50 @@ with st.sidebar:
         "dashboard": "🏠", "leads": "👤", "call_list": "📋", "dialer": "⚡",
         "caller_health": "🛡️", "followups": "🔁", "messages": "💬",
     }
+    # Nav items are REAL links now — middle-click / ctrl-click opens the page
+    # in a new tab so you can watch several pages at once. Left-click still
+    # navigates in place. The agent (?u) rides along so new tabs stay you.
+    _u_qs = "gl" if st.session_state.get("user") == "GL" else "rom"
+    st.markdown("""
+<style>
+.sl-nav-link { display:flex; align-items:center; gap:10px; width:100%;
+  padding:9px 13px; margin:3px 0; border-radius:9px; text-decoration:none;
+  font-size:14px; font-weight:600; color:#dfeae1 !important;
+  transition:background .12s; }
+.sl-nav-link:hover { background:rgba(255,255,255,.08); }
+.sl-nav-link.active { background:linear-gradient(180deg,#5E8A67,#49764F);
+  color:#fff !important; box-shadow:0 2px 8px rgba(20,50,26,.25); }
+.sl-nav-ico { font-size:16px; }
+.sl-nav-badge { margin-left:auto; background:#ff3b30; color:#fff;
+  border-radius:50%; min-width:20px; height:20px; display:inline-flex;
+  align-items:center; justify-content:center; font-size:11px; font-weight:700;
+  padding:0 5px; }
+</style>""", unsafe_allow_html=True)
 
-    def nav_item(label: str, page_key: str) -> None:
-        is_active = st.session_state["page"] == page_key
-        btn_style = "primary" if is_active else "secondary"
-        icon = _NAV_ICONS.get(page_key, "•")
-        if st.button(f"{icon}  {label}", key=f"nav_btn_{page_key}",
-                     use_container_width=True, type=btn_style):
-            nav_to(page_key)
-
-    nav_item("Dashboard", "dashboard")
-    nav_item("Leads", "leads")
-    nav_item("Call List", "call_list")
-    nav_item("Dialer", "dialer")
-    nav_item("Caller ID Health", "caller_health")
-    nav_item("Follow-ups", "followups")
-
-    # Messages nav item with unread badge. Persistent: only replying (text
-    # back = message, call back = missed call) or an explicit "Mark read"
-    # clears an item — opening the page or clicking around never does.
     _unread_msg_leads = db.unread_message_lead_ids()
     _missed_calls_open = db.fetch_unacknowledged_missed_calls()
     _unread_count = len(_unread_msg_leads) + len(_missed_calls_open)
-    _msg_nav_col, _msg_badge_col = st.columns([5, 1])
-    with _msg_nav_col:
-        nav_item("Messages", "messages")
-    with _msg_badge_col:
-        if _unread_count > 0:
-            _badge_label = str(_unread_count) if _unread_count < 100 else "99+"
-            st.markdown(
-                f"<div style='background:#ff3b30;color:#fff;border-radius:50%;"
-                f"min-width:20px;height:20px;display:flex;align-items:center;"
-                f"justify-content:center;font-size:11px;font-weight:700;"
-                f"padding:0 4px;margin-top:6px'>{_badge_label}</div>",
-                unsafe_allow_html=True,
-            )
+
+    def nav_link(label: str, page_key: str, badge: int = 0) -> None:
+        active = " active" if st.session_state["page"] == page_key else ""
+        icon = _NAV_ICONS.get(page_key, "•")
+        badge_html = (f"<span class='sl-nav-badge'>{badge if badge < 100 else '99+'}</span>"
+                      if badge > 0 else "")
+        st.markdown(
+            f"<a class='sl-nav-link{active}' href='?page={page_key}&u={_u_qs}' "
+            f"target='_self'><span class='sl-nav-ico'>{icon}</span>"
+            f"<span>{label}</span>{badge_html}</a>",
+            unsafe_allow_html=True,
+        )
+
+    nav_link("Dashboard", "dashboard")
+    nav_link("Leads", "leads")
+    nav_link("Call List", "call_list")
+    nav_link("Dialer", "dialer")
+    nav_link("Caller ID Health", "caller_health")
+    nav_link("Follow-ups", "followups")
+    nav_link("Messages", "messages", badge=_unread_count)
+    st.caption("💡 Middle-click (or Ctrl-click) any page to open it in a new tab.")
 
 st.divider()
 page = st.session_state["page"]
