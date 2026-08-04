@@ -16,6 +16,10 @@ _ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 _AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 _FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")        # 515 — Iowa default
 _FROM_IL_NUMBER = os.getenv("TWILIO_FROM_IL_NUMBER", "") # 773 — Chicago/IL
+# Registered A2P messaging service. Passed ALONGSIDE from_ so the specific
+# number (area-code local presence) is preserved while the message is
+# explicitly associated with the approved 10DLC campaign.
+_MESSAGING_SERVICE_SID = os.getenv("TWILIO_MESSAGING_SERVICE_SID", "")
 _MY_CELL = os.getenv("MY_CELL_NUMBER", "")
 _PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
@@ -157,11 +161,12 @@ def send_sms(lead_id: int, message: str, db_path: Path = db.DB_PATH) -> dict:
     error_msg = None
     try:
         client = Client(_ACCOUNT_SID, _AUTH_TOKEN)
-        client.messages.create(
-            body=clean_message,
-            from_=from_number,
-            to=e164,
-        )
+        _create_kwargs = {"body": clean_message, "from_": from_number, "to": e164}
+        if _MESSAGING_SERVICE_SID:
+            # from_ keeps area-code local presence; the service SID makes the
+            # approved-campaign association explicit (Twilio accepts both).
+            _create_kwargs["messaging_service_sid"] = _MESSAGING_SERVICE_SID
+        client.messages.create(**_create_kwargs)
         sent = True
         log_content = clean_message
     except Exception as exc:

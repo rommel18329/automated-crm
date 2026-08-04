@@ -53,6 +53,7 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")
 FROM_IL_NUMBER = os.getenv("TWILIO_FROM_IL_NUMBER", "")
 VI_SERVICE_SID = os.getenv("VOICE_INTELLIGENCE_SERVICE_SID", "")  # call transcription
+MESSAGING_SERVICE_SID = os.getenv("TWILIO_MESSAGING_SERVICE_SID", "")  # A2P campaign
 
 # transcript_sid -> lead_id, so the transcript webhook can find its lead
 _transcript_to_lead: dict[str, int] = {}
@@ -75,8 +76,11 @@ def _alert_cell(key: str, message: str) -> None:
     _last_alert[key] = now
     try:
         from twilio.rest import Client as TwilioClient
-        TwilioClient(ACCOUNT_SID, AUTH_TOKEN).messages.create(
-            body=message[:320], from_=FROM_NUMBER, to=to_e164(MY_CELL_NUMBER))
+        _kw = {"body": message[:320], "from_": FROM_NUMBER,
+               "to": to_e164(MY_CELL_NUMBER)}
+        if MESSAGING_SERVICE_SID:
+            _kw["messaging_service_sid"] = MESSAGING_SERVICE_SID
+        TwilioClient(ACCOUNT_SID, AUTH_TOKEN).messages.create(**_kw)
         log.info(f"Speed-to-lead alert sent: {message[:60]}")
     except Exception as exc:
         log.warning(f"Cell alert failed: {exc}")
