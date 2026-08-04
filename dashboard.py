@@ -21,6 +21,24 @@ from crm_engine import buyer_match
 
 st.set_page_config(page_title="Silverline CRM", page_icon="🌿", layout="wide")
 
+# Auto-reconnect: if the Streamlit server restarts (which severs this tab's
+# live connection and silently freezes it), detect the drop-then-recovery via
+# the health endpoint and reload the tab so it never shows a stale view.
+components.html(
+    """<script>
+(function() {
+  var wasDown = false;
+  function ping() {
+    fetch('/_stcore/health', {cache:'no-store'})
+      .then(function(r){ if(r.ok){ if(wasDown){ try{window.top.location.reload();}catch(e){location.reload();} } wasDown=false; } else { wasDown=true; } })
+      .catch(function(){ wasDown=true; });
+  }
+  setInterval(ping, 4000);
+})();
+</script>""",
+    height=0,
+)
+
 title_col1, title_col2 = st.columns([8, 1])
 
 with title_col1:
@@ -1418,7 +1436,10 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
     left, right = st.columns([1.2, 1])
     with left:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown(f"**Conversation** ({len(conversation)} messages)")
+        _conv_hdr, _conv_btn = st.columns([4, 1])
+        _conv_hdr.markdown(f"**Conversation** ({len(conversation)} messages)")
+        if _conv_btn.button("🔄", key=f"conv_refresh_{lead_id}", help="Refresh conversation"):
+            st.rerun()
         with st.container(height=420):
             render_imessage(conversation, max_items=len(conversation))
         st.markdown("</div>", unsafe_allow_html=True)
