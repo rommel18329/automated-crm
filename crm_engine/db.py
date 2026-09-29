@@ -11,6 +11,156 @@ from typing import Any, Iterable
 
 DB_PATH = Path(__file__).resolve().parents[1] / "crm.db"
 
+# Additive email migration, explicitly approved in dev/active/2026-09-29-email-review.md.
+# This is intentionally not called by init_db or normal dashboard startup.
+EMAIL_MIGRATION = """
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS email_sync_state (
+    mailbox TEXT PRIMARY KEY,
+    last_success_at TEXT,
+    last_error TEXT,
+    sync_cursor TEXT
+);
+CREATE TABLE IF NOT EXISTS email_reviews (
+    mailbox TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    latest_message_id TEXT NOT NULL,
+    latest_received_at TEXT NOT NULL,
+    thread_json TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    reply_reason TEXT NOT NULL DEFAULT '',
+    draft_text TEXT NOT NULL DEFAULT '',
+    draft_basis_id TEXT,
+    review_state TEXT NOT NULL DEFAULT 'needs_review'
+        CHECK (review_state IN ('needs_review','no_reply_needed','dismissed','answered')),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (mailbox, thread_id)
+);
+CREATE TABLE IF NOT EXISTS email_send_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    mailbox TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    basis_message_id TEXT NOT NULL,
+    recipient TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    approved_text TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    approved_at TEXT NOT NULL,
+    rfc_message_id TEXT NOT NULL UNIQUE,
+    send_state TEXT NOT NULL
+        CHECK (send_state IN ('sending','accepted','failed','unknown')),
+    gmail_message_id TEXT,
+    last_error TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS email_send_active_basis
+    ON email_send_attempts(mailbox, thread_id, basis_message_id)
+    WHERE send_state IN ('sending','accepted','unknown');
+COMMIT;
+"""
+
+
+def migrate_email(db_path: Path = DB_PATH) -> Path | None:
+    """Back up an existing database consistently, then apply only approved SQL."""
+    backup_path = None
+    if db_path.exists():
+        backup_path = db_path.with_name(db_path.name + '.backup-email-' + datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+        with sqlite3.connect(db_path) as source, sqlite3.connect(backup_path) as target:
+            source.backup(target)
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(EMAIL_MIGRATION)
+    return backup_path
+
+
+def email_ready(db_path: Path = DB_PATH) -> bool:
+    if not db_path.exists():
+        return False
+    with sqlite3.connect(db_path) as conn:
+        return conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN "
+                            "('email_reviews','email_sync_state','email_send_attempts')").fetchone()[0] == 3
+
+
+def email_reviews(mailbox: str, db_path: Path = DB_PATH) -> list[dict]:
+    if not email_ready(db_path):
+        return []
+    with get_conn(db_path) as conn:
+        return [dict(r) for r in conn.execute(
+            'SELECT * FROM email_reviews WHERE mailbox=? ORDER BY latest_received_at DESC', (mailbox,))]
+
+
+def email_review(mailbox: str, thread_id: str, db_path: Path = DB_PATH) -> dict | None:
+    with get_conn(db_path) as conn:
+        row = conn.execute('SELECT * FROM email_reviews WHERE mailbox=? AND thread_id=?',
+                           (mailbox, thread_id)).fetchone()
+        return dict(row) if row else None
+
+
+def save_email_review(row: dict, db_path: Path = DB_PATH) -> None:
+    columns = ('mailbox', 'thread_id', 'latest_message_id', 'latest_received_at', 'thread_json',
+               'summary', 'reply_reason', 'draft_text', 'draft_basis_id', 'review_state', 'updated_at')
+    with get_conn(db_path) as conn:
+        conn.execute('INSERT INTO email_reviews (' + ','.join(columns) + ') VALUES (' +
+                     ','.join('?' for _ in columns) + ') ON CONFLICT(mailbox,thread_id) DO UPDATE SET ' +
+                     ','.join(c + '=excluded.' + c for c in columns[2:]), tuple(row[c] for c in columns))
+
+
+def edit_email_review(mailbox: str, thread_id: str, basis: str, text: str,
+                      state: str, stamp: str, db_path: Path = DB_PATH) -> bool:
+    with get_conn(db_path) as conn:
+        cursor = conn.execute('UPDATE email_reviews SET draft_text=?,review_state=?,updated_at=? '
+                              'WHERE mailbox=? AND thread_id=? AND latest_message_id=?',
+                              (text, state, stamp, mailbox, thread_id, basis))
+        return cursor.rowcount == 1
+
+
+def email_sync_status(mailbox: str, db_path: Path = DB_PATH) -> dict:
+    if not email_ready(db_path):
+        return {}
+    with get_conn(db_path) as conn:
+        row = conn.execute('SELECT * FROM email_sync_state WHERE mailbox=?', (mailbox,)).fetchone()
+        return dict(row) if row else {}
+
+
+def save_email_sync(mailbox: str, success: str | None, error: str | None,
+                    cursor: str | None = None, db_path: Path = DB_PATH) -> None:
+    with get_conn(db_path) as conn:
+        conn.execute('INSERT INTO email_sync_state(mailbox,last_success_at,last_error,sync_cursor) '
+                     'VALUES (?,?,?,?) ON CONFLICT(mailbox) DO UPDATE SET '
+                     'last_success_at=COALESCE(excluded.last_success_at,email_sync_state.last_success_at),'
+                     'last_error=excluded.last_error,'
+                     'sync_cursor=COALESCE(excluded.sync_cursor,email_sync_state.sync_cursor)',
+                     (mailbox, success, error, cursor))
+
+
+def claim_email_send(attempt: dict, db_path: Path = DB_PATH) -> None:
+    """The unique partial index rejects a second active claim even across processes."""
+    columns = ('attempt_id','mailbox','thread_id','basis_message_id','recipient','subject',
+               'approved_text','approved_by','approved_at','rfc_message_id','send_state','updated_at')
+    with get_conn(db_path) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        conn.execute('INSERT INTO email_send_attempts (' + ','.join(columns) + ') VALUES (' +
+                     ','.join('?' for _ in columns) + ')', tuple(attempt[c] for c in columns))
+
+
+def finish_email_send(attempt_id: str, state: str, stamp: str, gmail_id: str | None = None,
+                      error: str | None = None, db_path: Path = DB_PATH) -> None:
+    with get_conn(db_path) as conn:
+        conn.execute('UPDATE email_send_attempts SET send_state=?,updated_at=?,gmail_message_id=?,'
+                     'last_error=? WHERE attempt_id=?', (state, stamp, gmail_id, error, attempt_id))
+        if state == 'accepted':
+            conn.execute("UPDATE email_reviews SET review_state='answered',updated_at=? WHERE "
+                         '(mailbox,thread_id,latest_message_id) IN '
+                         '(SELECT mailbox,thread_id,basis_message_id FROM email_send_attempts WHERE attempt_id=?)',
+                         (stamp, attempt_id))
+
+
+def email_attempts(mailbox: str, db_path: Path = DB_PATH) -> list[dict]:
+    if not email_ready(db_path):
+        return []
+    with get_conn(db_path) as conn:
+        return [dict(r) for r in conn.execute('SELECT * FROM email_send_attempts WHERE mailbox=? '
+                                             'ORDER BY approved_at DESC', (mailbox,))]
+
 
 @dataclass(slots=True)
 class Lead:

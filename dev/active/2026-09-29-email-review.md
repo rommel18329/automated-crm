@@ -1,6 +1,6 @@
 # Feature: Gmail email review
 **Started:** 2026-09-29
-**Status:** awaiting plan and migration approval
+**Status:** implemented; waiting for Google OAuth connection
 
 ## Confirmed request
 Monitor contactus@silverlineinvestment.group, hosted by Gmail. Show a daily CRM list of conversations needing a reply, their context, and editable suggested replies. Approval sends the displayed reply; denial does not send.
@@ -91,5 +91,16 @@ COMMIT;
 5. Connect Gmail through a browser OAuth consent flow. Live monitoring depends on Google Cloud OAuth configuration, consent and successful mailbox authentication; never request a password or token in chat.
 
 ## Open decisions
-- Approve the proposed 30-day initial lookback, 15-minute sync, reply-to-sender behavior, denial semantics, AI processing, file plan and exact additive migration.
-- Existing repository changes need an audited checkpoint before feature coding, per AGENTS.md.
+- The user approved the plan and exact migration on 2026-09-29 and confirmed direct Google sign-in as contactus@silverlineinvestment.group.
+- Google Desktop OAuth client configuration and user consent are still needed. No mailbox contents have been read and no live email has been sent.
+
+## Implementation record
+- Existing code was checkpointed at 5014b09 before feature edits. Local runtime files, secrets, backups and nested worktrees were excluded.
+- Added Gmail OAuth/read/send transport, email-only AI prompts, full-thread review UI, connection upload/sign-in controls, edited reply persistence, deny/reopen behavior, stale approval checks and uncertain-send reconciliation.
+- Installed Google API/OAuth libraries in the existing Python environment.
+- Applied the exact SQL above after temporary-database tests, with backup crm.db.backup-email-20260929-143738-545034. Verified existing table definitions and row counts were unchanged.
+- Installed the Windows task Silverline CRM Gmail Sync (15-minute interval, interactive user, hidden pythonw process). It is ready, but cannot sync until OAuth is connected.
+- Tests cover persistence, migration equivalence/idempotence, concurrent claims, double sends, uncertain outcomes, threading, pagination, MIME bodies, drafts, AI failures and Streamlit review interactions. Live sends were not tested or performed.
+- Final validation: python -m pytest tests/ completed with 40 passed (six existing datetime.utcnow deprecation warnings). Python compilation and git diff --check passed.
+- Runtime files remain in the Git-ignored .email-local directory. UI shows connection status, last successful sync and send history.
+- Separately requested next feature: one-time cross-channel catch-up review, pending its own plan approval. Read-only inspection found local interaction history ends 2026-08-04; provider reconciliation is required before claiming a complete catch-up list.

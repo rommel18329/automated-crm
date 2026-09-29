@@ -4,3 +4,11 @@ __pycache__/
 .pytest_cache/
 crm.db
 .env
+.email-local/
+.email-test-tmp/
+.email-test-cache/
+crm.db.backup*
+client_secret*.json
+credentials.json
+token.json
+*.egg-info/

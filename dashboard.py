@@ -18,6 +18,8 @@ from crm_engine.messaging_gateway import send_sms, place_call, place_call_number
 from crm_engine.dialer_import import parse_contacts
 from crm_engine import caller_id_pool
 from crm_engine import buyer_match
+from crm_engine.email_ui import render_email_review, catch_up_if_due
+from crm_engine.gmail_client import MAILBOX as EMAIL_MAILBOX
 
 st.set_page_config(page_title="Silverline CRM", page_icon="🌿", layout="wide")
 
@@ -1603,7 +1605,7 @@ with st.sidebar:
 
     _NAV_ICONS = {
         "dashboard": "🏠", "leads": "👤", "call_list": "📋", "dialer": "⚡",
-        "caller_health": "🛡️", "followups": "🔁", "messages": "💬",
+        "caller_health": "🛡️", "followups": "🔁", "messages": "💬", "email_review": "📧",
     }
     # Nav items are REAL links now — middle-click / ctrl-click opens the page
     # in a new tab so you can watch several pages at once. Left-click still
@@ -1648,13 +1650,19 @@ with st.sidebar:
     nav_link("Caller ID Health", "caller_health")
     nav_link("Follow-ups", "followups")
     nav_link("Messages", "messages", badge=_unread_count)
+    nav_link("Email Review", "email_review", badge=sum(
+        row['review_state'] == 'needs_review' for row in db.email_reviews(EMAIL_MAILBOX)))
     st.caption("💡 Middle-click (or Ctrl-click) any page to open it in a new tab.")
 
 st.divider()
 page = st.session_state["page"]
 render_sent_popup()   # one-shot verified-send confirmation (any page)
 
-if page == "dashboard":
+if page == "email_review":
+    catch_up_if_due()
+    render_email_review()
+
+elif page == "dashboard":
     calls_completed_today = sum(
         1 for item in all_interactions
         if item["type"] == "call" and datetime.fromisoformat(item["timestamp"]).date() == date.today()
