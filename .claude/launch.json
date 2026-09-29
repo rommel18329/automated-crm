@@ -4,8 +4,9 @@
     {
       "name": "crm",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "streamlit", "run", "dashboard.py", "--server.port", "8501", "--server.headless", "true"],
-      "port": 8501
+      "runtimeArgs": ["-m", "streamlit", "run", "dashboard.py", "--server.port", "8510", "--server.headless", "true"],
+      "port": 8510,
+      "autoPort": false
     }
   ]
 }
