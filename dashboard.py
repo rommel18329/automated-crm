@@ -1035,6 +1035,28 @@ def fmt_local_ts(ts_iso: str) -> str:
         return (ts_iso or "")[:16]
 
 
+def classify_callback_intent(lead_id: int, before_ts: str,
+                             ixns_by_lead: dict) -> dict:
+    """Why is this lead calling us back? Judged from what we did to them
+    BEFORE the callback. Drives the missed-call badge so a callback from
+    someone who heard our voicemail (real intent) is visually separated from
+    a cold lead just returning an unknown missed number (low intent)."""
+    prior = [i for i in ixns_by_lead.get(lead_id, [])
+             if i["timestamp"] < before_ts and i["direction"] == "outbound"]
+    blob = " ".join((i.get("content") or "").lower() for i in prior)
+    if "drop message played" in blob or "left voicemail" in blob:
+        return {"label": "\U0001F399\uFE0F Returning your voicemail",
+                "hint": "they heard your message \u2014 call this one back",
+                "fg": "#1b6e2e", "bg": "#e7f6ea", "rank": 3}
+    if "connected, talked" in blob or "wants callback" in blob:
+        return {"label": "\U0001F4AC Talked before",
+                "hint": "you\u2019ve spoken \u2014 warm callback",
+                "fg": "#12508f", "bg": "#e8f1fb", "rank": 2}
+    return {"label": "\U0001F4DE Cold callback",
+            "hint": "likely just returning the missed number \u2014 low intent",
+            "fg": "#8a6d00", "bg": "#fff6e0", "rank": 1}
+
+
 def lead_conversation_items(lead_id: int) -> list[dict]:
     interactions = db.fetch_interactions(lead_id)
     # Calls and texts only — notes live in the Notes panel, not the conversation
@@ -1714,6 +1736,15 @@ elif page == "dashboard":
                 label = f"{c['name']}\n{c['phone']}\n{d} {t}"
                 if st.button(label, key="missed_call_badge_" + str(c["id"])):
                     nav_to("leads", c["lead_id"])
+                _intent = classify_callback_intent(c["lead_id"], c["timestamp"], _ixns_by_lead)
+                st.markdown(
+                    f"<div style='background:{_intent['bg']};color:{_intent['fg']};"
+                    f"border-radius:7px;padding:5px 9px;font-size:12px;font-weight:700;"
+                    f"margin-bottom:6px'>{_intent['label']}"
+                    f"<div style='font-weight:400;font-size:11px;opacity:.85'>"
+                    f"{_intent['hint']}</div></div>",
+                    unsafe_allow_html=True,
+                )
                 _mc1, _mc2 = st.columns(2)
                 with _mc1:
                     # Softphone callback — the outbound call it logs clears

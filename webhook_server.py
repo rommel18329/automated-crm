@@ -1950,7 +1950,9 @@ def softphone_page():
     var vmNow = att >= 3 && ((att - 3) % 3 === 0);
     if (vmNow) {
       attemptLine.innerHTML = '📞 Attempt #' + att +
-        ' · 💡 <b>VM round — leave a short voicemail if a machine picks up</b>';
+        (hasDropAudio
+          ? ' · 📼 <b>VM round — hit 📼 Drop VM at the beep</b>'
+          : ' · 💡 <b>VM round — leave a short voicemail if a machine picks up</b>');
     } else if (att < 3) {
       attemptLine.innerHTML = '📞 Attempt #' + att +
         ' · 🚫 no voicemail yet — pros start VMs on attempt 3';
