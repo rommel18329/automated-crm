@@ -2148,13 +2148,15 @@ elif page == "followups":
             # They CALLED you and you haven't called back — a text reply is
             # the wrong move. Uses the persistent missed-call state, so this
             # clears the moment you call them back (or hit Mark read).
-            if any(m["lead_id"] == lid for m in _missed_calls_open):
+            _mc_open = next((m for m in _missed_calls_open if m["lead_id"] == lid), None)
+            if _mc_open:
+                _ci = classify_callback_intent(lid, _mc_open["timestamp"], _ixns_by_lead)
                 st.markdown(
-                    "<div class='sl-flag' style='border-color:#e74c3c;"
-                    "color:#c0392b;background:#fdecea;font-weight:700'>"
-                    "📞 This lead CALLED YOU and you haven't called back — "
-                    "call them instead of texting. A caller is hotter than a "
-                    "texter; don't downgrade the conversation.</div>",
+                    f"<div class='sl-flag' style='border-color:#e74c3c;"
+                    f"color:#c0392b;background:#fdecea;font-weight:700'>"
+                    f"📞 This lead CALLED YOU and you haven't called back — "
+                    f"call them instead of texting.<br>"
+                    f"<span style='font-weight:400'>{_ci['label']}: {_ci['hint']}.</span></div>",
                     unsafe_allow_html=True,
                 )
 
@@ -2552,6 +2554,15 @@ elif page == "messages":
                     f"<div class='call-preview'>{_call_preview}</div>",
                     unsafe_allow_html=True,
                 )
+                if _c["direction"] == "inbound" and _cl:
+                    _ci = classify_callback_intent(_cl["id"], _c["timestamp"], _ixns_by_lead)
+                    st.markdown(
+                        f"<span style='display:inline-block;background:{_ci['bg']};"
+                        f"color:{_ci['fg']};border-radius:6px;padding:3px 8px;"
+                        f"font-size:11px;font-weight:700;margin-top:3px'>"
+                        f"{_ci['label']} \u2014 {_ci['hint']}</span>",
+                        unsafe_allow_html=True,
+                    )
                 if _has_rec:
                     _rec_sid = _rec_url.rstrip("/").split("/")[-1].split(".")[0]
                     st.markdown(
