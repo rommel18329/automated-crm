@@ -1044,10 +1044,15 @@ def classify_callback_intent(lead_id: int, before_ts: str,
     prior = [i for i in ixns_by_lead.get(lead_id, [])
              if i["timestamp"] < before_ts and i["direction"] == "outbound"]
     blob = " ".join((i.get("content") or "").lower() for i in prior)
-    if "drop message played" in blob or "left voicemail" in blob:
+    if "drop message played" in blob:
         return {"label": "\U0001F399\uFE0F Returning your voicemail",
-                "hint": "they heard your message \u2014 call this one back",
-                "fg": "#1b6e2e", "bg": "#e7f6ea", "rank": 3}
+                "hint": "they heard your recorded message \u2014 call this one back",
+                "fg": "#1b6e2e", "bg": "#e7f6ea", "rank": 4}
+    if "left voicemail" in blob:
+        return {"label": "\U0001F4EC Reached their voicemail",
+                "hint": "we hit their VM and they called back \u2014 decent sign, "
+                        "but a message may not have been left",
+                "fg": "#5b3b8c", "bg": "#f0eafb", "rank": 3}
     if "connected, talked" in blob or "wants callback" in blob:
         return {"label": "\U0001F4AC Talked before",
                 "hint": "you\u2019ve spoken \u2014 warm callback",
