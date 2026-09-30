@@ -34,6 +34,8 @@ def test_current_instructions_and_coaching_survive_followup_pipeline(monkeypatch
         }))], usage=SimpleNamespace(input_tokens=20, output_tokens=30))
 
     monkeypatch.setattr(ai, "client", SimpleNamespace(messages=SimpleNamespace(create=create)))
+    monkeypatch.setattr(ai, "load_email_context", lambda lead: {
+        'messages': [], 'status': 'Gmail checked: no matched emails.', 'complete': True})
     request = "lets say we can talk tomorrow and should we say sorry for delay?"
     draft = generate_followup_message(
         lead={"id": 1, "name": "Jimmie", "status": "warm"},
@@ -48,7 +50,7 @@ def test_current_instructions_and_coaching_survive_followup_pipeline(monkeypatch
     assert "CURRENT AGENT REQUEST" in prompt
     assert "Never replace" in captured["system"]
     assert "tomorrow" in draft.message
-    assert draft.coaching.startswith("A brief acknowledgment")
+    assert "A brief acknowledgment" in draft.coaching
     assert draft.cost_usd > 0
 
 

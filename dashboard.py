@@ -1083,7 +1083,7 @@ def render_ai_draft_row(lead: dict, stage_key: str, widget_prefix: str) -> None:
         label_visibility="collapsed",
     )
     if _c1.button("✨ AI draft", key=f"{widget_prefix}_btn", use_container_width=True):
-        with st.spinner("Reading the thread and drafting..."):
+        with st.spinner("Checking matched emails and reading the conversation..."):
             _ixns = db.fetch_interactions(lead["id"])
             _last_in = next((i["content"] for i in _ixns
                              if i["type"] == "text" and i["direction"] == "inbound"), "")
@@ -1107,7 +1107,7 @@ def render_ai_draft_row(lead: dict, stage_key: str, widget_prefix: str) -> None:
     _coaching = st.session_state.get(f"{widget_prefix}_coaching", "")
     if _coaching:
         with st.container(border=True):
-            st.caption("Coach")
+            st.caption("Coach · email context and draft guidance")
             st.write(_coaching)
 
 
