@@ -1096,6 +1096,7 @@ def render_ai_draft_row(lead: dict, stage_key: str, widget_prefix: str) -> None:
                 extra_context=st.session_state.get(ctx_key, ""),
             )
         st.session_state[stage_key] = _draft.message
+        st.session_state[f"{widget_prefix}_coaching"] = _draft.coaching
         st.session_state[f"{widget_prefix}_cost"] = _draft.cost_usd
         st.session_state["ai_cost_session_total"] = (
             st.session_state.get("ai_cost_session_total", 0.0) + _draft.cost_usd)
@@ -1103,6 +1104,11 @@ def render_ai_draft_row(lead: dict, stage_key: str, widget_prefix: str) -> None:
     _cost = st.session_state.get(f"{widget_prefix}_cost")
     if _cost:
         st.caption(f"💰 draft cost ${_cost:.4f} — edit the message above, then send")
+    _coaching = st.session_state.get(f"{widget_prefix}_coaching", "")
+    if _coaching:
+        with st.container(border=True):
+            st.caption("Coach")
+            st.write(_coaching)
 
 
 def update_status(lead_id: int, key: str) -> None:
