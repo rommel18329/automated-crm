@@ -2,7 +2,7 @@
 import argparse
 
 from crm_engine import db
-from crm_engine.email_review import email_lock, sync
+from crm_engine.email_review import email_lock, sync, EmailBusy
 from crm_engine.gmail_client import GmailClient
 
 
@@ -11,6 +11,7 @@ def main():
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--migrate', action='store_true')
     modes.add_argument('--connect', action='store_true')
+    modes.add_argument('--review-year', action='store_true', help='Read the past year and prepare deal/relationship opportunities.')
     args = parser.parse_args()
     try:
         with email_lock():
@@ -21,9 +22,17 @@ def main():
             client = GmailClient.connect(interactive=args.connect)
             if args.connect:
                 print('Gmail connected and identity verified.')
+            if args.review_year:
+                from crm_engine.opportunity_scan import review_year
+                result = review_year(client)
+                print('Opportunity review:', result['state'], '. No messages sent.')
+                return
             count = sync(client)
             print(f'Email sync complete: {count} conversations refreshed. No email sent.')
     except Exception as exc:
+        if isinstance(exc, EmailBusy):
+            print('An email review or synchronization is already running. This scheduled run was skipped.')
+            return
         print(f'Email setup/sync failed ({type(exc).__name__}). See Email Review in the CRM for setup and sync status.')
         if db.email_ready():
             from crm_engine.gmail_client import MAILBOX

@@ -1,6 +1,6 @@
 # Feature: One-time cross-channel catch-up review
 **Started:** 2026-09-29
-**Status:** awaiting plan and SQL approval; no catch-up code or live outreach performed
+**Status:** separate batch/table proposal deferred; email opportunity/context work tracked in 2026-09-29-opportunity-review.md
 
 ## User request
 Review every unanswered text, meaningful missed call and email. Exclude calls that

@@ -6,11 +6,13 @@ import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from crm_engine import db
 from crm_engine.gmail_client import LOCAL, MAILBOX, ROOT, addresses, recipient_for
+from crm_engine.catchup_sources import build_context, notification_advice
+from crm_engine.email_opportunities import analyze, VERSION, months_ago
 
 
 def now():
@@ -18,6 +20,10 @@ def now():
 
 
 class ReviewChanged(RuntimeError):
+    pass
+
+
+class EmailBusy(RuntimeError):
     pass
 
 
@@ -39,7 +45,7 @@ def email_lock(directory=LOCAL):
                 import fcntl
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
-            raise RuntimeError('Email sync or approval is already running. Try again shortly.') from exc
+            raise EmailBusy('Email sync or approval is already running. Try again shortly.') from exc
         try:
             yield
         finally:
@@ -95,13 +101,37 @@ def suggest(thread):
         return fallback
 
 
-def store_thread(thread, db_path=db.DB_PATH, generator=suggest, force=False):
+def store_thread(thread, db_path=db.DB_PATH, generator=suggest, force=False, opportunity_result=None):
     if not thread['messages']:
         return
     latest = thread['messages'][-1]
     old = db.email_review(MAILBOX, thread['id'], db_path)
     unchanged = old and old['latest_message_id'] == latest['id']
-    if is_outbound(latest):
+    prior = json.loads(old['thread_json']) if old else {}
+    cross = thread.get('cross_channel')
+    old_cross = prior.get('cross_channel', {})
+    context_same = cross and cross.get('fingerprint') == old_cross.get('fingerprint')
+    if cross:
+        previous_op = prior.get('opportunity', {})
+        refresh = (force or not unchanged or not context_same or previous_op.get('version') != VERSION
+                   or previous_op.get('analysis_state') != 'complete'
+                   or (previous_op.get('is_opportunity') and previous_op.get('evaluated_on') != datetime.now().date().isoformat()))
+        opportunity = (opportunity_result or analyze(thread)) if refresh else previous_op
+        thread['opportunity'] = opportunity
+        actionable = opportunity.get('is_opportunity') and opportunity.get('stage') not in ('wait', 'closed')
+        advice = {'summary': opportunity['summary'], 'reply_reason': opportunity['reason'],
+                  'draft_text': opportunity.get('draft_text', ''),
+                  'review_state': 'needs_review' if actionable else 'no_reply_needed'}
+        if opportunity.get('analysis_state') == 'failed':
+            advice['review_state'] = 'needs_review'
+        if old and unchanged and context_same:
+            if old['review_state'] in ('dismissed', 'answered'):
+                advice['review_state'] = old['review_state']
+            if not refresh:
+                advice['draft_text'] = old['draft_text']
+            elif not force and old['draft_text'] != previous_op.get('draft_text', ''):
+                advice['draft_text'] = old['draft_text']  # Preserve a user's saved edit on daily reclassification.
+    elif is_outbound(latest):
         advice = {'summary': old['summary'] if old else 'Already replied in Gmail.',
                   'reply_reason': 'Latest message is outbound.', 'draft_text': '',
                   'review_state': 'answered'}
@@ -112,10 +142,14 @@ def store_thread(thread, db_path=db.DB_PATH, generator=suggest, force=False):
     row = {'mailbox': MAILBOX, 'thread_id': thread['id'], 'latest_message_id': latest['id'],
            'latest_received_at': latest['timestamp'], 'thread_json': json.dumps(thread),
            'draft_basis_id': latest['id'], 'updated_at': now(), **advice}
+    if cross and (cross.get('superseded') or notification_advice(thread)):
+        # Keep full merged history on its representative card, not repeated on every archived notification.
+        compact = {**thread, 'cross_channel': {**cross, 'events': []}}
+        row['thread_json'] = json.dumps(compact)
     db.save_email_review(row, db_path)
 
 
-def sync(client, db_path=db.DB_PATH, generator=suggest):
+def sync(client, db_path=db.DB_PATH, generator=suggest, context_builder=build_context, full_year=False):
     """Caller holds email_lock. Refresh tracked threads even beyond the initial lookback."""
     if not db.email_ready(db_path):
         raise RuntimeError('Run the approved email migration first.')
@@ -130,19 +164,31 @@ def sync(client, db_path=db.DB_PATH, generator=suggest):
                                      None if found else 'Outcome unknown. Check Gmail; automatic retry blocked.', db_path)
         status = db.email_sync_status(MAILBOX, db_path)
         # Overlap catches boundary arrivals; last successful sync covers long offline periods.
-        if status.get('last_success_at'):
+        if status.get('last_success_at') and not full_year:
             after = int(datetime.fromisoformat(status['last_success_at']).timestamp()) - 86400
             window = f'after:{after}'
         else:
-            window = 'newer_than:30d'
-        query = f'(to:{MAILBOX} OR deliveredto:{MAILBOX}) {window} -in:spam -in:trash'
+            window = 'after:' + (months_ago(12) - timedelta(days=1)).strftime('%Y/%m/%d')
+        query = f'{window} -in:spam -in:trash'
         started = now()
         ids = set(client.list_threads(query))
-        ids.update(r['thread_id'] for r in db.email_reviews(MAILBOX, db_path))
+        cached = {r['thread_id']: json.loads(r['thread_json']) for r in db.email_reviews(MAILBOX, db_path)}
+        ids.update(tid for tid, t in cached.items() if t.get('opportunity', {}).get('is_opportunity')
+                   or t.get('opportunity', {}).get('analysis_state') == 'failed')
+        if not context_builder:
+            ids.update(cached)  # Legacy/test workflow.
         failures = 0
+        threads = []
         for thread_id in sorted(ids):
             try:
-                store_thread(client.get_thread(thread_id), db_path, generator)
+                threads.append(client.get_thread(thread_id))
+            except Exception:
+                failures += 1
+        combined = {**cached, **{t['id']: t for t in threads}}
+        index = context_builder(list(combined.values()), db_path) if context_builder else None
+        for thread in threads:
+            try:
+                store_thread(index.attach(thread) if index else thread, db_path, generator)
             except Exception:
                 failures += 1
         if failures:
@@ -163,7 +209,8 @@ def save_edit(thread_id, basis, text, state='needs_review', db_path=db.DB_PATH):
         raise ReviewChanged('Conversation changed. Refresh and review the newest message.')
 
 
-def approve(client, thread_id, basis, text, actor, db_path=db.DB_PATH):
+def approve(client, thread_id, basis, text, actor, db_path=db.DB_PATH, context_builder=build_context,
+            context_basis=None):
     """Caller holds email_lock; only the explicit Approve & send UI calls this."""
     if not text.strip():
         raise ValueError('Write a reply before approving.')
@@ -172,17 +219,34 @@ def approve(client, thread_id, basis, text, actor, db_path=db.DB_PATH):
     if not row or row['latest_message_id'] != basis or row['review_state'] != 'needs_review':
         raise ReviewChanged('This review is no longer current. Refresh the list.')
     thread = client.get_thread(thread_id)
-    if not thread['messages'] or thread['messages'][-1]['id'] != basis or is_outbound(thread['messages'][-1]):
+    saved = json.loads(row['thread_json'])
+    is_reopen = saved.get('opportunity', {}).get('stage') == 'reopen'
+    if not thread['messages'] or thread['messages'][-1]['id'] != basis or (is_outbound(thread['messages'][-1]) and not is_reopen):
         store_thread(thread, db_path)
         raise ReviewChanged('Gmail conversation changed or was already answered. Review it again before sending.')
     latest = thread['messages'][-1]
     if 'TRASH' in latest.get('labels', []) or 'SPAM' in latest.get('labels', []):
         raise ReviewChanged('This message is now in spam or trash. Review it in Gmail.')
     # The recipient and headers must match what the user actually reviewed, not just the ID.
-    shown = json.loads(row['thread_json'])['messages'][-1]
+    shown = saved['messages'][-1]
     if any(latest.get(k) != shown.get(k) for k in ('reply-to', 'from', 'subject', 'message-id', 'body')):
         store_thread(thread, db_path, force=True)
         raise ReviewChanged('Message contents changed. Review the refreshed message before sending.')
+    if context_builder:
+        old_context = saved.get('cross_channel', {})
+        if not old_context or context_basis != old_context.get('fingerprint'):
+            raise ReviewChanged('Cross-channel context changed or has not been checked. Refresh and review again.')
+        if old_context.get('blocked') or old_context.get('kind') != 'email':
+            raise ReviewChanged('Cross-channel verification is incomplete or this is a text conversation. Review the source history before contacting this person.')
+        # Re-fetch known related threads AND newly arrived messages from this sender.
+        related_ids = set(old_context.get('related_thread_ids', [])) | {thread_id}
+        for sender in old_context.get('sender_emails', []):
+            related_ids.update(client.list_threads(f'{{from:{sender} to:{sender}}} -in:spam -in:trash'))
+        related = [client.get_thread(tid) if tid != thread_id else thread for tid in sorted(related_ids)]
+        checked = context_builder(related, db_path).attach(thread)
+        if checked['cross_channel']['blocked'] or checked['cross_channel']['fingerprint'] != old_context['fingerprint']:
+            store_thread(checked, db_path, force=True)
+            raise ReviewChanged('Text, email or CRM context changed. A fresh suggestion is ready for review; nothing sent.')
     recipient = recipient_for(latest)
     if not latest.get('message-id'):
         raise ValueError('Missing original Message-ID; reply in Gmail.')

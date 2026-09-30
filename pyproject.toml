@@ -14,6 +14,8 @@ dependencies = [
   "python-dotenv>=1.0",
   "google-api-python-client>=2.150",
   "google-auth-oauthlib>=1.2",
+  "beautifulsoup4>=4.12",
+  "twilio>=9.0",
 ]
 
 [project.scripts]

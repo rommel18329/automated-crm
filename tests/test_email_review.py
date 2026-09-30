@@ -43,7 +43,12 @@ class FakeGmail:
 
 
 @pytest.fixture
-def setup(tmp_path):
+def setup(tmp_path, monkeypatch):
+    from functools import partial
+    # These tests retain coverage of the underlying approval state machine;
+    # cross-channel verification is tested separately with explicit source fixtures.
+    monkeypatch.setattr(review, 'sync', partial(review.sync, context_builder=None))
+    monkeypatch.setattr(review, 'approve', partial(review.approve, context_builder=None))
     path = tmp_path / 'crm.db'
     db.migrate_email(path)
     review.store_thread(thread(), path, suggestion)
@@ -161,6 +166,13 @@ def test_review_ui_saves_edits_and_requires_explicit_approval(setup, tmp_path, m
     from types import SimpleNamespace
     path, client = setup
     (tmp_path / 'gmail-token.json').write_text('{}')
+    row = db.email_review(MAILBOX, 't1', path)
+    saved_thread = json.loads(row['thread_json'])
+    saved_thread['cross_channel'] = {'fingerprint': 'verified', 'blocked': False, 'kind': 'email'}
+    saved_thread['opportunity'] = {'is_opportunity': True, 'analysis_state': 'complete', 'priority': 4,
+                                 'stage': 'needs_reply', 'last_contact_at': '2026-09-29T12:00:00+00:00'}
+    row['thread_json'] = json.dumps(saved_thread)
+    db.save_email_review(row, path)
     monkeypatch.setattr(email_ui, 'LOCAL', tmp_path)
     monkeypatch.setattr(email_ui, 'db', SimpleNamespace(
         email_ready=lambda: True,
@@ -170,7 +182,7 @@ def test_review_ui_saves_edits_and_requires_explicit_approval(setup, tmp_path, m
     monkeypatch.setattr(email_ui, 'email_lock', lambda: review.email_lock(tmp_path))
     monkeypatch.setattr(email_ui, 'save_edit', lambda tid, basis, text, state='needs_review':
                         review.save_edit(tid, basis, text, state, path))
-    monkeypatch.setattr(email_ui, 'approve', lambda cli, tid, basis, text, actor:
+    monkeypatch.setattr(email_ui, 'approve', lambda cli, tid, basis, text, actor, **kwargs:
                         review.approve(cli, tid, basis, text, actor, path))
     monkeypatch.setattr(email_ui.GmailClient, 'connect', lambda: client)
     app = AppTest.from_string('from crm_engine.email_ui import render_email_review\nrender_email_review()').run()

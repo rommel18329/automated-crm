@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import os
+import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.message import Message
@@ -47,7 +48,8 @@ def addresses(value):
 
 
 def recipient_for(message):
-    value = message.get('reply-to') or message.get('from', '')
+    outgoing = MAILBOX in addresses(message.get('from')) or 'SENT' in message.get('labels', [])
+    value = message.get('to', '') if outgoing else message.get('reply-to') or message.get('from', '')
     recipients = addresses(value)
     if len(recipients) != 1 or '@' not in recipients[0] or any(c in value for c in '\r\n'):
         raise ValueError('This message does not have one valid reply address. Reply in Gmail.')
@@ -152,7 +154,42 @@ class GmailClient:
                 break
 
     def get_thread(self, thread_id):
-        raw = self.service.users().threads().get(userId='me', id=thread_id, format='full').execute()
+        from googleapiclient.errors import HttpError
+        for attempt in range(6):
+            try:
+                raw = self.service.users().threads().get(userId='me', id=thread_id, format='full').execute(num_retries=0)
+                break
+            except HttpError as exc:
+                limited = exc.resp.status == 429 or (exc.resp.status == 403 and b'quota' in exc.content.lower())
+                if not limited or attempt == 5:
+                    raise
+                time.sleep(32)
+        return self._normalize_raw(raw)
+
+    def get_threads(self, thread_ids):
+        """Batch read 25 threads at a time; surface every failed fetch to the caller."""
+        for start in range(0, len(thread_ids), 25):
+            if start:
+                time.sleep(20)  # Leave headroom under the newer per-user Gmail query-cost quota.
+            results, errors = {}, {}
+            def receive(request_id, response, exception):
+                if exception:
+                    errors[request_id] = exception
+                else:
+                    results[request_id] = response
+            batch = self.service.new_batch_http_request(callback=receive)
+            chunk = thread_ids[start:start + 25]
+            for tid in chunk:
+                batch.add(self.service.users().threads().get(userId='me', id=tid, format='full'), request_id=tid)
+            batch.execute()
+            for tid in chunk:
+                if tid in errors:
+                    # A fresh individual read retries transient batch failures.
+                    yield self.get_thread(tid)
+                else:
+                    yield self._normalize_raw(results[tid])
+
+    def _normalize_raw(self, raw):
         for message in raw.get('messages', []):
             def load_body(part):
                 body = part.get('body', {})

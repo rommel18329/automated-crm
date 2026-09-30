@@ -162,6 +162,22 @@ def email_attempts(mailbox: str, db_path: Path = DB_PATH) -> list[dict]:
                                              'ORDER BY approved_at DESC', (mailbox,))]
 
 
+def email_context_data(db_path: Path = DB_PATH) -> dict:
+    """Read existing contact/history tables without importing or changing lead data."""
+    with get_conn(db_path) as conn:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        return {name: [dict(r) for r in conn.execute('SELECT * FROM ' + name)] if name in tables else []
+                for name in ('leads', 'interactions', 'unmatched_inbox')}
+
+
+def email_opportunity_count(mailbox: str, db_path: Path = DB_PATH) -> int:
+    if not email_ready(db_path):
+        return 0
+    with get_conn(db_path) as conn:
+        return conn.execute("SELECT count(*) FROM email_reviews WHERE mailbox=? AND review_state='needs_review' "
+                            "AND json_extract(thread_json,'$.opportunity.is_opportunity')=1", (mailbox,)).fetchone()[0]
+
+
 @dataclass(slots=True)
 class Lead:
     id: int

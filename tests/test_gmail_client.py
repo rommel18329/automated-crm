@@ -81,3 +81,23 @@ def test_large_inline_body_is_read_but_named_attachment_is_not():
     assert result['messages'][0]['body'] == 'Long inline body'
     assert result['messages'][0]['attachments'] == ['private.txt']
     assert service.users().messages().attachments().get.call_args.kwargs['id'] == 'inline'
+
+
+def test_reopening_our_outbound_uses_the_external_recipient():
+    assert recipient_for({'from': MAILBOX, 'to': 'Seller <seller@example.com>', 'labels': ['SENT']}) == 'seller@example.com'
+
+
+def test_batch_read_preserves_all_threads_and_falls_back_for_failed_item(monkeypatch):
+    service = MagicMock()
+    def batch_factory(callback):
+        class Batch:
+            def __init__(self): self.ids = []
+            def add(self, request, request_id): self.ids.append(request_id)
+            def execute(self):
+                for tid in self.ids:
+                    callback(tid, {'id': tid, 'messages': []}, RuntimeError('retry') if tid == 'b' else None)
+        return Batch()
+    service.new_batch_http_request.side_effect = batch_factory
+    client = GmailClient(service)
+    monkeypatch.setattr(client, 'get_thread', lambda tid: {'id': tid, 'messages': []})
+    assert [t['id'] for t in client.get_threads(['a', 'b', 'c'])] == ['a', 'b', 'c']

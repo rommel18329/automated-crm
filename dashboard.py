@@ -1677,8 +1677,7 @@ with st.sidebar:
     nav_link("Caller ID Health", "caller_health")
     nav_link("Follow-ups", "followups")
     nav_link("Messages", "messages", badge=_unread_count)
-    nav_link("Email Review", "email_review", badge=sum(
-        row['review_state'] == 'needs_review' for row in db.email_reviews(EMAIL_MAILBOX)))
+    nav_link("Opportunities", "email_review", badge=db.email_opportunity_count(EMAIL_MAILBOX))
     st.caption("💡 Middle-click (or Ctrl-click) any page to open it in a new tab.")
 
 st.divider()

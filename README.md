@@ -44,11 +44,12 @@ crm --db crm.db add-interaction 1 --type text --direction outbound --content "Ch
 ## Approval mode
 The system only proposes actions. It does **not** auto-send any text/call.
 
-## Gmail Email Review
+## Deal & Relationship Opportunities
 
-Email Review monitors `contactus@silverlineinvestment.group`. It displays context,
-suggested replies, editable text and explicit **Approve & send**, **Save edit** and
-**Deny** actions. No scheduled process sends email. Gmail acceptance is shown with
+Opportunities monitors `contactus@silverlineinvestment.group` for substantive
+seller, buyer, agent, investor and referral conversations worth continuing or
+reopening. It displays context, suggested replies, editable text and explicit
+**Approve & send**, **Save edit** and **Deny** actions. No scheduled process sends email. Gmail acceptance is shown with
 the provider message ID; it does not mean confirmed delivery.
 
 ### One-time setup
@@ -66,7 +67,7 @@ the provider message ID; it does not mean confirmed delivery.
 4. Save the downloaded client JSON as `.email-local/gmail-client.json` inside this
    project. Never commit it or paste it in chat. This directory and token files
    are ignored by Git.
-5. In **Email Review**, upload the client JSON (or save it at the path above)
+5. In **Opportunities**, upload the client JSON (or save it at the path above)
    and click **Connect Gmail**. Alternatively run
    `python -m crm_engine.email_sync --connect`. Sign into Google as
    `contactus@silverlineinvestment.group` and grant Gmail read and send access.
@@ -76,28 +77,51 @@ the provider message ID; it does not mean confirmed delivery.
    `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install_email_sync.ps1`.
    The task runs every 15 minutes while your Windows account is signed in.
    It starts when available after a missed run; the computer must be awake.
-7. Open **Email Review** in the CRM. You can also select **Sync now**.
+7. Open **Opportunities** in the CRM. You can also select **Sync now**.
 
-The first sync examines the last 30 days of incoming email, including read mail,
-and retrieves full thread text. Later syncs cover time since the last successful
-sync and recheck tracked conversations so replies sent directly from Gmail are
-recognized. Unanswered items carry forward. Spam and trash are not initially
-imported. Opening Email Review catches up if the last sync is over 15 minutes old.
+Run `python -m crm_engine.email_sync --review-year` for a resumable review of the
+last calendar year, including read/archived messages and sent conversation context.
+Downloads and analysis checkpoints remain in the ignored `.email-local/` directory.
+The UI separates **Last 6 months**, **6–12 months ago**, and **All last 12 months**,
+based on the contact's most recent conversation activity. Routine notifications,
+newsletters, listing blasts and unrelated sales pitches are excluded, rather than
+presented as reply obligations. Recent unanswered outbound messages can appear under
+**Waiting on them**, with no extra draft to send. Failed analyses remain visible under
+**Analysis pending** and are retried by synchronization or the year-review command.
+
+Later syncs cover time since the last successful sync and recheck opportunity
+threads. Spam and trash are excluded. Opening Opportunities catches up if the
+last sync is over 15 minutes old. A thread whose last message is ours can still be
+a stale opportunity; this is distinguished from a recent follow-up that needs time.
 
 ### Review behavior
 
 - Suggested summaries and replies use the existing Anthropic account configured
   in `.env`. Relevant email text goes to that provider. `EMAIL_AI_MODEL` can
-  override the default `claude-haiku-4-5` model. AI context is limited to the latest
-  20 messages and 10,000 characters per message; full fetched thread bodies are
-  available in the UI. Attachments are listed but not read or sent to the AI.
-- AI classifications are suggestions. **No reply needed** remains visible and
-  can be returned to review. If AI generation fails, the email stays in Needs review
-  with a blank editable draft. **Suggest again** replaces the current draft.
+  override the default `claude-haiku-4-5` model. The opportunity analysis examines
+  candidate opportunities a second time with `claude-sonnet-4-6` to check factual
+  grounding and drafts (`EMAIL_REVIEW_MODEL` overrides that reviewer). It examines
+  all supplied events, using evidence-preserving chunks for large histories.
+  Quoted email and Google Voice footers are removed from individual new statements
+  to avoid treating old quoted messages as new responses. Original Gmail bodies
+  remain available in the UI. Attachments are listed but not read or sent to the AI.
+- AI classifications are suggestions. **Excluded** remains inspectable. Only
+  evidence-backed opportunities appear in the default view; classification errors
+  remain separate from successful exclusions. **Suggest again** replaces the draft.
+- Context combines exact recorded email/phone matches, CRM history, original Google
+  Voice Takeout and available Twilio records. Similar names alone never merge people.
+  Related Gmail conversations are combined into a representative contact card.
+  Google Voice relay emails are text conversations, not independent email prospects.
+  Their drafts can be reviewed here, but replies should be made in Google Voice
+  after checking current history. A historical export does not prove live coverage.
+- Source failures and ambiguous identities remain visible and block the send control.
+  In particular, an inactive Twilio account cannot provide current text verification.
+  Before an email send, related Gmail threads, text history and CRM context are
+  checked again; changes invalidate the approval instead of repeating an old draft.
 - **Deny** dismisses that incoming message without sending. A new message reopens
   the conversation. **Save edit** does not send. Approval replies to the displayed
   sender/reply-to address only; no automatic CC, BCC or reply-all.
-- Before sending, the app rechecks the thread and blocks outdated approvals.
+- Before sending, the app rechecks the thread/context and blocks outdated approvals.
   Concurrent sync/approval operations are serialized, and duplicate submissions
   are blocked by a database constraint. A new email can still arrive at Gmail in
   the small interval between the final check and send; Gmail has no atomic

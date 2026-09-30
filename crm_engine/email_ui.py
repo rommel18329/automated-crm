@@ -1,12 +1,15 @@
 """Streamlit email review page, kept outside the main dashboard."""
 import json
 from datetime import datetime, timezone
+from email.utils import parseaddr
 
 import streamlit as st
 
 from crm_engine import db
 from crm_engine.email_review import approve, email_lock, save_edit, store_thread, sync
-from crm_engine.gmail_client import GmailClient, LOCAL, MAILBOX, recipient_for
+from crm_engine.gmail_client import GmailClient, LOCAL, MAILBOX, recipient_for, addresses
+from crm_engine.email_opportunities import period, months_ago
+from crm_engine.catchup_sources import build_context
 
 
 def setup_help():
@@ -51,8 +54,8 @@ def render_email_review():
     reset = st.session_state.pop('email_reset_widget', None)
     if reset:
         st.session_state.pop(reset, None)
-    st.header('Email Review')
-    st.caption(MAILBOX + ' · Suggested replies for your approval')
+    st.header('Deal & Relationship Opportunities')
+    st.caption(MAILBOX + ' · Real conversations worth continuing or reopening')
     if not db.email_ready():
         st.info('The email database migration has not been applied.')
         st.code('python -m crm_engine.email_sync --migrate')
@@ -78,11 +81,25 @@ def render_email_review():
         except Exception as exc:
             st.error(str(exc) if isinstance(exc, (RuntimeError, ValueError)) else 'Could not sync Gmail. Check connection and try again.')
     rows = db.email_reviews(MAILBOX)
-    pending = sum(r['review_state'] == 'needs_review' for r in rows)
-    st.metric('Awaiting your review', pending)
-    st.caption('Unanswered conversations carry forward each day. AI uses email text to prepare suggestions; '
-               'attachments are listed but their contents are not analyzed.')
-    selected = st.radio('Show', ['Needs review', 'No reply needed', 'Dismissed', 'Answered', 'Send history'], horizontal=True)
+    details = {r['thread_id']: json.loads(r['thread_json']) for r in rows}
+    def assessment(row):
+        return details[row['thread_id']].get('opportunity', {})
+    pending = sum(assessment(r).get('is_opportunity', False) and r['review_state'] == 'needs_review' for r in rows)
+    st.metric('Opportunities to review', pending)
+    st.caption('Personal seller, buyer, agent, investor and referral conversations. Routine alerts and newsletters '
+               'are excluded. Suggestions use available text/CRM history; attachments are not analyzed.')
+    scan_file = LOCAL / 'opportunity-scan.json'
+    if scan_file.exists():
+        try:
+            scan = json.loads(scan_file.read_text(encoding='utf-8'))
+            st.caption(f"Year review: {scan.get('state', 'in progress')} · {scan.get('processed', 0)} / {scan.get('total', '?')} analyzed")
+            if scan.get('state') == 'reading Gmail':
+                st.caption(f"Downloaded {scan.get('downloaded', 0)} conversations so far.")
+        except (ValueError, OSError):
+            pass
+    selected_period = st.radio('Conversation window', ['Last 6 months', '6–12 months ago', 'All last 12 months'], horizontal=True)
+    st.caption(f'Last 6 months starts {months_ago(6)}; full year starts {months_ago(12)}. Grouped by most recent contact.')
+    selected = st.radio('Show', ['Opportunities', 'Waiting on them', 'Analysis pending', 'Dismissed', 'Excluded', 'Send history'], horizontal=True)
     if selected == 'Send history':
         attempts = db.email_attempts(MAILBOX)
         if not attempts:
@@ -97,24 +114,58 @@ def render_email_review():
                 if a['last_error']:
                     st.warning(a['last_error'])
         return
-    states = {'Needs review': 'needs_review', 'No reply needed': 'no_reply_needed',
-              'Dismissed': 'dismissed', 'Answered': 'answered'}
-    visible = [r for r in rows if r['review_state'] == states[selected]]
+    def visible_row(row):
+        op = assessment(row)
+        stamp = op.get('last_contact_at', row['latest_received_at'])
+        cohort = period(stamp)
+        if cohort == 'Outside last year' or (selected_period != 'All last 12 months' and cohort != selected_period):
+            return False
+        if selected == 'Analysis pending':
+            return not op or op.get('analysis_state') != 'complete'
+        if selected == 'Dismissed':
+            return row['review_state'] == 'dismissed'
+        if selected == 'Waiting on them':
+            return op.get('is_opportunity') and op.get('stage') == 'wait'
+        if selected == 'Excluded':
+            return bool(op) and op.get('analysis_state') == 'complete' and not op.get('is_opportunity')
+        return op.get('is_opportunity') and row['review_state'] == 'needs_review' and op.get('stage') != 'wait'
+    visible = sorted([r for r in rows if visible_row(r)], key=lambda r: (-assessment(r).get('priority', 0), r['latest_received_at']))
     if not visible:
         st.info('No conversations in this view.')
         return
     active_attempts = {(a['thread_id'], a['basis_message_id']): a for a in db.email_attempts(MAILBOX)
                        if a['send_state'] in ('sending', 'accepted', 'unknown')}
     for row in visible:
-        thread = json.loads(row['thread_json'])
+        thread = details[row['thread_id']]
         latest = thread['messages'][-1]
-        key = 'email_' + row['thread_id'] + '_' + row['latest_message_id']
+        cross = thread.get('cross_channel', {})
+        op = thread.get('opportunity', {})
+        key = 'email_' + row['thread_id'] + '_' + row['latest_message_id'] + '_' + cross.get('fingerprint', '')[:12]
         with st.container(border=True):
-            st.subheader(latest.get('subject') or '(No subject)')
-            st.write(latest.get('from', 'Unknown sender'))
+            contact = next((m.get('from', '') for m in reversed(thread['messages'])
+                            if MAILBOX not in addresses(m.get('from')) and 'SENT' not in m.get('labels', [])), latest.get('to', ''))
+            label, address = parseaddr(contact)
+            st.subheader(cross.get('lead_name') or label or address or 'Conversation')
+            st.caption(latest.get('subject') or '(No subject)')
             st.caption(latest['timestamp'])
             st.write(row['summary'])
             st.write(row['reply_reason'])
+            if op.get('is_opportunity'):
+                st.caption(f"{op.get('category', '').replace('-', ' ')} · priority {op.get('priority', '?')}/5 · {op.get('stage', '').replace('_', ' ')} · confidence {op.get('confidence', 'unknown')}")
+                st.write('Suggested next step: ' + op.get('next_step', 'Review the conversation.'))
+            if cross:
+                st.caption('Matched contact: ' + (cross.get('lead_name') or 'No confirmed CRM lead match') +
+                           ' · checked ' + cross.get('checked_at', 'unknown'))
+                if cross.get('blocked'):
+                    st.warning('Draft for review only: current text history or the contact match still needs verification.')
+                with st.expander('Text, call and related email context'):
+                    for alert in cross.get('alerts', []):
+                        st.warning(alert)
+                    for source in cross.get('sources', []):
+                        st.caption(source['source'] + ': ' + source['detail'])
+                    for event in cross.get('events', []):
+                        st.caption(f"{event['timestamp']} · {event['channel']} · {event['direction']} · {event['source']} · {event['status']}")
+                        st.text(event['body'])
             st.link_button('Open conversation in Gmail',
                            'https://mail.google.com/mail/u/' + MAILBOX + '/#all/' + row['thread_id'])
             with st.expander('Conversation history'):
@@ -152,7 +203,11 @@ def render_email_review():
                                 height=160, key=key + '_text')
             send_col, save_col, deny_col, regenerate_col = st.columns(4)
             action = None
-            if send_col.button('Approve & send', type='primary', key=key + '_send', disabled=not text.strip()):
+            blocked = not cross or cross.get('blocked') or cross.get('kind') != 'email' or op.get('analysis_state') != 'complete'
+            if cross.get('kind') == 'voice_text':
+                st.info('This is a Google Voice text conversation. Review the draft, then reply in Google Voice after checking its live history.')
+                st.link_button('Open Google Voice', 'https://voice.google.com/u/0/messages')
+            if send_col.button('Approve & send', type='primary', key=key + '_send', disabled=not text.strip() or blocked):
                 action = 'send'
             if save_col.button('Save edit', key=key + '_save'):
                 action = 'save'
@@ -165,11 +220,13 @@ def render_email_review():
                     with st.spinner('Processing…'), email_lock():
                         if action == 'send':
                             mid = approve(GmailClient.connect(), row['thread_id'], row['latest_message_id'],
-                                          text, st.session_state.get('user', 'local user'))
+                                          text, st.session_state.get('user', 'local user'), context_basis=cross.get('fingerprint'))
                             st.session_state['email_notice'] = 'Gmail accepted your reply. Message ID: ' + mid
                         elif action == 'generate':
                             client = GmailClient.connect()
-                            store_thread(client.get_thread(row['thread_id']), force=True)
+                            fetched = client.get_thread(row['thread_id'])
+                            related = [json.loads(r['thread_json']) for r in db.email_reviews(MAILBOX) if r['thread_id'] != row['thread_id']] + [fetched]
+                            store_thread(build_context(related).attach(fetched), force=True)
                             st.session_state['email_reset_widget'] = key + '_text'
                         else:
                             save_edit(row['thread_id'], row['latest_message_id'], text,
