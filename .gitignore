@@ -12,3 +12,5 @@ client_secret*.json
 credentials.json
 token.json
 *.egg-info/
+
+gv_imported_ids.json

@@ -2277,8 +2277,21 @@ elif page == "messages":
     # clears only when you reply (text/call back) or hit Mark read.
 
     # ── header ────────────────────────────────────────────────────────────────
-    hdr_left, hdr_right = st.columns([6, 1])
+    hdr_left, hdr_gv, hdr_right = st.columns([5, 1.4, 1])
     hdr_left.subheader("💬 Messages & Calls")
+    if hdr_gv.button("🔄 Google Voice", key="gv_sync_btn",
+                     help="Pull in texts people sent to your Google Voice number "
+                          "(forwarded to Gmail) and log them here."):
+        with st.spinner("Checking Google Voice (via Gmail)…"):
+            try:
+                from crm_engine.gv_gmail_import import sync_google_voice
+                _gv = sync_google_voice(since_days=60)
+                st.toast(f"Google Voice: {_gv['matched']} new to leads, "
+                         f"{_gv['unmatched']} to unmatched inbox.")
+            except Exception as _gv_exc:
+                st.error(f"Google Voice sync failed: {type(_gv_exc).__name__}. "
+                         f"Check Gmail is connected in Email Review.")
+        st.rerun()
     if hdr_right.button("🔄 Refresh", key="msg_refresh_btn"):
         st.rerun()
 

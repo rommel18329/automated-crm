@@ -29,6 +29,12 @@ def main():
                 return
             count = sync(client)
             print(f'Email sync complete: {count} conversations refreshed. No email sent.')
+            try:
+                from crm_engine.gv_gmail_import import sync_google_voice
+                gv = sync_google_voice(client, since_days=7)
+                print(f'Google Voice: {gv["matched"]} matched, {gv["unmatched"]} unmatched new texts.')
+            except Exception as gv_exc:
+                print(f'Google Voice sync skipped ({type(gv_exc).__name__}).')
     except Exception as exc:
         if isinstance(exc, EmailBusy):
             print('An email review or synchronization is already running. This scheduled run was skipped.')
