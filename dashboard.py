@@ -1506,6 +1506,15 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
 
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown("**Send a Text**")
+        if lead.get("phone", "") in _gv_contacts:
+            st.markdown(
+                "<div class='sl-flag' style='border-color:#8e44ad;color:#6c3483;"
+                "background:#f4ecfa'>📱 Reached you on <b>Google Voice</b> — "
+                "your reply sends from your Twilio number (a different number on their "
+                "end). The first reply should say it's your new office number they can "
+                "reach you at more reliably.</div>",
+                unsafe_allow_html=True,
+            )
         manual_msg_key = f"manual_text_{lead_id}"
         # An AI draft staged on the previous run lands in the compose box here.
         _staged_lead_draft = st.session_state.pop(f"manual_text_stage_{lead_id}", None)
@@ -1575,6 +1584,11 @@ _ixns_by_lead: dict[int, list[dict]] = {}
 for _ix in all_interactions:
     _ixns_by_lead.setdefault(_ix["lead_id"], []).append(_ix)
 result = _build_display_result(all_leads, _ixns_by_lead)
+try:
+    from crm_engine.gv_gmail_import import load_gv_contacts
+    _gv_contacts = load_gv_contacts()
+except Exception:
+    _gv_contacts = set()
 
 selected_id = st.session_state.get("selected_lead_id")
 if selected_id is not None and selected_id not in lead_lookup:
@@ -2170,17 +2184,31 @@ elif page == "followups":
                     unsafe_allow_html=True,
                 )
 
-            # First text from this number → make sure the draft says who you
-            # are and that this is the new number (the AI is instructed too).
+            # Reached us on Google Voice -> replies go from a different (Twilio)
+            # number, so flag it persistently.
+            _is_gv_lead = lead.get("phone", "") in _gv_contacts
+            if _is_gv_lead:
+                st.markdown(
+                    "<div class='sl-flag' style='border-color:#8e44ad;color:#6c3483;"
+                    "background:#f4ecfa'>📱 Reached you on <b>Google Voice</b> — "
+                    "your reply sends from your Twilio number (a different number on their "
+                    "end). The first reply should say it's your new office number they can "
+                    "reach you at more reliably.</div>",
+                    unsafe_allow_html=True,
+                )
+            # First text from this number -> the draft must identify the new number.
             _never_texted = not any(
                 h.get("type") == "text" and h.get("direction") == "outbound"
                 for h in history
             )
             if _never_texted:
+                _ft_extra = ("they came in on Google Voice, so say it's your new office "
+                             "number they can reach you at more reliably"
+                             if _is_gv_lead else
+                             "say who you are + that this is your new office number")
                 st.markdown(
-                    "<div class='sl-flag'>📱 First text from this number — the "
-                    "draft should say who you are + that this is your new number. "
-                    "Double-check before sending.</div>",
+                    f"<div class='sl-flag'>📱 First text from this number — the "
+                    f"draft should {_ft_extra}. Double-check before sending.</div>",
                     unsafe_allow_html=True,
                 )
 
@@ -2457,9 +2485,13 @@ elif page == "messages":
                 # Conversation header
                 _ch_left, _ch_mark, _ch_right = st.columns([3.2, 1.3, 1])
                 _sel_icon = _STATUS_ICONS.get(_sel_lead["status"], "")
+                _gv_tag = (" · <span style='color:#8e44ad;font-weight:700'>"
+                           "📱 Google Voice</span>"
+                           if _sel_lead["phone"] in _gv_contacts else "")
                 _ch_left.markdown(
                     f"**{_sel_lead['name']}** {_sel_icon} "
-                    f"{_sel_lead['status'].upper()} · `{_sel_lead['phone']}`"
+                    f"{_sel_lead['status'].upper()} · `{_sel_lead['phone']}`{_gv_tag}",
+                    unsafe_allow_html=True,
                 )
                 _sel_unread = _sel_lid in _unread_ids
                 _mark_label = "✓ Mark read" if _sel_unread else "Mark unread"
@@ -2485,8 +2517,13 @@ elif page == "messages":
                 st.markdown("---")
                 if not any(i.get("type") == "text" and i.get("direction") == "outbound"
                            for i in _convo_items):
-                    st.caption("📱 First text to this lead from this number — say who you "
-                               "are and that this is your new number they can save.")
+                    if _sel_lead["phone"] in _gv_contacts:
+                        st.caption("📱 They reached you on Google Voice — this reply "
+                                   "sends from your Twilio number. Say it's your new office "
+                                   "number they can reach you at more reliably.")
+                    else:
+                        st.caption("📱 First text to this lead from this number — say who "
+                                   "you are and that this is your new office number they can save.")
                 _compose_key = f"msg_compose_{_sel_lid}"
                 # An AI draft staged on the previous run lands in the compose
                 # box here (widget keys can't be set after the widget renders).

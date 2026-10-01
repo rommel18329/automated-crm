@@ -40,6 +40,28 @@ def _save_done(done: set) -> None:
         pass
 
 
+_CONTACTS = Path(__file__).resolve().parents[1] / "gv_contacts.json"
+
+
+def load_gv_contacts() -> set:
+    """Phone numbers (XXX-XXX-XXXX) that have texted the Google Voice number."""
+    try:
+        return set(json.loads(_CONTACTS.read_text()))
+    except Exception:
+        return set()
+
+
+def _save_contacts(contacts: set) -> None:
+    try:
+        _CONTACTS.write_text(json.dumps(sorted(contacts)))
+    except Exception:
+        pass
+
+
+def is_gv_contact(phone: str) -> bool:
+    return bool(phone) and phone in load_gv_contacts()
+
+
 def _fmt_phone(digits: str) -> str | None:
     d = re.sub(r"\D", "", digits or "")
     if len(d) == 11 and d[0] == "1":
@@ -129,16 +151,21 @@ def sync_google_voice(client=None, since_days: int = 60, db_path=db.DB_PATH) -> 
 
     matched = unmatched = skipped = 0
     touched: set[int] = set()
+    contacts = load_gv_contacts()
     query = f"from:txt.voice.google.com newer_than:{int(since_days)}d"
 
     for tid in client.list_threads(query):
         thread = client.get_thread(tid)
         for msg in thread.get("messages", []):
             mid = msg.get("id")
-            if not mid or mid in done:
+            if not mid:
+                continue
+            parsed = parse_gv_email(msg)
+            if parsed:
+                contacts.add(parsed["phone"])   # GV-sourced contact (idempotent)
+            if mid in done:
                 continue
             done.add(mid)                       # processed, parseable or not
-            parsed = parse_gv_email(msg)
             if not parsed:
                 continue
             phone, text, ts = parsed["phone"], parsed["text"], parsed["ts"]
@@ -166,6 +193,7 @@ def sync_google_voice(client=None, since_days: int = 60, db_path=db.DB_PATH) -> 
                     unmatched += 1
 
     _save_done(done)
+    _save_contacts(contacts)
 
     # AI auto-note on the leads that got new GV messages (best-effort).
     for lid in touched:

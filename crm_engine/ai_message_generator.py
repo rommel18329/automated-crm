@@ -343,13 +343,30 @@ def generate_message(
     )
     new_number_note = ""
     if not has_texted_before:
-        new_number_note = (
-            "\n⚠️ FIRST TEXT FROM THIS NUMBER: this lead has NEVER received a text "
-            "from this number. You MUST naturally work in (1) who this is, by name, "
-            "and (2) that this is your new number they can reach you at / save. "
-            "Example vibe: \"It's Rom by the way, this is my new office number, "
-            "feel free to save it.\" Keep it casual, not robotic."
-        )
+        try:
+            from .gv_gmail_import import is_gv_contact
+            _is_gv = is_gv_contact(lead.get("phone", ""))
+        except Exception:
+            _is_gv = False
+        if _is_gv:
+            new_number_note = (
+                "\n⚠️ FIRST TEXT FROM THIS NUMBER — they reached you on your "
+                "GOOGLE VOICE number, so this reply comes from a DIFFERENT number than "
+                "the one they texted. You MUST naturally work in (1) who this is, by "
+                "name, and (2) that this is your new OFFICE number and they can reach "
+                "you here more reliably. Example vibe: \"Hey, it's Rom — this is my "
+                "new office number, you can reach me here more reliably, feel free to "
+                "save it.\" Casual, not robotic. Say it only this once."
+            )
+        else:
+            new_number_note = (
+                "\n⚠️ FIRST TEXT FROM THIS NUMBER: this lead has NEVER received a text "
+                "from this number. You MUST naturally work in (1) who this is, by name, "
+                "and (2) that this is your new office number they can reach you at more "
+                "reliably / save. Example vibe: \"It's Rom by the way, this is my new "
+                "office number, you can reach me here more reliably, feel free to save "
+                "it.\" Keep it casual, not robotic. Say it only this once."
+            )
 
     user_msg = f"""LEAD PROFILE:
 - Name: {lead.get('name', 'Unknown')}

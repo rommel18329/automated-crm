@@ -14,3 +14,4 @@ token.json
 *.egg-info/
 
 gv_imported_ids.json
+gv_contacts.json
