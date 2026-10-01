@@ -101,10 +101,11 @@ def _waiting_digest() -> str:
     try:
         unread_ids = db.unread_message_lead_ids(DB_PATH)
         missed = db.fetch_unacknowledged_missed_calls(DB_PATH)
+        unmatched = db.fetch_unmatched_inbox(DB_PATH)
     except Exception as exc:
         log.warning(f"digest query failed: {exc}")
         return ""
-    if not unread_ids and not missed:
+    if not unread_ids and not missed and not unmatched:
         return ""
     parts = []
     if unread_ids:
@@ -132,7 +133,11 @@ def _waiting_digest() -> str:
         mnames = ", ".join(m["name"] for m in missed[:4])
         more = f" +{len(missed) - 4} more" if len(missed) > 4 else ""
         parts.append(f"{len(missed)} missed call(s) not returned: {mnames}{more}")
-    return "⏰ CRM daily: " + " | ".join(parts) + " — open Messages."
+    if unmatched:
+        gv_un = sum(1 for u in unmatched if (u.get("content") or "").startswith("[Google Voice]"))
+        gv_note = f" ({gv_un} on Google Voice)" if gv_un else ""
+        parts.append(f"{len(unmatched)} msg(s) from unknown numbers to triage{gv_note}")
+    return "⏰ CRM daily: " + " | ".join(parts) + " — open the dashboard."
 
 
 def _daily_digest_loop() -> None:

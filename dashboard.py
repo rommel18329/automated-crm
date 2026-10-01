@@ -1787,7 +1787,15 @@ elif page == "dashboard":
     unmatched = db.fetch_unmatched_inbox()
     if unmatched:
         word = "message" if len(unmatched) == 1 else "messages"
-        with st.expander(f"📥 {len(unmatched)} unmatched {word} from unknown numbers", expanded=False):
+        _gv_un = sum(1 for u in unmatched if (u.get("content") or "").startswith("[Google Voice]"))
+        _gv_note = f" · {_gv_un} from Google Voice" if _gv_un else ""
+        st.markdown(
+            f"<div class='sl-banner red'><b>📥 {len(unmatched)} {word} from unknown "
+            f"numbers need a look{_gv_note}</b> — could be new sellers. Add them as leads below so "
+            f"they don't slip through.</div>",
+            unsafe_allow_html=True,
+        )
+        with st.expander(f"📥 Review {len(unmatched)} unmatched {word}", expanded=True):
             for entry in unmatched:
                 d, t = fmt_date_time(entry["timestamp"])
                 icon = "🎙️" if entry["type"] == "voicemail" else "💬"

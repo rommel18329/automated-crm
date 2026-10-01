@@ -74,7 +74,8 @@ def _fmt_phone(digits: str) -> str | None:
 def _extract_message(body: str) -> str:
     """The message is between the GV link header and the 'YOUR ACCOUNT' footer."""
     text = (body or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    for marker in ("YOUR ACCOUNT <https://voice.google.com> HELP CENTER",
+    for marker in ("To respond to this",
+                   "YOUR ACCOUNT <https://voice.google.com> HELP CENTER",
                    "YOUR ACCOUNT", "This email was sent to you"):
         i = text.find(marker)
         if i != -1:
