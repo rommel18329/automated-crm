@@ -1061,28 +1061,85 @@ def create_lead(
         return cur.lastrowid
 
 
-def convert_unmatched_to_lead(unmatched_id: int, name: str, db_path: Path = DB_PATH) -> int:
-    """Create a lead from an unmatched inbox entry, copy its message into the
-    lead's interaction history, and mark the unmatched entry handled."""
+_ADDR_RE = re.compile(
+    r"\d{1,6}\s+[0-9A-Za-z.\-' ]*?\b(?:st|street|ave|avenue|rd|road|dr|drive|ln|lane|"
+    r"blvd|ct|court|way|pl|place|hwy|highway|cir|circle|ter|terrace|pkwy|parkway|trl|trail)"
+    r"\b[^,.\n]*(?:,\s*[A-Za-z]{2})?", re.IGNORECASE)
+
+
+def extract_address(text: str) -> str:
+    """Pull a street address out of free text (a typed lead name or messages)."""
+    m = _ADDR_RE.search(text or "")
+    return m.group(0).strip(" .,") if m else ""
+
+
+def convert_unmatched_to_lead(unmatched_id: int, name: str, db_path: Path = DB_PATH) -> dict:
+    """Create (or REUSE) a lead from an unmatched entry and fully populate it:
+    pull EVERY unmatched message from the same number into the lead's history
+    (so none are left in the review list), extract an address from the name /
+    messages, and mark all of that number's entries handled. Reuses an existing
+    lead with the same phone instead of creating a duplicate.
+    Returns {lead_id, messages_added, address, reused}."""
     with get_conn(db_path) as conn:
         row = conn.execute("SELECT * FROM unmatched_inbox WHERE id=?", (unmatched_id,)).fetchone()
         if not row:
             raise ValueError(f"No unmatched inbox entry with id={unmatched_id}")
-        entry = _to_dict(row)
+        phone = _to_dict(row)["phone"]
+        nm = (name or "").strip()
 
-        lead_id = create_lead(name, entry["phone"], db_path)
+        existing = conn.execute(
+            "SELECT id, timeline FROM leads WHERE phone=? ORDER BY id LIMIT 1", (phone,)
+        ).fetchone()
+        if existing:
+            lead_id = existing["id"]
+            cur_timeline = existing["timeline"] or ""
+            reused = True
+            if nm:
+                conn.execute("UPDATE leads SET name=? WHERE id=?", (nm, lead_id))
+        else:
+            today = date.today().isoformat()
+            cur = conn.execute(
+                """INSERT INTO leads (name, phone, status, motivation_score, timeline,
+                   timeline_days, last_contact_date, next_action_date, touch_count,
+                   last_strategy_used, conversation_stage, deal_probability)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (nm or phone, phone, "warm", 5, "", None, today, today, 0, None,
+                 "initial_contact", 0),
+            )
+            lead_id = cur.lastrowid
+            cur_timeline = ""
+            reused = False
 
-        ixn_type = "call" if entry["type"] == "voicemail" else "text"
-        content = entry["content"]
-        if entry["type"] == "voicemail" and entry.get("recording_url"):
-            content = f"Voicemail: {content} (recording: {entry['recording_url']})"
+        entries = [_to_dict(r) for r in conn.execute(
+            "SELECT * FROM unmatched_inbox WHERE phone=? AND handled=0 ORDER BY timestamp",
+            (phone,)).fetchall()]
+        added = 0
+        for e in entries:
+            ixn_type = "call" if e["type"] == "voicemail" else "text"
+            content = e["content"]
+            if e["type"] == "voicemail" and e.get("recording_url"):
+                content = f"Voicemail: {content} (recording: {e['recording_url']})"
+            dup = conn.execute(
+                "SELECT 1 FROM interactions WHERE lead_id=? AND content=? AND timestamp=? LIMIT 1",
+                (lead_id, content, e["timestamp"])).fetchone()
+            if not dup:
+                conn.execute(
+                    "INSERT INTO interactions (lead_id, type, content, timestamp, direction) "
+                    "VALUES (?,?,?,?,?)",
+                    (lead_id, ixn_type, content, e["timestamp"], "inbound"))
+                added += 1
+            conn.execute("UPDATE unmatched_inbox SET handled=1 WHERE id=?", (e["id"],))
 
-        conn.execute(
-            "INSERT INTO interactions (lead_id, type, content, timestamp, direction) VALUES (?,?,?,?,?)",
-            (lead_id, ixn_type, content, entry["timestamp"], "inbound"),
-        )
-        conn.execute("UPDATE unmatched_inbox SET handled=1 WHERE id=?", (unmatched_id,))
-        return lead_id
+        address = ""
+        if "Address:" not in (cur_timeline or ""):
+            blob = nm + " " + " ".join(e["content"] for e in entries)
+            address = extract_address(blob)
+            if address:
+                new_tl = ((cur_timeline + ". ") if cur_timeline else "") + f"Address: {address}"
+                conn.execute("UPDATE leads SET timeline=? WHERE id=?", (new_tl.strip(), lead_id))
+
+        return {"lead_id": lead_id, "messages_added": added,
+                "address": address, "reused": reused}
 
 
 def get_followup_suggestion(lead_id: int, db_path: Path = DB_PATH) -> dict[str, Any] | None:

@@ -1807,9 +1807,17 @@ elif page == "dashboard":
                 if u_col2.button("Add as lead", key=f"unmatched_convert_{entry['id']}"):
                     new_name = st.session_state.get(name_key, "").strip()
                     if new_name:
-                        new_lead_id = db.convert_unmatched_to_lead(entry["id"], new_name)
-                        st.success(f"Created lead: {new_name}")
-                        nav_to("Leads", new_lead_id)
+                        _res = db.convert_unmatched_to_lead(entry["id"], new_name)
+                        _verb = "Updated" if _res.get("reused") else "Created"
+                        _addr = f" · address: {_res['address']}" if _res.get("address") else ""
+                        st.session_state["_sent_popup"] = {
+                            "name": new_name,
+                            "preview": f"{_verb} lead — {_res.get('messages_added', 0)} "
+                                       f"message(s) pulled in{_addr}",
+                        }
+                        st.toast(f"✅ {_verb} lead: {new_name} "
+                                 f"({_res.get('messages_added', 0)} msgs)")
+                        st.rerun()
                     else:
                         st.warning("Enter a name first.")
                 if u_col3.button("Dismiss", key=f"unmatched_dismiss_{entry['id']}"):
