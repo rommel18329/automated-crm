@@ -34,6 +34,49 @@ WARMUP_DAILY_CAP = 10     # hard cap on a brand-new number (stage 1)
 # not a handful of test calls). The per-number caps below still gate volume.
 MIN_POOL_CALLS_PER_DAY = 10
 
+# After a long silence, carrier reputation goes stale, so warm-up credit must
+# NOT carry across a big gap. If two consecutive real-dialing days are more than
+# GAP_RESET_DAYS apart - or the most recent real-dialing day is itself more than
+# GAP_RESET_DAYS before today - warm-up restarts from zero. Dialing consistently
+# every day is what actually warms numbers; a two-week break wipes the progress.
+GAP_RESET_DAYS = 14
+
+# Pool-wide HARD ceiling on total calls placed per day, ramped by how many real
+# dialing days the pool has completed (gap-aware; see pool_warmup_days_completed).
+# This sits ON TOP of the per-number caps: with ~20 numbers, per-number caps alone
+# would allow far more total daily volume than is safe just after a restart, so
+# the pool total is the real limiter early in the ramp.
+#   (days completed below this  ->  max TOTAL calls allowed that day)
+POOL_DAILY_RAMP = [(1, 80), (2, 120), (4, 175), (7, 275), (10, 400)]
+POOL_DAILY_CAP_FULL = 500     # fully warmed: steady-state ceiling
+
+
+def pool_daily_cap(days_completed: int) -> int:
+    """Max total calls the whole pool may place today, for this warm-up stage."""
+    for upto, cap in POOL_DAILY_RAMP:
+        if days_completed < upto:
+            return cap
+    return POOL_DAILY_CAP_FULL
+
+
+def _era_day_count(qdays: list, today: date) -> int:
+    """Count real-dialing days in the CURRENT warm-up era. A gap of more than
+    GAP_RESET_DAYS between consecutive dialing days - or between the last dialing
+    day and today - invalidates older progress and restarts the count. `qdays`
+    is the list of qualifying days (>= MIN_POOL_CALLS_PER_DAY), oldest first."""
+    if not qdays:
+        return 0
+    # Silence right up to today wipes all prior credit - treat as a fresh start.
+    if (today - qdays[-1]).days > GAP_RESET_DAYS:
+        return 0
+    count = 1
+    for i in range(len(qdays) - 1, 0, -1):
+        if (qdays[i] - qdays[i - 1]).days > GAP_RESET_DAYS:
+            break
+        count += 1
+    return count
+
+
 # Answer-rate detection: if a number with enough volume drops below this fraction
 # of the pool's median answer rate, treat it as a likely flag.
 MIN_CALLS_FOR_RATE = 20          # need this many placed calls before judging
@@ -99,22 +142,27 @@ def pool_warmup_days_completed(db_path: Path = db.DB_PATH) -> int:
     MIN_POOL_CALLS_PER_DAY calls), read from the dispositions table — the
     authoritative record, immune to caller_id_stats.json resets. This is the
     pool's shared warm-up progress; every number's cap derives from it."""
-    today = date.today().isoformat()
-    if _warmup_cache.get("_day") == today and "n" in _warmup_cache:
+    today = date.today()
+    today_s = today.isoformat()
+    if _warmup_cache.get("_day") == today_s and "n" in _warmup_cache:
         return _warmup_cache["n"]
     try:
         with db.get_conn(db_path) as conn:
             rows = conn.execute(
                 """SELECT date(created_at) d, COUNT(*) c FROM dispositions
                    WHERE from_number IS NOT NULL AND date(created_at) < ?
-                   GROUP BY d""",
-                (today,),
+                   GROUP BY d ORDER BY d""",
+                (today_s,),
             ).fetchall()
-        n = sum(1 for r in rows if r["c"] >= MIN_POOL_CALLS_PER_DAY)
+        # Qualifying real-dialing days (>= MIN_POOL_CALLS_PER_DAY), oldest first,
+        # then counted gap-aware so a long silence restarts the warm-up.
+        qdays = [date.fromisoformat(r["d"]) for r in rows
+                 if r["c"] >= MIN_POOL_CALLS_PER_DAY]
+        n = _era_day_count(qdays, today)
     except Exception:
         n = 0
     _warmup_cache.clear()
-    _warmup_cache.update({"_day": today, "n": n})
+    _warmup_cache.update({"_day": today_s, "n": n})
     return n
 
 
@@ -182,6 +230,15 @@ def pick_number(lead_phone: str, db_path: Path = db.DB_PATH,
     if not pool:
         return None
 
+    # HARD pool-wide daily ceiling (gap-aware ramp): once the whole pool has
+    # placed its allotment for today, stop - even if individual numbers still
+    # have per-number headroom. Right after a restart this is the real limiter.
+    days = pool_warmup_days_completed(db_path)
+    pool_used = sum(db.caller_calls_today(n["phone_number"], db_path)
+                    for n in pool if n["status"] not in ("flagged", "retired"))
+    if pool_used >= pool_daily_cap(days):
+        return None
+
     usable = []
     stats = _load_stats()
     for num in pool:
@@ -220,6 +277,7 @@ def pool_status(db_path: Path = db.DB_PATH) -> dict:
     pool = db.fetch_caller_pool(db_path)
     out = {"numbers": 0, "active": 0, "warming": 0, "flagged": 0,
            "used_today": 0, "cap_today": 0, "remaining_today": 0,
+           "pool_cap_today": None,
            "warmup_day": None, "warmup_total_days": WARMUP_DAYS,
            "warming_cap": None, "warmup_days_left": None}
     days = pool_warmup_days_completed(db_path)       # pool-shared warm-up stage
@@ -243,6 +301,14 @@ def pool_status(db_path: Path = db.DB_PATH) -> dict:
     if not graduated:
         out["warmup_day"] = days + 1                 # humans count from day 1
         out["warmup_days_left"] = max(0, WARMUP_DAYS - days)
+    # Clamp to the gap-aware pool-wide daily ceiling on top of per-number caps.
+    pool_cap = pool_daily_cap(days)
+    true_used = sum(db.caller_calls_today(num["phone_number"], db_path)
+                    for num in pool if num["status"] not in ("flagged", "retired"))
+    out["pool_cap_today"] = pool_cap
+    out["cap_today"] = min(out["cap_today"], pool_cap)
+    out["remaining_today"] = max(0, min(out["remaining_today"],
+                                        pool_cap - true_used))
     return out
 
 
