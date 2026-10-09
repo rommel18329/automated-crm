@@ -839,11 +839,19 @@ def render_imessage(items: list[dict], max_items: int | None = None) -> None:
         outgoing = msg["direction"] == "outbound"
         bubble = "msg-bubble-out" if outgoing else "msg-bubble-in"
         row = "msg-right" if outgoing else "msg-left"
+        _content = msg.get("content") or ""
+        _is_gv = (msg.get("channel") == "gv") or _content.startswith("[Google Voice]")
+        if _content.startswith("[Google Voice] "):
+            _content = _content[len("[Google Voice] "):]
+        elif _content.startswith("[Google Voice]"):
+            _content = _content[len("[Google Voice]"):].lstrip()
         if msg["type"] == "call":
             prefix = "Outbound Call" if outgoing else "Inbound Call"
-            label = f"{prefix} - {msg['content']}"
+            label = f"{prefix} - {_content}"
         else:
-            label = msg["content"]
+            _gv_badge = ("<span title='Google Voice' style='font-size:0.72rem;"
+                         "opacity:.75;margin-right:3px'>📱</span>" if _is_gv else "")
+            label = _gv_badge + _content
 
         # Audio player for recorded calls / voicemails
         rec_url = msg.get("recording_url") or ""
@@ -2424,12 +2432,21 @@ elif page == "messages":
         _latest = max(_txts, key=lambda x: x["timestamp"])
         _last_in = max((x["timestamp"] for x in _txts if x["direction"] == "inbound"),
                        default=None)
+        _gv_thread = any((t.get("channel") == "gv")
+                         or (t.get("content") or "").startswith("[Google Voice]")
+                         for t in _txts)
+        _last_txt = _latest["content"] or ""
+        if _last_txt.startswith("[Google Voice] "):
+            _last_txt = _last_txt[len("[Google Voice] "):]
+        elif _last_txt.startswith("[Google Voice]"):
+            _last_txt = _last_txt[len("[Google Voice]"):].lstrip()
         _threads.append({
             "lead_id": _lid,
             "lead_name": _lead["name"],
             "phone": _lead["phone"],
             "status": _lead["status"],
-            "last_text": _latest["content"],
+            "last_text": _last_txt,
+            "gv": _gv_thread,
             "last_ts": _latest["timestamp"],
             "last_in_ts": _last_in,      # when THEY last texted us
             "direction": _latest["direction"],
@@ -2464,6 +2481,8 @@ elif page == "messages":
                 _is_sel = st.session_state["msg_selected_lead"] == _t["lead_id"]
                 _is_unread = _t["lead_id"] in _unread_ids
                 _preview = (_t["last_text"][:48] + "…") if len(_t["last_text"]) > 48 else _t["last_text"]
+                if _t.get("gv"):
+                    _preview = "📱 " + _preview
                 _d, _tm = fmt_date_time(_t["last_ts"])
                 _dir_icon = "← " if _t["direction"] == "inbound" else "→ "
                 _btn_type = "secondary" if _is_sel else "tertiary"
@@ -2534,9 +2553,8 @@ elif page == "messages":
                 if not any(i.get("type") == "text" and i.get("direction") == "outbound"
                            for i in _convo_items):
                     if _sel_lead["phone"] in _gv_contacts:
-                        st.caption("📱 They reached you on Google Voice — this reply "
-                                   "sends from your Twilio number. Say it's your new office "
-                                   "number they can reach you at more reliably.")
+                        st.caption("📱 Google Voice — your reply sends from your Google "
+                                   "Voice number, the same one they already texted you from.")
                     else:
                         st.caption("📱 First text to this lead from this number — say who "
                                    "you are and that this is your new office number they can save.")
@@ -2550,13 +2568,18 @@ elif page == "messages":
                     "Compose",
                     key=_compose_key,
                     height=72,
-                    placeholder="iMessage  ✉",
+                    placeholder=("Message via 📱 Google Voice"
+                                 if _sel_lead["phone"] in _gv_contacts else "iMessage  ✉"),
                     label_visibility="collapsed",
                 )
                 _sc1, _sc2 = st.columns([3, 1])
                 if _sc1.button("Send ↑", key=f"msg_send_{_sel_lid}", type="primary", use_container_width=True):
                     if (_msg_text or "").strip():
-                        _res = send_sms(_sel_lid, _msg_text.strip())
+                        if _sel_lead["phone"] in _gv_contacts:
+                            from crm_engine.gv_gmail_import import send_gv
+                            _res = send_gv(_sel_lid, _msg_text.strip())
+                        else:
+                            _res = send_sms(_sel_lid, _msg_text.strip())
                         if _res.get("sent"):
                             flag_sent(_sel_lead["name"], _msg_text.strip())
                             st.session_state.pop(_compose_key, None)

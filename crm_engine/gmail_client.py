@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -14,6 +15,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL = ROOT / '.email-local'
 MAILBOX = 'contactus@silverlineinvestment.group'
+GV_LINE = '17732178686'   # our Google Voice number (the "Me" line)
+
+
+def gv_relay_address(their_number):
+    """Mail to this address is delivered by Google Voice as an SMS FROM our
+    GV number: <gv-line>.<their-number>@txt.voice.google.com."""
+    d = re.sub(r'\D', '', their_number or '')
+    if len(d) == 10:
+        d = '1' + d
+    if len(d) != 11:
+        raise ValueError(f'bad GV recipient number: {their_number!r}')
+    return f'{GV_LINE}.{d}@txt.voice.google.com'
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly',
           'https://www.googleapis.com/auth/gmail.send']
 
@@ -227,3 +240,17 @@ class GmailClient:
         response = self.service.users().messages().list(userId='me',
             q='in:sent rfc822msgid:' + rfc_message_id.strip('<>')).execute()
         return next(iter(response.get('messages', [])), None)
+
+    def send_gv_text(self, their_number, body):
+        """Send an SMS through Google Voice by emailing its relay address, so the
+        recipient sees the same GV number they already know (no Twilio 'new
+        number'). Returns the Gmail send response."""
+        to = gv_relay_address(their_number)
+        msg = EmailMessage()
+        msg['To'] = to
+        msg['Subject'] = ''
+        msg.set_content(body)
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode('ascii')
+        # Non-idempotent send: never auto-retry.
+        return self.service.users().messages().send(
+            userId='me', body={'raw': raw}).execute(num_retries=0)

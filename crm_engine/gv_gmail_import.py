@@ -23,6 +23,7 @@ from . import db
 
 _STATE = Path(__file__).resolve().parents[1] / "gv_imported_ids.json"
 _FROM_RE = re.compile(r'<([0-9]+)\.([0-9]+)\.[^@]+@txt\.voice\.google\.com>')
+_TO_RE = re.compile(r'([0-9]+)\.([0-9]+)(?:\.[^@]+)?@txt\.voice\.google\.com')
 _SUBJ_NAME_RE = re.compile(r'from\s+(.*?)\s*\(\d{3}\)\s*\d{3}-\d{4}\s*$')
 
 
@@ -114,19 +115,60 @@ def parse_gv_email(msg: dict) -> dict | None:
     return {"phone": phone, "name": name, "text": text, "ts": ts}
 
 
-def _already_logged(lead_id: int, text: str, ts: datetime, db_path) -> bool:
-    """True if a near-identical inbound text already exists (catches the prior
-    Takeout import + any overlap). Exact content within a +/-2h window."""
+def _already_logged(lead_id: int, text: str, ts: datetime, db_path,
+                    direction: str = "inbound") -> bool:
+    """True if a near-identical text already exists for this lead/direction
+    (catches the Takeout import + any overlap). Exact content within +/-2h."""
     lo = (ts - timedelta(hours=2)).isoformat()
     hi = (ts + timedelta(hours=2)).isoformat()
     with db.get_conn(db_path) as conn:
         row = conn.execute(
             """SELECT 1 FROM interactions WHERE lead_id=? AND type='text'
-               AND direction='inbound' AND content=? AND timestamp BETWEEN ? AND ?
+               AND direction=? AND content=? AND timestamp BETWEEN ? AND ?
                LIMIT 1""",
-            (lead_id, text, lo, hi),
+            (lead_id, direction, text, lo, hi),
         ).fetchone()
     return row is not None
+
+
+def _extract_sent_body(body: str) -> str:
+    """Our sent text sits above the quoted GV original; strip the quote/footer."""
+    text = (body or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    lines = []
+    for ln in text.split("\n"):
+        st = ln.strip()
+        if st.startswith(">") or st.startswith("<https://voice.google.com>"):
+            break
+        if st.startswith("On ") and st.endswith("wrote:"):
+            break
+        if st in ("YOUR ACCOUNT", "To respond to this text message, "
+                  "reply to this email or visit Google Voice."):
+            break
+        lines.append(ln)
+    return "\n".join(lines).strip()
+
+
+def parse_gv_sent(msg: dict) -> dict | None:
+    """Parse one of OUR Sent GV emails -> {phone, text, ts}. The To address is
+    <gv-line>.<their-number>[.token]@txt.voice.google.com; body is what we sent."""
+    to = msg.get("to", "") or ""
+    m = _TO_RE.search(to)
+    if not m:
+        return None
+    phone = _fmt_phone(m.group(2))
+    if not phone:
+        return None
+    text = _extract_sent_body(msg.get("body", ""))
+    if not text:
+        return None
+    try:
+        dt = parsedate_to_datetime(msg.get("date") or "")
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        ts = dt
+    except Exception:
+        ts = datetime.utcnow()
+    return {"phone": phone, "text": text, "ts": ts}
 
 
 def _unmatched_exists(phone: str, text: str, db_path) -> bool:
@@ -175,7 +217,7 @@ def sync_google_voice(client=None, since_days: int = 60, db_path=db.DB_PATH) -> 
                 if _already_logged(lead["id"], text, ts, db_path):
                     skipped += 1
                     continue
-                db.add_interaction(lead["id"], "text", text, "inbound", db_path, ts=ts)
+                db.add_interaction(lead["id"], "text", text, "inbound", db_path, ts=ts, channel="gv")
                 fields = {"next_action_date": date.today().isoformat()}
                 db.update_lead(lead["id"], fields, db_path)
                 try:
@@ -193,6 +235,31 @@ def sync_google_voice(client=None, since_days: int = 60, db_path=db.DB_PATH) -> 
                     db.add_unmatched_message(phone, "text", f"[Google Voice] {text}", db_path)
                     unmatched += 1
 
+    # Outbound: our own GV replies live in Gmail Sent (GV never forwards them
+    # inbound). Capture them so the CRM knows what we've already said.
+    sent_q = f"in:sent to:txt.voice.google.com newer_than:{int(since_days)}d"
+    for tid in client.list_threads(sent_q):
+        thread = client.get_thread(tid)
+        for msg in thread.get("messages", []):
+            mid = msg.get("id")
+            if not mid or mid in done:
+                continue
+            done.add(mid)
+            parsed = parse_gv_sent(msg)
+            if not parsed:
+                continue
+            phone, text, ts = parsed["phone"], parsed["text"], parsed["ts"]
+            lead = by_phone.get(phone)
+            if not lead:
+                continue  # never create a lead from an outbound-only thread
+            if _already_logged(lead["id"], text, ts, db_path, direction="outbound"):
+                skipped += 1
+                continue
+            db.add_interaction(lead["id"], "text", text, "outbound", db_path,
+                               ts=ts, channel="gv")
+            touched.add(lead["id"])
+            matched += 1
+
     _save_done(done)
     _save_contacts(contacts)
 
@@ -206,3 +273,19 @@ def sync_google_voice(client=None, since_days: int = 60, db_path=db.DB_PATH) -> 
 
     return {"matched": matched, "unmatched": unmatched, "skipped": skipped,
             "leads_touched": len(touched)}
+
+
+def send_gv(lead_id: int, body: str, db_path=db.DB_PATH) -> dict:
+    """Send a text to a lead via Google Voice (Gmail relay) and log it outbound.
+    Mirrors messaging_gateway.send_sms's return shape: {"sent": bool, "error"}."""
+    lead = db.fetch_lead(lead_id, db_path)
+    if not lead:
+        return {"sent": False, "error": "lead not found"}
+    try:
+        from .gmail_client import GmailClient
+        client = GmailClient.connect(interactive=False)
+        client.send_gv_text(lead["phone"], body)
+    except Exception as e:
+        return {"sent": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+    db.add_interaction(lead_id, "text", body, "outbound", db_path, channel="gv")
+    return {"sent": True, "error": None}
