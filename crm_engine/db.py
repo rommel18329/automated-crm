@@ -395,6 +395,14 @@ def _init_db_once(db_path: Path = DB_PATH) -> None:
         except Exception:
             pass  # column already exists
 
+        # Migration: add channel column to interactions (sms|gv|email; NULL = legacy sms).
+        # Additive + nullable; existing rows read as plain SMS. Lets a Google Voice
+        # text and a Twilio text share one thread with the right per-message icon.
+        try:
+            conn.execute("ALTER TABLE interactions ADD COLUMN channel TEXT")
+        except Exception:
+            pass  # column already exists
+
 
 def seed_sample_data(db_path: Path = DB_PATH, replace_existing: bool = False) -> None:
     today = date.today().isoformat()
@@ -812,12 +820,13 @@ def add_interaction(
     db_path: Path = DB_PATH,
     ts: datetime | None = None,
     recording_url: str | None = None,
+    channel: str | None = None,
 ) -> None:
     timestamp = (ts or datetime.utcnow()).isoformat(timespec="seconds")
     with get_conn(db_path) as conn:
         conn.execute(
-            "INSERT INTO interactions (lead_id, type, content, timestamp, direction, recording_url) VALUES (?,?,?,?,?,?)",
-            (lead_id, type_, content, timestamp, direction, recording_url),
+            "INSERT INTO interactions (lead_id, type, content, timestamp, direction, recording_url, channel) VALUES (?,?,?,?,?,?,?)",
+            (lead_id, type_, content, timestamp, direction, recording_url, channel),
         )
 
 
