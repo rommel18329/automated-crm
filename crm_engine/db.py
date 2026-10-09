@@ -389,6 +389,13 @@ def _init_db_once(db_path: Path = DB_PATH) -> None:
         except Exception:
             pass
 
+        # Migration: add email column to leads (links email threads to a lead so
+        # they can show inline in Messages). Additive, nullable.
+        try:
+            conn.execute("ALTER TABLE leads ADD COLUMN email TEXT")
+        except Exception:
+            pass
+
         # Migration: add recording_url column to interactions if it doesn't exist yet
         try:
             conn.execute("ALTER TABLE interactions ADD COLUMN recording_url TEXT")

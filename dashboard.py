@@ -839,6 +839,23 @@ def render_imessage(items: list[dict], max_items: int | None = None) -> None:
         outgoing = msg["direction"] == "outbound"
         bubble = "msg-bubble-out" if outgoing else "msg-bubble-in"
         row = "msg-right" if outgoing else "msg-left"
+        if msg.get("type") == "email":
+            def _esc(t):
+                return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            _subj = _esc(msg.get("subject") or msg.get("content") or "(email)")
+            _snip = _esc(msg.get("snippet", ""))
+            _url = msg.get("url", "")
+            _link = (f"<a href='{_url}' target='_blank' style='color:#0b63c4;"
+                     f"text-decoration:none;font-size:0.72rem'>Open in Gmail \u2197</a>"
+                     if _url else "")
+            _estyle = ("background:#FFF7E6;border:1px solid #F0E2BE;color:#3a3a3a;"
+                       "padding:9px 12px;border-radius:14px;max-width:82%;text-align:left")
+            _ehtml = ("<span style='font-size:0.7rem;opacity:.7'>\U0001F4E7 Email</span><br>"
+                      f"<b>{_subj}</b><br><span style='opacity:.85'>{_snip}</span>"
+                      + (f"<br>{_link}" if _link else ""))
+            st.markdown(f"<div class='msg-row {row}'><div style=\"{_estyle}\">{_ehtml}</div></div>",
+                        unsafe_allow_html=True)
+            continue
         _content = msg.get("content") or ""
         _is_gv = (msg.get("channel") == "gv") or _content.startswith("[Google Voice]")
         if _content.startswith("[Google Voice] "):
@@ -1344,6 +1361,17 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
                 db.update_lead(lead_id, {"name": _new_name.strip()})
                 st.toast(f"Renamed to {_new_name.strip()}")
                 st.rerun()
+        st.caption("Email — links their Gmail thread into Messages, inline with texts.")
+        _em1, _em2 = st.columns([3, 1])
+        _new_email = _em1.text_input("Email", value=(lead.get("email") or ""),
+                                     key=f"email_{lead_id}",
+                                     placeholder="name@example.com",
+                                     label_visibility="collapsed")
+        if _em2.button("Save email", key=f"email_save_{lead_id}",
+                       use_container_width=True):
+            db.update_lead(lead_id, {"email": _new_email.strip() or None})
+            st.toast("Email saved" if _new_email.strip() else "Email cleared")
+            st.rerun()
         st.divider()
         st.caption(f"Delete **{lead['name']}** and ALL their history — texts, "
                    "calls, notes, dispositions. crm.db has no backup; this "
@@ -2424,6 +2452,14 @@ elif page == "messages":
         if _ixn["type"] == "text":
             _texts_by_lead.setdefault(_ixn["lead_id"], []).append(_ixn)
 
+    # Email threads linked to leads, shown inline in the conversation (and in
+    # the thread list, so email-only leads still appear in Messages).
+    try:
+        from crm_engine.email_timeline import build_email_index
+        _email_index = build_email_index()
+    except Exception:
+        _email_index = {}
+
     _threads: list[dict] = []
     for _lid, _txts in _texts_by_lead.items():
         _lead = lead_lookup.get(_lid)
@@ -2450,6 +2486,27 @@ elif page == "messages":
             "last_ts": _latest["timestamp"],
             "last_in_ts": _last_in,      # when THEY last texted us
             "direction": _latest["direction"],
+        })
+    # Include leads that have only email threads (no texts) so email-only
+    # conversations still appear in Messages.
+    _text_lead_ids = set(_texts_by_lead)
+    for _elid, _eitems in _email_index.items():
+        if _elid in _text_lead_ids or not _eitems:
+            continue
+        _elead = lead_lookup.get(_elid)
+        if not _elead:
+            continue
+        _elatest = max(_eitems, key=lambda x: x.get("timestamp") or "")
+        _threads.append({
+            "lead_id": _elid,
+            "lead_name": _elead["name"],
+            "phone": _elead["phone"],
+            "status": _elead["status"],
+            "last_text": "📧 " + (_elatest.get("subject") or "Email"),
+            "gv": False,
+            "last_ts": _elatest.get("timestamp") or "",
+            "last_in_ts": None,
+            "direction": _elatest.get("direction", "inbound"),
         })
     # Unread threads pin to the top (newest first within each group) and stay
     # there until replied to or marked read.
@@ -2541,6 +2598,10 @@ elif page == "messages":
                 _convo_ixns = db.fetch_interactions(_sel_lid)
                 _convo_items = [i for i in _convo_ixns if i["type"] in ("text", "call")]
                 _convo_asc = list(reversed(_convo_items))  # fetch returns newest-first; reverse for display
+                _lead_emails = _email_index.get(_sel_lid, [])
+                if _lead_emails:
+                    _convo_asc = sorted(_convo_asc + _lead_emails,
+                                        key=lambda x: x.get("timestamp") or "")
 
                 with st.container(height=420):
                     if _convo_asc:
