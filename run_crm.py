@@ -143,6 +143,24 @@ def _kill_stale_crm_processes() -> None:
         time.sleep(1.5)   # let the OS release their ports
 
 
+def _refresh_funnel() -> None:
+    """Re-establish the Tailscale funnel after the webhook (re)starts. tailscaled
+    can keep proxying to the OLD (dead) webhook process after a restart and keep
+    returning HTTP 502 to Twilio until the funnel is re-applied -- which is what
+    produced 'an application error has occurred' in the dialer."""
+    steps = (
+        ["tailscale", "funnel", "reset"],
+        ["tailscale", "funnel", "--bg", "5001"],
+        ["tailscale", "funnel", "--bg", "--set-path", "/amd", "5002"],
+    )
+    for cmd in steps:
+        try:
+            subprocess.run(cmd, timeout=20, capture_output=True)
+        except Exception as e:
+            log(f"funnel refresh step failed ({' '.join(cmd)}): {e}")
+    log("tailscale funnel re-applied (pointing at the current webhook)")
+
+
 def main() -> None:
     global _singleton_sock
     _singleton_sock = _acquire_singleton_lock()
@@ -155,6 +173,7 @@ def main() -> None:
         procs[name] = start(name, cfg)
         grace_until[name] = time.time() + cfg["grace"]
 
+    _refresh_funnel()
     log("all services launched. Watching... (Ctrl+C to stop)")
     try:
         while True:
@@ -187,6 +206,8 @@ def main() -> None:
                     except Exception:
                         pass
                     procs[name] = start(name, cfg)
+                    if name == "webhook":
+                        _refresh_funnel()   # re-point the funnel at the new webhook
                     grace_until[name] = time.time() + cfg["grace"]
                     restart_times[name].append(time.time())
     except KeyboardInterrupt:
