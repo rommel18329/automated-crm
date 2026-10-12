@@ -14,6 +14,7 @@ Ctrl+C stops everything cleanly.
 """
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
 import sys
@@ -94,7 +95,58 @@ def start(name: str, cfg: dict) -> subprocess.Popen:
     return proc
 
 
+# A fixed loopback port doubles as an atomic single-instance mutex: only one
+# supervisor can bind it, and the OS releases it the instant that process dies.
+# This is what stops multiple supervisors from racing over port 5001 (the cause
+# of the intermittent 502s / "application error" in the dialer).
+_MUTEX_PORT = 5099
+_singleton_sock = None
+
+
+def _acquire_singleton_lock():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", _MUTEX_PORT))
+        sock.listen(1)
+    except OSError:
+        log(f"Another CRM supervisor is already running (mutex :{_MUTEX_PORT} held). "
+            f"Not starting a second one.")
+        sys.exit(1)
+    return sock
+
+
+def _kill_stale_crm_processes() -> None:
+    """Kill leftover CRM processes from a previous/crashed launch so we always
+    start exactly one clean stack (no duplicate webhooks fighting over :5001)."""
+    try:
+        import psutil
+    except Exception:
+        log("psutil not available; skipping stale-process cleanup")
+        return
+    me, parent = os.getpid(), os.getppid()
+    targets = ("webhook_server.py", "amd_server.py", "run_crm.py")
+    killed = 0
+    for p in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if p.info["pid"] in (me, parent):
+                continue
+            cl = " ".join(p.info.get("cmdline") or [])
+            if not cl:
+                continue
+            if any(t in cl for t in targets) or ("streamlit" in cl and "8501" in cl):
+                p.kill()
+                killed += 1
+        except Exception:
+            pass
+    if killed:
+        log(f"cleaned up {killed} stale CRM process(es) before starting")
+        time.sleep(1.5)   # let the OS release their ports
+
+
 def main() -> None:
+    global _singleton_sock
+    _singleton_sock = _acquire_singleton_lock()
+    _kill_stale_crm_processes()
     procs: dict[str, subprocess.Popen] = {}
     grace_until: dict[str, float] = {}
     restart_times: dict[str, list[float]] = {n: [] for n in SERVICES}
