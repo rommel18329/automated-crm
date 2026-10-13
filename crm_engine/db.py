@@ -8,8 +8,57 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 DB_PATH = Path(__file__).resolve().parents[1] / "crm.db"
+
+# Explicit migration approved 2026-10-13; never applied during app startup.
+DIALER_HISTORY_MIGRATION = """
+CREATE TABLE IF NOT EXISTS dialer_call_history (
+ call_sid TEXT PRIMARY KEY,
+ phone_number TEXT NOT NULL,
+ placed_at TEXT NOT NULL,
+ call_day TEXT NOT NULL,
+ agent TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS dialer_history_day ON dialer_call_history(call_day);
+CREATE TABLE IF NOT EXISTS dialer_warmup_credit (
+ call_day TEXT PRIMARY KEY,
+ minimum_calls INTEGER NOT NULL,
+ evidence TEXT NOT NULL
+);
+"""
+
+
+def crm_today() -> date:
+    return datetime.now(ZoneInfo("America/Chicago")).date()
+
+
+def record_dialer_call(call_sid: str, phone_number: str, agent: str = "",
+                       db_path: Path = DB_PATH, placed_at: datetime | None = None) -> bool:
+    when = placed_at or datetime.now(ZoneInfo("America/Chicago"))
+    if when.tzinfo is None:
+        raise ValueError("Call timestamp must include its timezone")
+    with get_conn(db_path) as conn:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO dialer_call_history
+               (call_sid,phone_number,placed_at,call_day,agent) VALUES (?,?,?,?,?)""",
+            (call_sid, phone_number, when.isoformat(),
+             when.astimezone(ZoneInfo("America/Chicago")).date().isoformat(), agent),
+        )
+        return cur.rowcount == 1
+
+
+def dialer_day_counts(db_path: Path = DB_PATH) -> list[dict[str, Any]]:
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            """SELECT call_day, MAX(n) AS calls FROM (
+                 SELECT call_day, COUNT(*) AS n FROM dialer_call_history GROUP BY call_day
+                 UNION ALL
+                 SELECT call_day, minimum_calls AS n FROM dialer_warmup_credit
+               ) GROUP BY call_day ORDER BY call_day"""
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 # Additive email migration, explicitly approved in dev/active/2026-09-29-email-review.md.
 # This is intentionally not called by init_db or normal dashboard startup.
@@ -1317,7 +1366,7 @@ def update_caller_number(number_id: int, fields: dict[str, Any], db_path: Path =
 
 def increment_caller_calls(phone_number: str, db_path: Path = DB_PATH) -> None:
     """Bump a number's calls-today counter, resetting it if the date rolled over."""
-    today = date.today().isoformat()
+    today = crm_today().isoformat()
     with get_conn(db_path) as conn:
         row = conn.execute(
             "SELECT calls_today, calls_today_date FROM caller_id_pool WHERE phone_number=?",
@@ -1334,7 +1383,7 @@ def increment_caller_calls(phone_number: str, db_path: Path = DB_PATH) -> None:
 
 def caller_calls_today(phone_number: str, db_path: Path = DB_PATH) -> int:
     """Current call count for a number today (0 if the stored date is stale)."""
-    today = date.today().isoformat()
+    today = crm_today().isoformat()
     with get_conn(db_path) as conn:
         row = conn.execute(
             "SELECT calls_today, calls_today_date FROM caller_id_pool WHERE phone_number=?",

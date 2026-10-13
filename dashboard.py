@@ -3327,7 +3327,7 @@ elif page == "caller_health":
             "**To add your 10-number pool:**\n"
             "1. Preview available numbers: `python buy_numbers.py --area 515 --count 10`\n"
             "2. Purchase them: `python buy_numbers.py --area 515 --count 10 --buy`\n\n"
-            "New numbers start in **warming** mode (low volume for 7 days) automatically."
+            "New numbers start in **warming** mode (low volume through 10 qualifying dialing days) automatically."
         )
     else:
         # Auto-detect likely-flagged numbers from answer-rate crater
@@ -3380,10 +3380,10 @@ elif page == "caller_health":
                 _warm_note = ""
                 if num["status"] == "warming":
                     # Pool-level, from the DB: a warm-up day = a past day the
-                    # pool placed 10+ real calls. Every number ramps together.
-                    _days_done = caller_id_pool.pool_warmup_days_completed()
+                    # pool placed 10+ real calls since this number joined.
+                    _days_done = caller_id_pool._warmup_days_completed(num["phone_number"])
                     _warm_note = (f" · warm-up day {_days_done + 1}/{caller_id_pool.WARMUP_DAYS}"
-                                  f" · dial {caller_id_pool.MIN_POOL_CALLS_PER_DAY}+ today to advance")
+                                  f" · {caller_id_pool.MIN_POOL_CALLS_PER_DAY}+ pool calls today advance tomorrow")
                 st.caption(f"Area {num['area_code']}{_warm_note}")
             with c2:
                 _eff_cap = caller_id_pool._effective_cap(num)
@@ -3412,8 +3412,10 @@ elif page == "caller_health":
             "- **Warm-up (pool-level, from real dialing):** the whole pool "
             "advances one warm-up day for each past day it placed 10+ calls "
             "(read from the call record, so it survives restarts). Per-number "
-            "caps ramp together: 10/day → 15 → 25 → 40 → 50 over 10 dialing "
-            "days. A day with only a few test calls doesn't count.\n"
+            "caps ramp: 10/day → 15 → 25 → 40 → 50 over 10 dialing "
+            "days. Both profiles share progress and limits; newer numbers only "
+            "count days since joining. Days use Chicago time. Gaps over 14 days "
+            "reset progress. A day with fewer than 10 pool calls doesn't count.\n"
             "- **Detection:** answer rate is tracked per number; a sudden crater vs. "
             "the pool median flags a likely carrier block, and the number is pulled.\n"
             "- **Proactive registration:** run `python register_voice_integrity.py` to "

@@ -12,26 +12,20 @@ Design follows 2026 carrier best practices:
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+import os
+import tempfile
+import threading
+from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 
 from . import db
 
-# Warming numbers ramp up slowly before carrying full load. Warm-up advances
-# on REAL usage, not the calendar: a warm-up day only counts once the number
-# actually placed MIN_CALLS_WARMUP_DAY calls that day. Idle days advance
-# nothing — a number that never dials never graduates.
-#   (completed dialing days below this, hard per-day cap PER NUMBER)
+# Shared progress uses completed Chicago days with >=10 placed calls across
+# both agents. Each number can only inherit days since it joined the pool.
 WARMUP_SCHEDULE = [(2, 10), (4, 15), (7, 25), (10, 40)]
-WARMUP_DAYS = 10          # real dialing days needed to graduate to full cap
-WARMUP_DAILY_CAP = 10     # hard cap on a brand-new number (stage 1)
-# Warm-up is POOL-level and counted from the database (dispositions), NOT the
-# stats JSON. Rationale: the pool spreads each day's calls across 20 numbers,
-# so no single number ever hits a meaningful per-number daily count — a
-# per-number warm-up can never advance. What actually warms reputation is the
-# operation dialing consistently over days, so a "warm-up day" is any past
-# calendar day the pool placed >= MIN_POOL_CALLS_PER_DAY calls (real dialing,
-# not a handful of test calls). The per-number caps below still gate volume.
+WARMUP_DAYS = 10
+WARMUP_DAILY_CAP = 10
 MIN_POOL_CALLS_PER_DAY = 10
 
 # After a long silence, carrier reputation goes stale, so warm-up credit must
@@ -98,31 +92,68 @@ def _load_stats() -> dict:
         return {}
 
 
+_stats_thread_lock = threading.RLock()
+
+
+@contextmanager
+def _stats_lock():
+    # Serialize read/modify/write across both threads and server processes.
+    with _stats_thread_lock:
+        with _STATS_PATH.with_suffix(".lock").open("a+b") as lock:
+            lock.seek(0, 2)
+            if lock.tell() == 0:
+                lock.write(b"0")
+                lock.flush()
+            lock.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                lock.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def _save_stats(stats: dict) -> None:
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                     dir=_STATS_PATH.parent, delete=False) as out:
+        json.dump(stats, out, indent=2)
+        tmp = out.name
     try:
-        _STATS_PATH.write_text(json.dumps(stats, indent=2))
-    except Exception:
-        pass
+        os.replace(tmp, _STATS_PATH)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
-def record_placed(phone_number: str) -> None:
-    """A call was fired from this number (counts toward answer-rate denominator
-    and toward today's warm-up progress)."""
-    stats = _load_stats()
-    s = stats.setdefault(phone_number, {"placed": 0, "connected": 0})
-    s["placed"] += 1
-    daily = s.setdefault("daily", {})
-    day = date.today().isoformat()
-    daily[day] = daily.get(day, 0) + 1
-    _save_stats(stats)
+def record_placed(phone_number: str, call_sid: str, agent: str = "",
+                  db_path: Path = db.DB_PATH) -> None:
+    """Persist every successful placement once, independent of disposition."""
+    if not db.record_dialer_call(call_sid, phone_number, agent, db_path):
+        return
+    with _stats_lock():
+        stats = _load_stats()
+        s = stats.setdefault(phone_number, {"placed": 0, "connected": 0})
+        s["placed"] += 1
+        daily = s.setdefault("daily", {})
+        day = db.crm_today().isoformat()
+        daily[day] = daily.get(day, 0) + 1
+        _save_stats(stats)
 
 
 def record_connected(phone_number: str) -> None:
-    """A call from this number reached a human (answer-rate numerator)."""
-    stats = _load_stats()
-    s = stats.setdefault(phone_number, {"placed": 0, "connected": 0})
-    s["connected"] += 1
-    _save_stats(stats)
+    with _stats_lock():
+        stats = _load_stats()
+        s = stats.setdefault(phone_number, {"placed": 0, "connected": 0})
+        s["connected"] += 1
+        _save_stats(stats)
 
 
 def answer_rate(phone_number: str) -> float | None:
@@ -134,43 +165,33 @@ def answer_rate(phone_number: str) -> float | None:
 
 # ── Rotation ────────────────────────────────────────────────────────────────
 
-_warmup_cache: dict = {}   # {date_str: days_completed} — recompute once/day
+def _qualifying_days(db_path: Path) -> list[date]:
+    today = db.crm_today()
+    return [date.fromisoformat(row["call_day"]) for row in db.dialer_day_counts(db_path)
+            if row["calls"] >= MIN_POOL_CALLS_PER_DAY
+            and date.fromisoformat(row["call_day"]) < today]
 
 
 def pool_warmup_days_completed(db_path: Path = db.DB_PATH) -> int:
-    """Count PAST calendar days on which the pool did real dialing (>=
-    MIN_POOL_CALLS_PER_DAY calls), read from the dispositions table — the
-    authoritative record, immune to caller_id_stats.json resets. This is the
-    pool's shared warm-up progress; every number's cap derives from it."""
-    today = date.today()
-    today_s = today.isoformat()
-    if _warmup_cache.get("_day") == today_s and "n" in _warmup_cache:
-        return _warmup_cache["n"]
-    try:
-        with db.get_conn(db_path) as conn:
-            rows = conn.execute(
-                """SELECT date(created_at) d, COUNT(*) c FROM dispositions
-                   WHERE from_number IS NOT NULL AND date(created_at) < ?
-                   GROUP BY d ORDER BY d""",
-                (today_s,),
-            ).fetchall()
-        # Qualifying real-dialing days (>= MIN_POOL_CALLS_PER_DAY), oldest first,
-        # then counted gap-aware so a long silence restarts the warm-up.
-        qdays = [date.fromisoformat(r["d"]) for r in rows
-                 if r["c"] >= MIN_POOL_CALLS_PER_DAY]
-        n = _era_day_count(qdays, today)
-    except Exception:
-        n = 0
-    _warmup_cache.clear()
-    _warmup_cache.update({"_day": today_s, "n": n})
-    return n
+    """Shared, gap-aware progress; today's calls advance tomorrow's stage.
+
+    Read the durable ledger every time so imports and separate DBs cannot
+    leave the process stuck with cached or another database's progress.
+    """
+    return _era_day_count(_qualifying_days(db_path), db.crm_today())
 
 
 def _warmup_days_completed(phone_number: str = "", stats: dict | None = None,
-                           db_path: Path = db.DB_PATH) -> int:
-    """Pool-level warm-up days completed (the phone_number arg is ignored now;
-    kept so existing callers/tests keep working)."""
-    return pool_warmup_days_completed(db_path)
+                            db_path: Path = db.DB_PATH) -> int:
+    days = _qualifying_days(db_path)
+    if phone_number:
+        num = next((n for n in db.fetch_caller_pool(db_path)
+                    if n["phone_number"] == phone_number), None)
+        if not num:
+            return 0
+        started = max(num.get("added_date") or "", num.get("warmup_started") or "")
+        days = [day for day in days if day.isoformat() >= started]
+    return _era_day_count(days, db.crm_today())
 
 
 def _stage_cap(days_completed: int) -> int | None:
@@ -183,10 +204,8 @@ def _stage_cap(days_completed: int) -> int | None:
 
 def _effective_cap(num: dict, stats: dict | None = None,
                    db_path: Path = db.DB_PATH) -> int:
-    """Per-number hard cap for today, from the pool's shared warm-up stage
-    (pool_warmup_days_completed). Every number ramps together: 10→15→25→40→50
-    as the pool logs more real dialing days."""
-    stage = _stage_cap(pool_warmup_days_completed(db_path))
+    """Per-number cap from shared qualifying days since the number joined."""
+    stage = _stage_cap(_warmup_days_completed(num["phone_number"], db_path=db_path))
     if stage is None:
         return num["daily_cap"]
     return min(num["daily_cap"], stage)
@@ -198,7 +217,7 @@ def _sync_status(num: dict, db_path: Path = db.DB_PATH,
     completes, 'active' after."""
     if num["status"] in ("flagged", "retired"):
         return
-    graduated = _stage_cap(pool_warmup_days_completed(db_path)) is None
+    graduated = _stage_cap(_warmup_days_completed(num["phone_number"], db_path=db_path)) is None
     want = "active" if graduated else "warming"
     if num["status"] != want:
         db.update_caller_number(num["id"], {"status": want}, db_path)
@@ -235,7 +254,7 @@ def pick_number(lead_phone: str, db_path: Path = db.DB_PATH,
     # have per-number headroom. Right after a restart this is the real limiter.
     days = pool_warmup_days_completed(db_path)
     pool_used = sum(db.caller_calls_today(n["phone_number"], db_path)
-                    for n in pool if n["status"] not in ("flagged", "retired"))
+                    for n in pool)
     if pool_used >= pool_daily_cap(days):
         return None
 
@@ -248,7 +267,7 @@ def pick_number(lead_phone: str, db_path: Path = db.DB_PATH,
             continue
         _sync_status(num, db_path, stats)
         used = db.caller_calls_today(num["phone_number"], db_path)
-        cap = _effective_cap(num, stats)
+        cap = _effective_cap(num, stats, db_path=db_path)
         if used >= cap:
             continue
         usable.append((num, cap - used))
@@ -279,7 +298,7 @@ def pool_status(db_path: Path = db.DB_PATH) -> dict:
            "used_today": 0, "cap_today": 0, "remaining_today": 0,
            "pool_cap_today": None,
            "warmup_day": None, "warmup_total_days": WARMUP_DAYS,
-           "warming_cap": None, "warmup_days_left": None}
+           "warming_cap": None, "warming_cap_max": None, "warmup_days_left": None}
     days = pool_warmup_days_completed(db_path)       # pool-shared warm-up stage
     graduated = _stage_cap(days) is None
     for num in pool:
@@ -291,20 +310,22 @@ def pool_status(db_path: Path = db.DB_PATH) -> dict:
         cap = _effective_cap(num, db_path=db_path)
         used = db.caller_calls_today(num["phone_number"], db_path)
         out["cap_today"] += cap
-        out["used_today"] += min(used, cap)
+        out["used_today"] += used
         out["remaining_today"] += max(0, cap - used)
-        if graduated:
+        if _stage_cap(_warmup_days_completed(num["phone_number"], db_path=db_path)) is None:
             out["active"] += 1
         else:
             out["warming"] += 1
-            out["warming_cap"] = cap
+            out["warming_cap"] = min(out["warming_cap"] or cap, cap)
+            out["warming_cap_max"] = max(out["warming_cap_max"] or cap, cap)
     if not graduated:
         out["warmup_day"] = days + 1                 # humans count from day 1
         out["warmup_days_left"] = max(0, WARMUP_DAYS - days)
     # Clamp to the gap-aware pool-wide daily ceiling on top of per-number caps.
     pool_cap = pool_daily_cap(days)
     true_used = sum(db.caller_calls_today(num["phone_number"], db_path)
-                    for num in pool if num["status"] not in ("flagged", "retired"))
+                    for num in pool)
+    out["used_today"] = true_used
     out["pool_cap_today"] = pool_cap
     out["cap_today"] = min(out["cap_today"], pool_cap)
     out["remaining_today"] = max(0, min(out["remaining_today"],

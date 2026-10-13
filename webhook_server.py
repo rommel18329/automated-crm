@@ -780,8 +780,11 @@ def _start_multi_batch(agent: str, lead_ids: list[int], amd: bool = True) -> str
                 if cur and cur.get("batch_id") == batch_id:
                     _dialer_current.pop(batch["agent"], None)
                 log.warning(f"Multi [{batch_id}] softphone never joined — calls NOT fired")
-                return
-            batch["status"] = "ringing"
+            else:
+                batch["status"] = "ringing"
+        if batch["status"] == "no_agent":
+            _requeue_leads(agent, lead_ids)
+            return
 
         from twilio.rest import Client as TwilioClient
         twilio = TwilioClient(ACCOUNT_SID, AUTH_TOKEN)
@@ -841,8 +844,13 @@ def _start_multi_batch(agent: str, lead_ids: list[int], amd: bool = True) -> str
                     batch["call_sids"][lid] = call.sid
                     batch["from_numbers"][lid] = frm
                 # (daily counter already reserved at pick time, under the lock)
-                caller_id_pool.record_placed(frm)
                 log.info(f"Multi-dial [{batch_id}] → {lead['name']} ({phone}) from {frm} SID={call.sid}")
+                try:
+                    caller_id_pool.record_placed(frm, call.sid, agent, DB_PATH)
+                except Exception:
+                    # A statistics failure must never mark an actual live call
+                    # as failed/resolved. The log retains its SID for recovery.
+                    log.exception(f"Call history write failed for {call.sid}")
             except Exception as exc:
                 log.warning(f"Multi-dial [{batch_id}] call to {lid} failed: {exc}")
                 with _batch_lock:
@@ -1585,7 +1593,7 @@ def _queue_next(agent: str) -> dict:
     if _agent_batch_busy(agent):
         return {"error": "busy", "remaining": len(q["pending"])}
     # HARD daily limit: batches only dial what the caller ID pool has left
-    # today (warming numbers 15/day, warmed 50/day). At zero the queue pauses
+    # today (limits shared by Rom and Gabby; per-number limits ramp with usage). At zero the queue pauses
     # until tomorrow — cold calls never overflow onto the texting numbers.
     capacity = caller_id_pool.pool_status(DB_PATH)["remaining_today"]
     if capacity <= 0:
@@ -1661,7 +1669,7 @@ def dialer_queue_status():
 @app.route("/dialer/pool-status")
 def dialer_pool_status():
     """Caller ID pool health for the softphone bar: capacity used/left today,
-    warm-up progress. remaining_today == 0 means dialing is done for the day."""
+    shared warm-up progress. remaining_today == 0 means dialing is done for the day."""
     return _cors(jsonify(caller_id_pool.pool_status(DB_PATH)))
 
 
@@ -1791,7 +1799,7 @@ def softphone_page():
     <button class="q-btn q-end" id="btnQEnd" title="End the queue">⏹ End</button>
   </span>
 </div>
-<div class="poolbar" id="poolBar" title="Caller ID pool: today's call volume vs the spam-safe caps (warming numbers 15/day, warmed 50/day). Dialing hard-stops at the cap."></div>
+<div class="poolbar" id="poolBar" title="Caller ID pool: today's call volume vs the spam-safe caps (limits shared by Rom and Gabby; per-number limits ramp with usage). Dialing hard-stops at the cap."></div>
 <div class="buttons">
   <button class="btn btn-call" id="btnCall" disabled>📞 Call</button>
   <button class="btn btn-mute" id="btnMute" disabled>🔇 Mute</button>
@@ -1980,6 +1988,8 @@ def softphone_page():
 
   let device = null;
   let call = null;
+  let connectPending = false;
+  let callGeneration = 0;
   let muted = false;
   let timerInterval = null;
   let callStart = null;
@@ -2023,21 +2033,25 @@ def softphone_page():
   }
 
   // 2.x: call events live on the Call object. Wire them when a call starts.
-  function wireCall(c) {
+  function wireCall(c, batchId, generation) {
     call = c;
     callEndHandled = false;
     acceptedFired = false;
     c.on('accept', function() {
+      if (call !== c || generation !== callGeneration) return;
+      btnHangup.disabled = false;
+      btnMute.disabled = false;
       acceptedFired = true;
-      if (currentBatchId) {
+      if (batchId) {
         // Agent is now in the conference — tell the server to fire the calls.
         // The token makes ownership exclusive: if another softphone (same
         // agent in two browsers) got there first, we back out immediately
         // instead of double-joining the room.
-        fetch('/dialer/agent-ready/' + currentBatchId, { method: 'POST',
+        fetch('/dialer/agent-ready/' + batchId, { method: 'POST',
           body: JSON.stringify({ token: joinToken }) })
           .then(function(r) { return r.json(); })
           .then(function(j) {
+            if (call !== c || generation !== callGeneration) return;
             if (j && j.owner === false) {
               logMsg('Another softphone (same agent) owns this batch — backing out.');
               setStatus('Batch taken by your other softphone window', 'ended');
@@ -2053,10 +2067,11 @@ def softphone_page():
         logMsg('Call connected');
       }
     });
-    c.on('disconnect', function() { handleCallEnd(null); });
-    c.on('cancel', function() { handleCallEnd(null); });
-    c.on('reject', function() { handleCallEnd(null); });
+    c.on('disconnect', function() { if (call === c && generation === callGeneration) handleCallEnd(null); });
+    c.on('cancel', function() { if (call === c && generation === callGeneration) handleCallEnd(null); });
+    c.on('reject', function() { if (call === c && generation === callGeneration) handleCallEnd(null); });
     c.on('error', function(err) {
+      if (call !== c || generation !== callGeneration) return;
       logMsg('Call error: ' + (err.code ? ('[' + err.code + '] ') : '') + (err.message || err));
       handleCallEnd(err);
     });
@@ -2090,6 +2105,9 @@ def softphone_page():
   }
 
   function onCallEnded() {
+    callGeneration += 1;
+    const endedGeneration = callGeneration;
+    connectPending = false;
     call = null;
     currentBatchId = null;
     muted = false;
@@ -2111,6 +2129,7 @@ def softphone_page():
         fetch('/dialer/batch/' + dispBatchId)
           .then(function(r) { return r.json(); })
           .then(function(b) {
+            if (endedGeneration !== callGeneration) return;
             if (b && b.status === 'machine_ended') {
               currentLeadId = null;
               hideDisposition();
@@ -2125,6 +2144,7 @@ def softphone_page():
             }
           })
           .catch(function() {
+            if (endedGeneration !== callGeneration) return;
             setStatus('Call ended — pick a disposition below', 'ended');
             showDisposition();
           });
@@ -2260,7 +2280,7 @@ def softphone_page():
   // returns 'busy' harmlessly (and the /dialer/current poll rejoins it).
   var autoResumed = false;
   function maybeAutoResume() {
-    if (autoResumed || !queueActive || call || !deviceReady || !autoAdvance) return;
+    if (autoResumed || !queueActive || call || connectPending || !deviceReady || !autoAdvance) return;
     if (awaitingDisposition) return;   // a call is waiting to be written up
     autoResumed = true;
     logMsg('Queue is active — resuming automatically...');
@@ -2324,16 +2344,23 @@ def softphone_page():
     if (awaitingDisposition) return;
     if (nextTimer) clearTimeout(nextTimer);
     setStatus((why || 'Next batch') + ' in ' + (Math.round(ms / 500) / 2) + 's…', 'ready');
-    nextTimer = setTimeout(function() { nextTimer = null; doNext(); }, ms);
+    nextTimer = setTimeout(function() { nextTimer = null; if (queueActive && autoAdvance && !queueStopped) doNext(); }, ms);
   }
 
   var nextRetries = 0;
+  var nextPending = false;
+  var queueStopped = false;
   function doNext() {
     if (nextTimer) { clearTimeout(nextTimer); nextTimer = null; }
-    if (call) { logMsg('Still on a call — hang up first.'); return; }
+    if (call || connectPending) { logMsg('Still on a call — hang up first.'); return; }
+    if (nextPending) return;
+    nextPending = true;
+    queueStopped = false;
     fetch('/dialer/queue/next', { method: 'POST', body: JSON.stringify({ agent: AGENT }) })
       .then(function(r) { return r.json(); })
       .then(function(j) {
+        nextPending = false;
+        if (queueStopped) return;
         nextRetries = 0;
         if (j.error === 'busy') { logMsg('A batch is already ringing.'); return; }
         if (j.error === 'pool_exhausted') {
@@ -2353,6 +2380,8 @@ def softphone_page():
         // The /dialer/current poll sees the new batch and joins its conference.
       })
       .catch(function(e) {
+        nextPending = false;
+        if (queueStopped) return;
         // Backend hiccup (restart / tunnel blip / empty response). Never
         // freeze the queue on one bad response — back off and retry, then
         // hand control back to the agent with a clear message.
@@ -2406,6 +2435,8 @@ def softphone_page():
   });
   btnQEnd.addEventListener('click', function() {
     if (nextTimer) { clearTimeout(nextTimer); nextTimer = null; }
+    queueStopped = true;
+    queueActive = false; autoAdvance = false; updateQueueBar();
     fetch('/dialer/queue/stop', { method: 'POST', body: JSON.stringify({ agent: AGENT }) })
       .then(function() {
         queueActive = false; updateQueueBar();
@@ -2438,7 +2469,10 @@ def softphone_page():
           txt += ' · ' + p.warming + ' warming';
           if (p.warmup_day) {
             txt += ' — day ' + p.warmup_day + '/' + p.warmup_total_days +
-                   ' (' + p.warming_cap + '/number)';
+                   ' (' + p.warming_cap +
+                   (p.warming_cap_max > p.warming_cap ? '–' + p.warming_cap_max : '') + '/number)';
+          } else {
+            txt += ' — newer numbers still warming';
           }
         }
         poolBar.className = 'poolbar' + (p.remaining_today < 20 ? ' low' : '');
@@ -2470,7 +2504,7 @@ def softphone_page():
 
   // ── Single-line dial ──────────────────────────────────────────────────
   async function dialSingle(lead, isRetry) {
-    if (call || !device) return;
+    if (call || connectPending || !device) return;
     lastSingleParams = lead;
     dialStartTime = Date.now();
     if (!isRetry) { retriedThisDial = false; }
@@ -2492,10 +2526,16 @@ def softphone_page():
     var params = { caller_id: lead.caller_id || '' };
     if (lead.to_number) { params.to_number = lead.to_number; }
     else { params.lead_id = String(lead.lead_id); }
+    const generation = ++callGeneration;
+    connectPending = true;
     try {
       var c = await device.connect({ params: params });
-      wireCall(c);
+      if (generation !== callGeneration) { c.disconnect(); return; }
+      connectPending = false;
+      wireCall(c, null, generation);
     } catch (e) {
+      if (generation !== callGeneration) return;
+      connectPending = false;
       setStatus('Connect failed: ' + (e.message || e), 'error');
       logMsg('Connect failed: ' + (e.message || e));
       onCallEnded();
@@ -2504,18 +2544,23 @@ def softphone_page():
 
   // ── Multi-line dial ───────────────────────────────────────────────────
   async function joinMulti(data) {
-    if (call || !device) return;
+    if (call || connectPending || !device) return;
+    const generation = ++callGeneration;
+    connectPending = true;
+    const batchId = data.batch_id;
     lastDialTs = data.ts;   // claim this command immediately (no double-trigger)
     // Stale-replay guard: never join a batch that already ended (a fresh popup
     // can see an old command still sitting in the channel).
     try {
       var bs = await (await fetch('/dialer/batch/' + data.batch_id)).json();
+      if (generation !== callGeneration) return;
       if (!bs || (bs.status !== 'waiting_agent' && bs.status !== 'ringing')) {
+        connectPending = false;
         logMsg('Ignored stale batch ' + data.batch_id + ' (' + ((bs && bs.status) || 'gone') + ')');
         return;
       }
-    } catch (e) { return; }
-    if (call) return;       // a dial started while we were checking
+    } catch (e) { if (generation === callGeneration) connectPending = false; return; }
+    if (generation !== callGeneration || call) return;       // a dial started while we were checking
     hideDisposition();
     currentLeadId = null;
     dispBatchId = data.batch_id;
@@ -2524,6 +2569,7 @@ def softphone_page():
     joinToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
     nameEl.textContent = data.lines + ' lines ringing...';
     phoneEl.textContent = '';
+    loadScriptForLead(null);
     timerEl.textContent = '00:00';
     setStatus('Ringing ' + data.lines + ' leads — waiting for first answer', 'ringing');
     startRinging();
@@ -2531,10 +2577,22 @@ def softphone_page():
     btnHangup.disabled = false;
     btnMute.disabled = false;
     logMsg('Multi-line: joining conference ' + data.conference);
+    const joinTimeout = setTimeout(function() {
+      if (generation !== callGeneration || !connectPending) return;
+      hangUp();
+      autoAdvance = false; updateQueueBar();
+      setStatus('Connection timed out — press Next to retry', 'error');
+    }, 35000);
     try {
       var c = await device.connect({ params: { conference: data.conference } });
-      wireCall(c);
+      clearTimeout(joinTimeout);
+      if (generation !== callGeneration) { c.disconnect(); return; }
+      connectPending = false;
+      wireCall(c, batchId, generation);
     } catch (e) {
+      clearTimeout(joinTimeout);
+      if (generation !== callGeneration) return;
+      connectPending = false;
       setStatus('Connect failed: ' + (e.message || e), 'error');
       logMsg('Connect failed: ' + (e.message || e));
       onCallEnded();
@@ -2544,6 +2602,7 @@ def softphone_page():
     if (batchPollInterval) clearInterval(batchPollInterval);
     var batchStart = Date.now();
     batchPollInterval = setInterval(function() {
+      if (generation !== callGeneration) return;
       // Watchdog: a batch that never resolves (Twilio Device join hung, or
       // every line failed silently with no status callback) must not freeze
       // the softphone on "ringing" forever — recover after 45s.
@@ -2556,9 +2615,10 @@ def softphone_page():
         if (queueActive && autoAdvance) scheduleNext(1500, 'Recovering — next batch');
         return;
       }
-      fetch('/dialer/batch/' + currentBatchId)
+      fetch('/dialer/batch/' + batchId)
         .then(function(r) { return r.json(); })
         .then(function(b) {
+          if (generation !== callGeneration) return;
           if (b.status === 'no_agent') {
             // The batch aborted before this softphone finished joining (slow
             // connect) — NO calls were fired. Recover to a fresh batch.
@@ -2625,7 +2685,11 @@ def softphone_page():
   }
 
   function hangUp() {
+    if (nextTimer) { clearTimeout(nextTimer); nextTimer = null; }
+    callGeneration += 1;
+    connectPending = false;
     if (device) device.disconnectAll();
+    onCallEnded();
     if (batchPollInterval) { clearInterval(batchPollInterval); batchPollInterval = null; }
   }
 
@@ -2779,9 +2843,9 @@ def softphone_page():
       .then(function(data) {
         if (!data || !data.ts) return;
         if (data.ts === lastDialTs) return;
-        if (call) return;
+        if (call || connectPending) return;
         if (!deviceReady) return;
-        if (data.mode === 'multi') { joinMulti(data); }
+        if (data.mode === 'multi') { if (!queueStopped) joinMulti(data); }
         else if (data.lead_id || data.to_number) { dialSingle(data); }
       })
       .catch(function() {});
