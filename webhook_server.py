@@ -1325,7 +1325,7 @@ def dialer_set_status():
         resp.headers["Access-Control-Allow-Origin"] = "*"
         return resp, 404
 
-    db.update_lead(int(lead_id), {"status": status}, DB_PATH)
+    db.set_manual_status(int(lead_id), status, DB_PATH, contacted_on=date.today())
     db.add_interaction(int(lead_id), "note", f"Marked {status.upper()} from dialer",
                        "outbound", DB_PATH, ts=datetime.utcnow())
     # KPI: attach the temperature to this call's disposition row.

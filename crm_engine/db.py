@@ -871,6 +871,37 @@ def log_performance(
         )
 
 
+def set_manual_status(
+    lead_id: int, status: str, db_path: Path = DB_PATH,
+    contacted_on: date | None = None,
+) -> None:
+    """Save a worked lead's manual status without changing advanced stages.
+
+    The dialer supplies the contact date. Editing an older lead's status in
+    the dashboard does not invent a new contact today.
+    """
+    if status not in {"cold", "warm", "hot", "dead", "contract", "investor"}:
+        raise ValueError("Invalid lead status")
+    contact_date = contacted_on.isoformat() if contacted_on else None
+    with get_conn(db_path) as conn:
+        conn.execute(
+            """UPDATE leads SET status=?,
+               conversation_stage=CASE WHEN conversation_stage='not_contacted'
+                   THEN 'initial_contact' ELSE conversation_stage END,
+               last_contact_date=CASE WHEN ? IS NULL THEN last_contact_date
+                   ELSE MAX(COALESCE(last_contact_date, ''), ?) END
+               WHERE id=?""",
+            (status, contact_date, contact_date, lead_id),
+        )
+
+
+def lead_status_bucket(lead: dict[str, Any]) -> str:
+    """Only untouched cold leads belong in the uncontacted filter."""
+    if lead["status"] == "cold" and lead.get("conversation_stage") == "not_contacted":
+        return "uncontacted"
+    return lead["status"]
+
+
 def update_lead(lead_id: int, fields: dict[str, Any], db_path: Path = DB_PATH) -> None:
     if not fields:
         return

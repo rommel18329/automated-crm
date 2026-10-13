@@ -1137,7 +1137,7 @@ def render_ai_draft_row(lead: dict, stage_key: str, widget_prefix: str) -> None:
 
 
 def update_status(lead_id: int, key: str) -> None:
-    db.update_lead(lead_id, {"status": st.session_state[key]})
+    db.set_manual_status(lead_id, st.session_state[key])
 
 
 def auto_save_field(lead_id: int, field: str, key: str) -> None:
@@ -2004,13 +2004,10 @@ elif page == "leads":
     )
 
     def _status_match(l: dict) -> bool:
-        # "Uncontacted" = raw call leads (never dialed). Keep them OUT of the
-        # worked-status buckets so the cold/warm/hot pools stay clean.
+        # A stale stage must not hide explicitly classified non-cold leads.
         if not status_filter:
             return True
-        if l.get("conversation_stage") == "not_contacted":
-            return "uncontacted" in status_filter
-        return l["status"] in status_filter
+        return db.lead_status_bucket(l) in status_filter
 
     matches = [
         l for l in all_leads
