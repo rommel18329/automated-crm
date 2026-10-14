@@ -732,6 +732,64 @@ def voice_browser_connect():
     return Response(twiml, mimetype="text/xml")
 
 
+def _mark_resolved(batch: dict, lead_id: int) -> None:
+    """Record that one line of a multi-line batch has finished (caller holds
+    _batch_lock). Idempotent per lead, so a late Twilio status callback and the
+    reconciler can't double-count."""
+    done = batch.setdefault("resolved", set())
+    if lead_id in done:
+        return
+    done.add(lead_id)
+    batch["resolved_count"] = len(done)
+    if batch["resolved_count"] >= batch["total"] and batch["winner"] is None:
+        batch["status"] = "no_answer"
+
+
+_TERMINAL_CALL_STATES = {"completed", "busy", "no-answer", "failed", "canceled"}
+
+
+def _reconcile_batch(batch_id: str, twilio, first_wait: float = 40, step: float = 10,
+                     cap: float = 120, sleep=time.sleep) -> None:
+    """Don't depend on every Twilio status callback arriving. Callbacks can be
+    lost (the public tunnel returned 502s for 3 of 10 on 2026-10-14), which left
+    the batch "ringing" forever and locked the agent out of dialing. After the
+    lines should have rung out, ask Twilio directly for any unresolved call;
+    at `cap` seconds close the batch as no-answer no matter what."""
+    waited = 0.0
+    sleep(first_wait); waited += first_wait
+    while True:
+        with _batch_lock:
+            batch = _multi_batches.get(batch_id)
+            if not batch or batch["status"] not in ("waiting_agent", "ringing"):
+                return
+            pending = [(lid, batch["call_sids"].get(lid)) for lid in batch["lead_ids"]
+                       if lid not in batch.get("resolved", set()) and lid != batch["winner"]]
+        for lid, sid in pending:
+            if not sid:
+                continue
+            try:
+                state = twilio.calls(sid).fetch().status
+            except Exception as exc:
+                log.warning(f"Multi [{batch_id}] reconcile: could not fetch {sid}: {exc}")
+                continue
+            if state in _TERMINAL_CALL_STATES:
+                with _batch_lock:
+                    if lid not in batch.get("resolved", set()):
+                        log.info(f"Multi [{batch_id}] reconcile: lead {lid} was {state} "
+                                 f"(status callback never arrived)")
+                    _mark_resolved(batch, lid)
+        with _batch_lock:
+            if batch["status"] not in ("waiting_agent", "ringing"):
+                return
+            if waited >= cap:
+                if batch["winner"] is None:
+                    batch["status"] = "no_answer"
+                    log.warning(f"Multi [{batch_id}] still unresolved after {int(cap)}s "
+                                f"({batch['resolved_count']}/{batch['total']}) — closing as no answer")
+                return
+        sleep(step); waited += step
+
+
 def _start_multi_batch(agent: str, lead_ids: list[int], amd: bool = True) -> str:
     """Fire N simultaneous outbound calls. First answer wins and joins
     the conference where the browser softphone is waiting. Returns batch_id.
@@ -803,7 +861,7 @@ def _start_multi_batch(agent: str, lead_ids: list[int], amd: bool = True) -> str
             lead = db.fetch_lead(lid, DB_PATH)
             if not lead:
                 with _batch_lock:
-                    batch["resolved_count"] += 1
+                    _mark_resolved(batch, lid)
                 continue
             # Atomic pick + reserve: the daily counter is incremented the
             # moment the number is chosen, inside the lock, so a second
@@ -819,7 +877,7 @@ def _start_multi_batch(agent: str, lead_ids: list[int], amd: bool = True) -> str
                 # release its claim so it's dialable when capacity returns.
                 log.warning(f"Multi [{batch_id}] pool at daily cap — lead {lid} NOT dialed")
                 with _batch_lock:
-                    batch["resolved_count"] += 1
+                    _mark_resolved(batch, lid)
                     _lead_claims.pop(lid, None)
                 continue
             used_numbers.add(frm)
@@ -854,10 +912,12 @@ def _start_multi_batch(agent: str, lead_ids: list[int], amd: bool = True) -> str
             except Exception as exc:
                 log.warning(f"Multi-dial [{batch_id}] call to {lid} failed: {exc}")
                 with _batch_lock:
-                    batch["resolved_count"] += 1
+                    _mark_resolved(batch, lid)
 
         with ThreadPoolExecutor(max_workers=10) as pool:
             pool.map(_one_call, assignments)
+
+        _reconcile_batch(batch_id, twilio)
 
     threading.Thread(target=_fire_calls, daemon=True).start()
 
@@ -1158,9 +1218,8 @@ def voice_multi_status(batch_id: str, lead_id: int):
     with _batch_lock:
         batch = _multi_batches.get(batch_id)
         if batch:
-            batch["resolved_count"] += 1
-            if batch["resolved_count"] >= batch["total"] and batch["winner"] is None:
-                batch["status"] = "no_answer"
+            _mark_resolved(batch, lead_id)
+            if batch["status"] == "no_answer":
                 log.info(f"Multi [{batch_id}] all lines resolved — no one answered")
     return ("", 204)
 
@@ -2615,10 +2674,33 @@ def softphone_page():
         if (queueActive && autoAdvance) scheduleNext(1500, 'Recovering — next batch');
         return;
       }
+      // Hard cap even while sitting in the room: every line rings out in ~30s,
+      // so a batch that hasn't connected in 150s is dead. Leave and move on
+      // instead of freezing the dialer.
+      if (Date.now() - batchStart > 150000) {
+        clearInterval(batchPollInterval); batchPollInterval = null;
+        stopRinging();
+        setStatus('No connection this batch — moving on', 'no-answer');
+        logMsg('Batch unresolved after 150s — leaving the room, next batch.');
+        if (device) device.disconnectAll();
+        if (queueActive && autoAdvance) scheduleNext(1500, 'Recovering — next batch');
+        return;
+      }
       fetch('/dialer/batch/' + batchId)
         .then(function(r) { return r.json(); })
         .then(function(b) {
           if (generation !== callGeneration) return;
+          if (b && b.error) {
+            // The server no longer knows this batch (e.g. it restarted) — the
+            // room is dead. Leave it instead of ringing forever.
+            clearInterval(batchPollInterval); batchPollInterval = null;
+            stopRinging();
+            setStatus('Batch ended on the server — moving on', 'no-answer');
+            logMsg('Batch no longer exists on the server — next batch.');
+            if (device) device.disconnectAll();
+            if (queueActive && autoAdvance) scheduleNext(1500, 'Recovering — next batch');
+            return;
+          }
           if (b.status === 'no_agent') {
             // The batch aborted before this softphone finished joining (slow
             // connect) — NO calls were fired. Recover to a fresh batch.
