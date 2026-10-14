@@ -8,7 +8,12 @@ Run this instead of start.bat's individual commands:
     python run_crm.py
 
 The Tailscale funnel is still started separately by start.bat (it's a
-long-lived OS service, not a Python process this supervisor manages).
+long-lived OS service, not a Python process this supervisor manages), but the
+supervisor also watches the PUBLIC URL: if Twilio's path through the funnel
+breaks while the webhook itself is fine, it re-applies the funnel.
+
+Everything the supervisor and each service prints is also written to
+logs/<name>.log (size-capped), so a failure leaves a record.
 
 Ctrl+C stops everything cleanly.
 """
@@ -18,12 +23,15 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+LOG_DIR = ROOT / "logs"
+LOG_MAX_BYTES = 5_000_000   # rotate to <name>.log.1 past this size
 
 # name -> config
 SERVICES = {
@@ -54,8 +62,67 @@ CHECK_EVERY = 5          # seconds between health checks
 MAX_RESTARTS_PER_MIN = 5  # circuit breaker: stop hammering if it keeps dying
 
 
+_log_lock = threading.Lock()
+
+
+def _append_log(name: str, line: str, log_dir: Path = LOG_DIR) -> None:
+    """Append one line to logs/<name>.log, rotating once past LOG_MAX_BYTES.
+    Logging must never take the supervisor down, so failures are swallowed."""
+    try:
+        with _log_lock:
+            log_dir.mkdir(exist_ok=True)
+            path = log_dir / f"{name}.log"
+            if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+                os.replace(path, log_dir / f"{name}.log.1")
+            with open(path, "a", encoding="utf-8", errors="replace") as f:
+                f.write(line if line.endswith("\n") else line + "\n")
+    except Exception:
+        pass
+
+
 def log(msg: str) -> None:
-    print(f"{datetime.now():%H:%M:%S} [supervisor] {msg}", flush=True)
+    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} [supervisor] {msg}"
+    print(line[11:], flush=True)
+    _append_log("supervisor", line)
+
+
+def _public_base_url() -> str:
+    """PUBLIC_BASE_URL from the environment or .env (the funnel address Twilio
+    calls). Empty disables the public watchdog."""
+    url = os.getenv("PUBLIC_BASE_URL", "")
+    if not url:
+        try:
+            for raw in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
+                k, _, v = raw.partition("=")
+                if k.strip() == "PUBLIC_BASE_URL":
+                    url = v.strip().strip('"').strip("'")
+        except Exception:
+            pass
+    return url.rstrip("/")
+
+
+class FunnelWatch:
+    """Decides when to re-apply the Tailscale funnel. Only counts a public
+    failure while the webhook answers locally (otherwise the normal restart
+    path handles it), needs `threshold` in a row, and waits `cooldown` seconds
+    between repairs so a real outage can't turn into a reset loop."""
+
+    def __init__(self, threshold: int = 3, cooldown: float = 60.0):
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self.fails = 0
+        self.last_repair = float("-inf")
+
+    def record(self, public_ok: bool, local_ok: bool, now: float) -> bool:
+        if public_ok or not local_ok:
+            self.fails = 0
+            return False
+        self.fails += 1
+        if self.fails >= self.threshold and now - self.last_repair >= self.cooldown:
+            self.fails = 0
+            self.last_repair = now
+            return True
+        return False
 
 
 def port_open(port: int) -> bool:
@@ -91,8 +158,22 @@ def wait_for_port_release(port: int, timeout: int = 15) -> None:
 def start(name: str, cfg: dict) -> subprocess.Popen:
     wait_for_port_release(cfg["port"])
     log(f"starting {name}...")
-    proc = subprocess.Popen(cfg["cmd"], cwd=str(ROOT))
+    proc = subprocess.Popen(cfg["cmd"], cwd=str(ROOT), stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, bufsize=1, text=True,
+                            encoding="utf-8", errors="replace")
+    threading.Thread(target=_tee_output, args=(name, proc), daemon=True).start()
     return proc
+
+
+def _tee_output(name: str, proc: subprocess.Popen) -> None:
+    """Show a service's output in this console as before AND keep it in
+    logs/<name>.log."""
+    for line in proc.stdout:
+        try:
+            print(line, end="", flush=True)
+        except Exception:
+            pass
+        _append_log(name, f"{datetime.now():%Y-%m-%d %H:%M:%S} {line.rstrip()}")
 
 
 # A fixed loopback port doubles as an atomic single-instance mutex: only one
@@ -174,11 +255,31 @@ def main() -> None:
         grace_until[name] = time.time() + cfg["grace"]
 
     _refresh_funnel()
+    public_health = _public_base_url() + "/health" if _public_base_url() else ""
+    funnel_watch = FunnelWatch()
+    if public_health:
+        log(f"watching public URL {public_health}")
+    else:
+        log("PUBLIC_BASE_URL not set; public funnel watchdog disabled")
     log("all services launched. Watching... (Ctrl+C to stop)")
     try:
         while True:
             time.sleep(CHECK_EVERY)
             now = time.time()
+            # Twilio reaches the webhook only through the funnel. It can break
+            # (HTTP 502) while the webhook is perfectly healthy, which is the
+            # "an application error has occurred" seen on 2026-10-14. Re-apply it.
+            if public_health and now >= grace_until["webhook"]:
+                local_ok = healthy(SERVICES["webhook"])
+                public_ok = http_ok(public_health) if local_ok else False
+                if not public_ok and local_ok:
+                    log(f"public URL check failed ({funnel_watch.fails + 1} in a row) "
+                        f"while webhook is healthy locally")
+                if funnel_watch.record(public_ok, local_ok, now):
+                    log("funnel unreachable from outside — re-applying tailscale funnel")
+                    _refresh_funnel()
+                    ok = http_ok(public_health)
+                    log(f"public URL after funnel repair: {'OK' if ok else 'STILL FAILING'}")
             for name, cfg in SERVICES.items():
                 proc = procs[name]
                 exited = proc.poll() is not None
