@@ -1543,14 +1543,7 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown("**Send a Text**")
         if lead.get("phone", "") in _gv_contacts:
-            st.markdown(
-                "<div class='sl-flag' style='border-color:#8e44ad;color:#6c3483;"
-                "background:#f4ecfa'>📱 Reached you on <b>Google Voice</b> — "
-                "your reply sends from your Twilio number (a different number on their "
-                "end). The first reply should say it's your new office number they can "
-                "reach you at more reliably.</div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown(_gv_flag(lead.get("phone", "")), unsafe_allow_html=True)
         manual_msg_key = f"manual_text_{lead_id}"
         # An AI draft staged on the previous run lands in the compose box here.
         _staged_lead_draft = st.session_state.pop(f"manual_text_stage_{lead_id}", None)
@@ -1562,16 +1555,21 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
         if send_col1.button("Send Text", key=f"manual_send_{lead_id}"):
             text_to_send = st.session_state.get(manual_msg_key, "").strip()
             if text_to_send:
-                result = send_sms(lead_id, text_to_send)
+                from crm_engine.gv_gmail_import import route_text
+                with st.spinner("Sending, and checking it was delivered..."):
+                    result = route_text(lead_id, text_to_send)
                 if result.get("sent"):
                     flag_sent(lead["name"], text_to_send)
                     st.session_state.pop(manual_msg_key, None)
                     st.rerun()
+                elif result.get("no_gv_thread"):
+                    st.session_state[f"gv_fallback_lead_{lead_id}"] = True
                 else:
                     # No rerun on failure — keep the error (and the draft) visible.
                     st.error(f"❌ NOT sent: {result.get('error', 'unknown error')}")
             else:
                 st.warning("Type a message first.")
+        render_gv_fallback(lead_id, manual_msg_key, lead["name"], "lead")
         _auto_cid = _auto_caller_id(lead.get("phone", ""))
         _cid_pick = send_col2.radio(
             "Call from", ["515", "773"],
@@ -1621,10 +1619,46 @@ for _ix in all_interactions:
     _ixns_by_lead.setdefault(_ix["lead_id"], []).append(_ix)
 result = _build_display_result(all_leads, _ixns_by_lead)
 try:
-    from crm_engine.gv_gmail_import import load_gv_contacts
+    from crm_engine.gv_gmail_import import load_gv_contacts, load_reply_addrs, has_reply_addr
     _gv_contacts = load_gv_contacts()
+    _gv_replies = load_reply_addrs()
 except Exception:
-    _gv_contacts = set()
+    _gv_contacts, _gv_replies = set(), {}
+    has_reply_addr = lambda phone, store=None: False  # noqa: E731
+_GV_OK_FLAG = "<div class='sl-flag' style='border-color:#8e44ad;color:#6c3483;background:#f4ecfa'>📱 <b>Google Voice</b> contact. Texts here send from your Google Voice number, the one they already know.</div>"
+_GV_NONE_FLAG = "<div class='sl-flag' style='border-color:#8e44ad;color:#6c3483;background:#f4ecfa'>📱 <b>Google Voice</b> contact, but no Google Voice text thread on file, so Google Voice can't text them first. Sending will offer your Twilio number instead.</div>"
+
+
+def _gv_flag(phone: str) -> str:
+    return _GV_OK_FLAG if has_reply_addr(phone, _gv_replies) else _GV_NONE_FLAG
+
+
+def render_gv_fallback(lead_id: int, compose_key: str, lead_name: str, key: str) -> None:
+    """After a Google Voice send was refused for lack of a thread, let the user
+    explicitly choose to send the same text from the Twilio number instead."""
+    flag_key = f"gv_fallback_{key}_{lead_id}"
+    if not st.session_state.get(flag_key):
+        return
+    st.warning("Not sent: this Google Voice contact has no text thread yet, so Google "
+               "Voice can't text them first. You can send it from your Twilio number "
+               "(they'll see a different number than the one they know).")
+    _f1, _f2 = st.columns(2)
+    if _f1.button("Send from my Twilio number instead", key=f"gvfb_send_{key}_{lead_id}"):
+        _txt = (st.session_state.get(compose_key) or "").strip()
+        if not _txt:
+            st.warning("Type a message first.")
+        else:
+            _r = send_sms(lead_id, _txt)
+            if _r.get("sent"):
+                st.session_state.pop(flag_key, None)
+                flag_sent(lead_name, _txt)
+                st.session_state.pop(compose_key, None)
+                st.rerun()
+            else:
+                st.error(f"❌ NOT sent: {_r.get('error')}")
+    if _f2.button("Cancel", key=f"gvfb_cancel_{key}_{lead_id}"):
+        st.session_state.pop(flag_key, None)
+        st.rerun()
 
 selected_id = st.session_state.get("selected_lead_id")
 if selected_id is not None and selected_id not in lead_lookup:
@@ -2237,22 +2271,17 @@ elif page == "followups":
             # number, so flag it persistently.
             _is_gv_lead = lead.get("phone", "") in _gv_contacts
             if _is_gv_lead:
-                st.markdown(
-                    "<div class='sl-flag' style='border-color:#8e44ad;color:#6c3483;"
-                    "background:#f4ecfa'>📱 Reached you on <b>Google Voice</b> — "
-                    "your reply sends from your Twilio number (a different number on their "
-                    "end). The first reply should say it's your new office number they can "
-                    "reach you at more reliably.</div>",
-                    unsafe_allow_html=True,
-                )
+                st.markdown(_gv_flag(lead.get("phone", "")), unsafe_allow_html=True)
             # First text from this number -> the draft must identify the new number.
             _never_texted = not any(
                 h.get("type") == "text" and h.get("direction") == "outbound"
                 for h in history
             )
             if _never_texted:
-                _ft_extra = ("they came in on Google Voice, so say it's your new office "
-                             "number they can reach you at more reliably"
+                _ft_extra = ("it goes from your Google Voice number, the one they know"
+                             if _is_gv_lead and has_reply_addr(lead.get("phone", ""), _gv_replies)
+                             else "they came in on Google Voice but have no thread, so it would "
+                             "go from your Twilio number: say it's your new office number"
                              if _is_gv_lead else
                              "say who you are + that this is your new office number")
                 st.markdown(
@@ -2296,7 +2325,14 @@ elif page == "followups":
                 if lid > 0:
                     ts = datetime.utcnow()
                     approved_text = st.session_state[msg_key]
-                    _send_res = send_sms(lid, approved_text)  # logs the text interaction internally
+                    from crm_engine.gv_gmail_import import route_text
+                    with st.spinner("Sending, and checking it was delivered..."):
+                        _send_res = route_text(lid, approved_text)  # logs the text interaction internally
+                    if _send_res.get("no_gv_thread"):
+                        st.error("❌ NOT sent: this Google Voice contact has no text thread, so "
+                                 "Google Voice can't text them first. Open them in Messages to "
+                                 "send from your Twilio number instead. Nothing was logged or snoozed.")
+                        st.stop()
                     if not _send_res.get("sent"):
                         # Send FAILED: no note, no snooze, keep the draft so
                         # the agent can retry. Never claim "sent" unverified.
@@ -2612,7 +2648,11 @@ elif page == "messages":
                            for i in _convo_items):
                     if _sel_lead["phone"] in _gv_contacts:
                         st.caption("📱 Google Voice — your reply sends from your Google "
-                                   "Voice number, the same one they already texted you from.")
+                                   "Voice number, the same one they already texted you from."
+                                   if has_reply_addr(_sel_lead["phone"], _gv_replies) else
+                                   "📱 Google Voice contact with no text thread yet: "
+                                   "Google Voice can't text them first. Sending will offer "
+                                   "your Twilio number instead.")
                     else:
                         st.caption("📱 First text to this lead from this number — say who "
                                    "you are and that this is your new office number they can save.")
@@ -2633,20 +2673,21 @@ elif page == "messages":
                 _sc1, _sc2 = st.columns([3, 1])
                 if _sc1.button("Send ↑", key=f"msg_send_{_sel_lid}", type="primary", use_container_width=True):
                     if (_msg_text or "").strip():
-                        if _sel_lead["phone"] in _gv_contacts:
-                            from crm_engine.gv_gmail_import import send_gv
-                            _res = send_gv(_sel_lid, _msg_text.strip())
-                        else:
-                            _res = send_sms(_sel_lid, _msg_text.strip())
+                        from crm_engine.gv_gmail_import import route_text
+                        with st.spinner("Sending, and checking it was delivered..."):
+                            _res = route_text(_sel_lid, _msg_text.strip())
                         if _res.get("sent"):
                             flag_sent(_sel_lead["name"], _msg_text.strip())
                             st.session_state.pop(_compose_key, None)
                             st.rerun()
+                        elif _res.get("no_gv_thread"):
+                            st.session_state[f"gv_fallback_msg_{_sel_lid}"] = True
                         else:
                             # No rerun on failure — error and draft stay visible.
                             st.error(f"❌ NOT sent: {_res.get('error')}")
                     else:
                         st.warning("Type a message first.")
+                render_gv_fallback(_sel_lid, _compose_key, _sel_lead["name"], "msg")
                 _msg_auto_cid = _auto_caller_id(_sel_lead.get("phone", ""))
                 _msg_cid = _sc2.radio(
                     "From", ["515", "773"],

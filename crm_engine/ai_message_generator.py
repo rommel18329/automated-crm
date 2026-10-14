@@ -344,11 +344,16 @@ def generate_message(
     new_number_note = ""
     if not has_texted_before:
         try:
-            from .gv_gmail_import import is_gv_contact
+            from .gv_gmail_import import is_gv_contact, has_reply_addr
             _is_gv = is_gv_contact(lead.get("phone", ""))
+            _gv_thread = _is_gv and has_reply_addr(lead.get("phone", ""))
         except Exception:
-            _is_gv = False
-        if _is_gv:
+            _is_gv = _gv_thread = False
+        if _gv_thread:
+            # Goes out from the Google Voice number they already texted: same
+            # number, so no "new number" intro.
+            new_number_note = ""
+        elif _is_gv:
             new_number_note = (
                 "\n⚠️ FIRST TEXT FROM THIS NUMBER — they reached you on your "
                 "GOOGLE VOICE number, so this reply comes from a DIFFERENT number than "

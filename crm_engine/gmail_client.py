@@ -18,6 +18,9 @@ MAILBOX = 'contactus@silverlineinvestment.group'
 GV_LINE = '17732178686'   # our Google Voice number (the "Me" line)
 
 
+# TODO: verify unused before removing -- Google Voice rejects this bare
+# <gv>.<their-number>@ form ("address not found"); sending must use a reply
+# address GV issued on an incoming text. See send_gv_reply().
 def gv_relay_address(their_number):
     """Mail to this address is delivered by Google Voice as an SMS FROM our
     GV number: <gv-line>.<their-number>@txt.voice.google.com."""
@@ -236,11 +239,30 @@ class GmailClient:
         return self.service.users().messages().send(userId='me', body={
             'threadId': thread['id'], 'raw': raw}).execute(num_retries=0)
 
+    def send_gv_reply(self, address, body):
+        """Send an SMS through Google Voice by emailing a reply address that GV
+        issued on an incoming text: <gv-line>.<their-number>.<code>@txt.voice.google.com.
+        GV only delivers mail sent to addresses it issued; anything else bounces.
+        Returns the Gmail send response (accepted by Gmail, not yet proof of delivery)."""
+        if not re.fullmatch(GV_LINE + r'\.\d{10,11}\.[A-Za-z0-9_-]+@txt\.voice\.google\.com',
+                            address or '', re.I):
+            raise ValueError('not a Google Voice reply address')
+        msg = EmailMessage()
+        msg['To'] = address
+        msg['Subject'] = ''
+        msg.set_content(body)
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode('ascii')
+        # Non-idempotent send: never auto-retry.
+        return self.service.users().messages().send(
+            userId='me', body={'raw': raw}).execute(num_retries=0)
+
     def find_sent(self, rfc_message_id):
         response = self.service.users().messages().list(userId='me',
             q='in:sent rfc822msgid:' + rfc_message_id.strip('<>')).execute()
         return next(iter(response.get('messages', [])), None)
 
+    # TODO: verify unused before removing -- builds the bare relay address,
+    # which Google Voice bounces. Use send_gv_reply() instead.
     def send_gv_text(self, their_number, body):
         """Send an SMS through Google Voice by emailing its relay address, so the
         recipient sees the same GV number they already know (no Twilio 'new
