@@ -581,6 +581,12 @@ def open_lead_from_search(lead_id: int) -> None:
     st.session_state["page"] = "leads"
     st.session_state["selected_lead_id"] = lead_id
     st.session_state["lead_list_collapsed"] = True
+    # The page and lead are re-read from the URL on every run, so the URL has
+    # to change too -- otherwise ?page=messages (or an old &lead=) wins and the
+    # click appears to do nothing.
+    st.query_params["page"] = "leads"
+    st.query_params["lead"] = str(lead_id)
+    st.session_state["quick_search_value"] = ""
 
 
 def render_global_search(leads: list[dict]) -> None:
