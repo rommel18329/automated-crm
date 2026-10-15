@@ -72,6 +72,7 @@ let lastDialTs=null,currentLeadId=null,dispBatchId=null,lastCallDuration=0;
 let nameEl={},phoneEl={},timerEl={},btnCall={},autoAdvance=true;
 function hideDisposition(){}
 function loadScriptForLead(){}
+function bindCallNotes(){}
 function startRinging(){}
 function updateQueueBar(){}
 let resolveConnect, connectCount=0;

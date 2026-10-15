@@ -1274,6 +1274,7 @@ _DISPOSITIONS = {
     "Not Interested": ("Call - not interested", None),
     "Callback":       ("Call - wants callback", 1),
     "Connected":      ("Call - connected, talked", 3),
+    "Investor":       ("Call - investor buyer", None),
     # Answered but no audio either way (silent screening app, dead line,
     # or an audio-path glitch). Retry the next day.
     "Dead Air":       ("Call - answered but dead air (no audio)", 1),
@@ -1312,6 +1313,8 @@ def dialer_dispose():
 
     db.add_interaction(int(lead_id), "call", note, "outbound", DB_PATH, ts=datetime.utcnow())
     fields = {"last_contact_date": date.today().isoformat()}
+    if label == "Investor":
+        fields["status"] = "investor"
     if lead.get("conversation_stage") == "not_contacted":
         fields["conversation_stage"] = "initial_contact"
     if days is not None:
@@ -1329,9 +1332,10 @@ def dialer_dispose():
                 frm = b["from_numbers"].get(int(lead_id)) or frm
                 to = b.get("winner_phone") or to
     db.log_disposition(int(lead_id), label, source="popup",
+                       status_set="investor" if label == "Investor" else None,
                        agent=data.get("agent"), batch_id=b_id,
                        from_number=frm, to_number=to,
-                       duration_sec=data.get("duration_sec"))
+                       duration_sec=data.get("duration_sec"), db_path=DB_PATH)
     # Disposed = done for today; the claim is no longer needed.
     with _batch_lock:
         _lead_claims.pop(int(lead_id), None)
@@ -1414,6 +1418,8 @@ def dialer_note():
     note = (data.get("note") or "").strip()
     if not lead_id or not note:
         return _cors(jsonify({"ok": False, "error": "missing lead_id or note"})), 400
+    if not db.fetch_lead(int(lead_id), DB_PATH):
+        return _cors(jsonify({"ok": False, "error": "lead not found"})), 404
     who = (data.get("agent") or "").strip()
     prefix = f"📞 {who}: " if who else "📞 "
     db.add_interaction(int(lead_id), "note", prefix + note, "outbound",
@@ -1873,6 +1879,7 @@ def softphone_page():
     <button class="disp-btn" onclick="dispose('No Answer')">No Answer</button>
     <button class="disp-btn" onclick="dispose('Voicemail')">Voicemail</button>
     <button class="disp-btn" onclick="dispose('Connected')">Connected</button>
+    <button class="disp-btn" onclick="dispose('Investor')">Investor</button>
     <button class="disp-btn" onclick="dispose('Callback')">Callback</button>
     <button class="disp-btn" onclick="dispose('Not Interested')">Not Interested</button>
     <button class="disp-btn" onclick="dispose('Wrong Number')">Wrong Number</button>
@@ -1888,13 +1895,18 @@ def softphone_page():
       <button class="disp-btn st-cold" onclick="setLeadStatus('cold')">❄️ Cold</button>
     </div>
   </div>
-  <div class="disp-title" style="margin-top:10px">Note (optional)</div>
+  <button class="btn btn-call" id="btnDispNext"
+          style="width:100%;margin-top:8px">✓ Save & Next lead</button>
+</div>
+<div id="liveNotes" style="display:none;margin-top:12px">
+  <div class="disp-title">Call notes — available during your call</div>
   <textarea id="dispNote" placeholder="Type a quick note about this call…"
             style="width:100%;box-sizing:border-box;min-height:52px;padding:7px 9px;
                    border:1px solid #ccc;border-radius:7px;font-size:13px;
                    font-family:inherit;resize:vertical"></textarea>
-  <button class="btn btn-call" id="btnDispNext"
-          style="width:100%;margin-top:8px">✓ Save & Next lead</button>
+  <button class="btn btn-call" id="btnSaveNote" style="margin-top:8px">Save Note</button>
+  <button class="btn btn-mute" id="btnInvestor" onclick="dispose('Investor')">Investor</button>
+  <div id="noteSaveStatus" role="status" style="font-size:12px;margin-top:6px"></div>
 </div>
 <div class="disp-done" id="dispDone"></div>
 <details class="script" id="scriptBox" open>
@@ -1955,6 +1967,12 @@ def softphone_page():
   const dispOutcomeEl = document.getElementById('dispOutcome');
   const dispStatusEl  = document.getElementById('dispStatus');
   const dispNote  = document.getElementById('dispNote');
+  const liveNotes = document.getElementById('liveNotes');
+  const btnSaveNote = document.getElementById('btnSaveNote');
+  const btnInvestor = document.getElementById('btnInvestor');
+  const noteSaveStatus = document.getElementById('noteSaveStatus');
+  let noteLeadId = null, noteSavePending = false;
+  const noteDrafts = {};
   const btnDispNext = document.getElementById('btnDispNext');
   const repNameEl = document.getElementById('repName');
   const scOpen1 = document.getElementById('scOpen1');
@@ -2250,7 +2268,6 @@ def softphone_page():
     dispStatusEl.classList.remove('locked');
     var _ss = document.getElementById('statusSection');
     if (_ss) _ss.style.display = '';   // restore status prompt for the next call
-    if (dispNote) dispNote.value = '';
     savedParts = [];
     outcomeSaved = false;
     statusSaved = false;
@@ -2267,9 +2284,9 @@ def softphone_page():
 
   // Call outcome -> logs the call + sets the next-call date.
   window.dispose = function(label) {
-    if (!currentLeadId) return;
+    if (!currentLeadId || outcomeSaved) return;
     dispOutcomeEl.classList.add('locked');   // one outcome per call
-    var terminal = TERMINAL_OUTCOMES.indexOf(label) !== -1;
+    var terminal = TERMINAL_OUTCOMES.indexOf(label) !== -1 || label === 'Investor';
     if (terminal) {
       // No temperature needed — hide the status prompt entirely.
       var _ss = document.getElementById('statusSection');
@@ -2293,6 +2310,7 @@ def softphone_page():
           showSaved(label);
           logMsg('Outcome saved: ' + label);
           outcomeSaved = true;
+          if (label === 'Investor') { statusSaved = true; btnInvestor.disabled = true; }
           lastOutcomeNoStatus = NO_STATUS_OUTCOMES.indexOf(label) !== -1;
           if (terminal) { dispDoneEl.textContent = '✓ ' + label; }
           maybeAdvance();
@@ -2361,6 +2379,7 @@ def softphone_page():
   // Advance once the call is fully written up: outcome saved, plus a
   // temperature unless the outcome doesn't need one (no answer / VM / wrong #).
   function maybeAdvance() {
+    if (call || connectPending || noteSavePending) return;
     if (!outcomeSaved) return;
     if (!statusSaved && !lastOutcomeNoStatus) return;
     // Temperature outcomes (warm/hot/cold): don't auto-jump — let the agent
@@ -2378,23 +2397,63 @@ def softphone_page():
 
   // Save the typed note (if any) then advance. This is the button the agent
   // hits after warm/hot/cold + note; also works for any outcome.
-  function saveNoteThenNext() {
+  async function saveNoteThenNext() {
     if (nextTimer) { clearTimeout(nextTimer); nextTimer = null; }
-    var txt = dispNote ? dispNote.value.trim() : '';
-    function go() {
-      awaitingDisposition = false;
-      if (dispNote) dispNote.value = '';
-      if (queueActive && autoAdvance) scheduleNext(600, 'Next lead');
-      else { hideDisposition(); setStatus('Saved — hit ⏭ Next when ready', 'ended'); }
-    }
-    if (txt && currentLeadId) {
-      fetch('/dialer/note', { method: 'POST', body: JSON.stringify({
-        lead_id: currentLeadId, note: txt,
-        agent: (repNameEl.value || '').trim() || null }) })
-        .then(function() { showSaved('note'); logMsg('Note saved.'); go(); })
-        .catch(function() { logMsg('Note save failed — advancing anyway.'); go(); });
-    } else {
-      go();
+    if (noteSavePending) return;
+    const leadId = currentLeadId;
+    if (!await saveCallNote()) return;
+    if (call || connectPending || currentLeadId !== leadId || hasUnsavedNote()) return;
+    awaitingDisposition = false;
+    if (queueActive && autoAdvance) scheduleNext(600, 'Next lead');
+    else { hideDisposition(); setStatus('Saved — hit ⏭ Next when ready', 'ended'); }
+  }
+
+  function bindCallNotes(leadId) {
+    if (noteLeadId) noteDrafts[noteLeadId] = dispNote.value;
+    noteLeadId = leadId;
+    dispNote.value = leadId ? (noteDrafts[leadId] || '') : '';
+    liveNotes.style.display = leadId ? '' : 'none';
+    noteSaveStatus.textContent = '';
+    btnInvestor.disabled = false;
+  }
+
+  function hasUnsavedNote() {
+    return noteSavePending || !!(dispNote && dispNote.value.trim());
+  }
+
+  async function saveCallNote() {
+    if (noteSavePending) return false;
+    const leadId = noteLeadId;
+    const draft = dispNote.value;
+    if (!draft.trim()) return true;
+    if (!leadId) return false;
+    noteSavePending = true;
+    btnSaveNote.disabled = true;
+    noteSaveStatus.textContent = 'Saving…';
+    try {
+      const response = await fetch('/dialer/note', { method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({lead_id: leadId, note: draft.trim(),
+          agent: (repNameEl.value || '').trim() || null}) });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || 'Save failed');
+      // Preserve anything typed while this request was in flight.
+      let latest = noteLeadId === leadId ? dispNote.value : (noteDrafts[leadId] || '');
+      if (latest.startsWith(draft)) latest = latest.slice(draft.length);
+      noteDrafts[leadId] = latest;
+      if (noteLeadId === leadId) {
+        dispNote.value = latest;
+        noteSaveStatus.textContent = latest.trim() ? 'Saved. New edits still unsaved.' : '✓ Note saved to CRM';
+      }
+      logMsg('Note saved.');
+      return true;
+    } catch (error) {
+      if (noteLeadId === leadId) noteSaveStatus.textContent = 'Save failed — your note is kept. Try again.';
+      logMsg('Note save failed — keeping draft and staying on this lead.');
+      return false;
+    } finally {
+      noteSavePending = false;
+      btnSaveNote.disabled = false;
     }
   }
 
@@ -2412,6 +2471,7 @@ def softphone_page():
   function doNext() {
     if (nextTimer) { clearTimeout(nextTimer); nextTimer = null; }
     if (call || connectPending) { logMsg('Still on a call — hang up first.'); return; }
+    if (hasUnsavedNote()) { noteSaveStatus.textContent = 'Save your note before moving to the next lead.'; return; }
     if (nextPending) return;
     nextPending = true;
     queueStopped = false;
@@ -2474,9 +2534,12 @@ def softphone_page():
 
   // Save & Next lead (after a disposition + optional note).
   if (btnDispNext) btnDispNext.addEventListener('click', saveNoteThenNext);
+  btnSaveNote.addEventListener('click', saveCallNote);
   // Typing a note cancels any pending auto-advance so it can't jump away
   // mid-sentence — the agent finishes and hits Save & Next.
   if (dispNote) dispNote.addEventListener('input', function() {
+    if (noteLeadId) noteDrafts[noteLeadId] = dispNote.value;
+    noteSaveStatus.textContent = dispNote.value.trim() ? 'Unsaved note' : '';
     if (nextTimer) {
       clearTimeout(nextTimer); nextTimer = null;
       setStatus('Writing a note — hit ✓ Save & Next when done', 'ended');
@@ -2569,6 +2632,7 @@ def softphone_page():
     if (!isRetry) { retriedThisDial = false; }
     hideDisposition();
     currentLeadId = lead.lead_id || null;   // null for manual quick-dials
+    bindCallNotes(currentLeadId);
     dispBatchId = null;
     lastCallDuration = 0;
     loadScriptForLead(currentLeadId);
@@ -2623,6 +2687,7 @@ def softphone_page():
     hideDisposition();
     currentLeadId = null;
     dispBatchId = data.batch_id;
+    bindCallNotes(null);
     lastCallDuration = 0;
     currentBatchId = data.batch_id;
     joinToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -2718,6 +2783,7 @@ def softphone_page():
             nameEl.textContent = b.winner_name;
             phoneEl.textContent = b.winner_phone || '';
             currentLeadId = b.winner || null;   // dispose the winning lead
+            bindCallNotes(currentLeadId);
             if (hasDropAudio && currentLeadId) btnDropVm.disabled = false;
             loadScriptForLead(currentLeadId);   // fill script for the person who answered
             setStatus('Connected — ' + b.winner_name, 'connected');
