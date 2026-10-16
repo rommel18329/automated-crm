@@ -639,6 +639,8 @@ def get_lead_by_id(lead_id: int | None, leads: list[dict]) -> dict | None:
     return None
 
 
+# TODO: verify unused before removing. The Follow-ups page no longer falls back
+# to this "everyone warm/cold" list; the cadence queue (followup_cadence) replaced it.
 def build_followups(leads: list[dict]) -> tuple[list[dict], list[dict]]:
     warm_items: list[dict] = []
     cold_items: list[dict] = []
@@ -1214,16 +1216,16 @@ def _build_display_result(leads: list[dict] | None = None,
         for l, e in sorted_hot
     ]
 
-    # Follow-up queue: non-hot DB leads that are due today or overdue
-    today_str = date.today().isoformat()
+    # Follow-up queue: everyone due today by the cadence rule (hot daily,
+    # warm weekly, cold every 6 months, waiting on you, scheduled callbacks),
+    # each with the reason it's here. See crm_engine/followup_cadence.py.
+    from crm_engine.followup_cadence import followup_reason
     followups: list = []
     for lead, evaluation in leads_with_eval:
-        if lead["status"] in ("hot", "dead", "contract", "investor"):
-            continue
-        next_action = lead.get("next_action_date") or today_str
-        if next_action > today_str:
-            continue
         ixns = all_ixns.get(lead["id"], [])
+        reason = followup_reason(lead, ixns)
+        if not reason:
+            continue
         ignored = engine.ignored_outbound_texts(ixns)
         last_outbound = next((i for i in ixns if i["direction"] == "outbound"), None)
         # No AI call here — suggestions are generated lazily on the Follow-ups page
@@ -1236,7 +1238,12 @@ def _build_display_result(leads: list[dict] | None = None,
             "options": ["approve", "edit", "skip", "call instead"],
             "touch_notice": evaluation.touch_message,
             "ghosting_signal": evaluation.ghosting_signal,
+            "reason": reason["label"],
+            "reason_kind": reason["kind"],
+            "rank": reason["rank"],
+            "overdue_days": reason["overdue_days"],
         })
+    followups.sort(key=lambda f: (f["rank"], -f["overdue_days"]))
 
     counts = Counter(l["status"] for l in leads if l["status"] in ("hot", "warm", "cold"))
     risk_leads = [
@@ -2238,27 +2245,27 @@ elif page == "followups":
     overdue_only = st.session_state.get("followup_overdue_only", False)
     queue = result["followup_queue"]
 
-    warm_items, cold_items = [], []
+    st.caption("🔥 Hot every day · 🌤 Warm every 7 days · ❄️ Cold every 6 months since you last "
+               "called or texted, plus anyone 💬 waiting on you and 🗓 scheduled follow-ups.")
+
+    # The queue is already sorted: hot, waiting on you, callbacks, then most overdue.
+    hot_items, warm_items, cold_items = [], [], []
     for item in queue:
         lead = get_lead_by_id(item["lead_id"], all_leads)
         if not lead:
             continue
-        if overdue_only and lead.get("next_action_date") and lead["next_action_date"] >= date.today().isoformat():
+        if overdue_only and item.get("overdue_days", 0) <= 0 and item.get("reason_kind") != "reply":
             continue
-        (warm_items if lead["status"] == "warm" else cold_items).append((item, lead))
-
-    if not warm_items and not cold_items:
-        warm_built, cold_built = build_followups(all_leads)
-        warm_items = [(item, lead_lookup[item["lead_id"]]) for item in warm_built if item["lead_id"] in lead_lookup]
-        cold_items = [(item, lead_lookup[item["lead_id"]]) for item in cold_built if item["lead_id"] in lead_lookup]
+        {"hot": hot_items, "warm": warm_items}.get(lead["status"], cold_items).append((item, lead))
 
     if overdue_only:
         st.markdown("#### Overdue Follow-ups")
-        warm_items.sort(key=lambda pair: pair[1].get("next_action_date") or "9999-12-31")
-        cold_items.sort(key=lambda pair: pair[1].get("next_action_date") or "9999-12-31")
+    if not (hot_items or warm_items or cold_items):
+        st.success("✅ Nobody is due for a follow-up today.")
 
-    for section_name, items in [("Warm", warm_items), ("Cold", cold_items)]:
-        st.markdown(f"### {section_name}")
+    for section_name, items in [("🔥 Hot (daily)", hot_items), ("🌤 Warm (weekly)", warm_items),
+                                ("❄️ Cold (every 6 months)", cold_items)]:
+        st.markdown(f"### {section_name} · {len(items)}")
         if not items:
             st.caption("No items")
         for item, lead in items:
@@ -2330,6 +2337,12 @@ elif page == "followups":
             if lid <= 0:
                 st.markdown(f"**{item['lead_name']}**")
             st.caption(f"Phone: {lead.get('phone', 'N/A')}  ·  {address}")
+            if item.get("reason"):
+                st.markdown(f"<div class='sl-flag' style='font-weight:700'>{html.escape(item['reason'])}</div>",
+                            unsafe_allow_html=True)
+            if lead.get("status") == "hot" and lid > 0:
+                # Hot leads: call first. Texting stays a manual click (never automatic).
+                softphone_call_button(lead, _FROM_OPTS[_auto_caller_id(lead.get("phone", ""))])
 
             # They CALLED you and you haven't called back — a text reply is
             # the wrong move. Uses the persistent missed-call state, so this
@@ -2399,7 +2412,8 @@ elif page == "followups":
                     st.caption("💰 $0.0000 — reused cached suggestion, no API call")
 
             c1, c2, c_ctx, c3 = st.columns([2, 1, 3, 1])
-            _SNOOZE_DAYS = {"warm": 5, "cold": 30}
+            # Matches the Follow-ups cadence (crm_engine/followup_cadence.CADENCE_DAYS).
+            _SNOOZE_DAYS = {"hot": 1, "warm": 7, "cold": 180}
 
             if c1.button("Approve & Send", key=f"f_app_{lid}",
                          disabled=not st.session_state.get(msg_key, "").strip()):
