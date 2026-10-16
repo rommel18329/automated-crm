@@ -1634,9 +1634,9 @@ def dialer_lead(lead_id: int):
         "first_name": name.split()[0] if name else "",
         "phone": lead.get("phone", ""),
         "address": address,
-        # Prior dialing attempts (disposed calls) — the softphone shows
-        # "Attempt #N" plus VM-cadence advice from this.
-        "attempts": db.count_dispositions(lead_id, DB_PATH),
+        # Prior dialing attempts (every recorded dial, answered or not) — the
+        # softphone shows "Attempt #N" plus VM-cadence advice from this.
+        "attempts": db.count_dial_attempts(lead_id, DB_PATH),
     })
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
@@ -2054,6 +2054,55 @@ def dialer_queue_status():
                           "list_alerts": health["alerts"] if health else []}))
 
 
+_DTMF_RE = re.compile(r"[0-9*#w]{1,20}")
+
+
+@app.route("/voice/dtmf/<digits>", methods=["GET", "POST"])
+def voice_dtmf(digits):
+    """Announcement TwiML that plays keypad tones into one conference participant."""
+    if not _DTMF_RE.fullmatch(digits or ""):
+        return Response(_HANGUP_TWIML, status=400, mimetype="text/xml")
+    return Response('<?xml version="1.0" encoding="UTF-8"?>'
+                    f'<Response><Play digits="{digits}"/></Response>', mimetype="text/xml")
+
+
+@app.route("/dialer/dtmf", methods=["POST", "OPTIONS"])
+def dialer_dtmf():
+    """Softphone keypad on a multi-line call: press keys on the SELLER's leg
+    (phone menus, "press 1 to be connected" screeners). Conferences don't
+    pass key presses between participants, so play the tones to the seller's
+    participant as an announcement. Body: {agent, digits}."""
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    data = request.get_json(force=True, silent=True) or {}
+    agent = (data.get("agent") or "rom").lower()
+    digits = str(data.get("digits") or "")
+    if not _DTMF_RE.fullmatch(digits):
+        return _cors(jsonify({"ok": False, "error": "digits must be 0-9, * or #"})), 400
+    with _batch_lock:
+        batch = next((b for b in _multi_batches.values()
+                      if b.get("agent") == agent and b.get("status") == "connected"
+                      and b.get("winner") is not None), None)
+        seller_sid = batch["call_sids"].get(batch["winner"]) if batch else None
+        conference = batch["conference"] if batch else None
+    if not seller_sid:
+        return _cors(jsonify({"ok": False, "error": "no connected multi-line call"}))
+    try:
+        from twilio.rest import Client as TwilioClient
+        twilio = TwilioClient(ACCOUNT_SID, AUTH_TOKEN)
+        conf = next(iter(twilio.conferences.list(friendly_name=conference, status="in-progress", limit=1)), None)
+        if not conf:
+            return _cors(jsonify({"ok": False, "error": "conference not found"}))
+        from urllib.parse import quote
+        twilio.conferences(conf.sid).participants(seller_sid).update(   # "#" must be %23 in a URL
+            announce_url=f"{PUBLIC_BASE_URL}/voice/dtmf/{quote(digits, safe='')}", announce_method="POST")
+        log.info(f"Keypad [{agent}]: pressed {digits} on seller leg {seller_sid}")
+        return _cors(jsonify({"ok": True}))
+    except Exception as exc:
+        log.warning(f"Keypad [{agent}] failed to press {digits}: {exc}")
+        return _cors(jsonify({"ok": False, "error": "Twilio rejected the key press"}))
+
+
 @app.route("/dialer/ai-notes-status")
 def dialer_ai_notes_status():
     """Running count for the softphone's AI call notes bar."""
@@ -2112,6 +2161,14 @@ def softphone_page():
   .timer { text-align:center; font-size:28px; font-weight:700; color:#1a1a1a;
            margin:8px 0; font-variant-numeric:tabular-nums; }
   .buttons { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; margin-top:10px; }
+  .keypad { display:none; grid-template-columns:repeat(3, 1fr); gap:6px; margin:10px auto 0;
+            max-width:240px; }
+  .keypad.open { display:grid; }
+  .keypad button { padding:10px 0; font-size:18px; font-weight:700; border:1px solid #cdd6cf;
+                   border-radius:9px; background:#fff; cursor:pointer; color:#2f4a35; }
+  .keypad button:active { background:#e4efe6; }
+  .keypad-status { grid-column:1 / -1; text-align:center; font-size:12px; color:#6b7a70;
+                   min-height:15px; }
   .btn { padding:10px 22px; border:none; border-radius:8px; font-size:14px;
          font-weight:600; cursor:pointer; transition:all 0.15s; }
   .btn:hover { transform:scale(1.03); }
@@ -2215,6 +2272,15 @@ def softphone_page():
   <button class="btn btn-mute" id="btnSound" title="Speaker test — plays a ring tone through your browser. If you hear it, your audio output works; dead air on a call means the other side was silent.">🔊 Test</button>
   <button class="btn btn-call" id="btnDropVm" style="display:none" disabled
           title="Hear a voicemail greeting? Tap at the beep: your recorded message plays into the voicemail while you move on to the next batch.">📼 Drop VM</button>
+  <button class="btn btn-mute" id="btnKeypad" disabled
+          title="Phone menu or call screener (&quot;press 1 to be connected&quot;)? Open the keypad and tap the number.">⌨️ Keypad</button>
+</div>
+<div class="keypad" id="keypad">
+  <button data-d="1">1</button><button data-d="2">2</button><button data-d="3">3</button>
+  <button data-d="4">4</button><button data-d="5">5</button><button data-d="6">6</button>
+  <button data-d="7">7</button><button data-d="8">8</button><button data-d="9">9</button>
+  <button data-d="*">*</button><button data-d="0">0</button><button data-d="#">#</button>
+  <div class="keypad-status" id="keypadStatus"></div>
 </div>
 <div class="disp" id="disp">
   <div class="disp-title">Call outcome — saves to CRM</div>
@@ -2411,6 +2477,41 @@ def softphone_page():
 
   renderScript(null);   // show generic script until a lead is dialed
 
+  // ── Keypad: answer phone menus / call screeners ("press 1 to be connected")
+  // Single-line calls are bridged straight to the seller, so the browser sends
+  // the tone. Multi-line calls run through a conference, which doesn't pass
+  // key presses, so the server plays the tone into the seller's leg instead.
+  var btnKeypad = document.getElementById('btnKeypad');
+  var keypad = document.getElementById('keypad');
+  var keypadStatus = document.getElementById('keypadStatus');
+  btnKeypad.addEventListener('click', function() { keypad.classList.toggle('open'); });
+  function sendKey(d) {
+    if (!call) { keypadStatus.textContent = 'No call in progress'; return; }
+    keypadStatus.textContent = 'Pressing ' + d + '…';
+    if (!currentBatchId) {
+      try { call.sendDigits(d); keypadStatus.textContent = 'Pressed ' + d; }
+      catch (e) { keypadStatus.textContent = 'Could not press ' + d; }
+      return;
+    }
+    fetch('/dialer/dtmf', { method: 'POST', body: JSON.stringify({ agent: AGENT, digits: d }) })
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        if (j.ok) { keypadStatus.textContent = 'Pressed ' + d; return; }
+        try { call.sendDigits(d); keypadStatus.textContent = 'Pressed ' + d; }
+        catch (e) { keypadStatus.textContent = 'Could not press ' + d + (j.error ? ': ' + j.error : ''); }
+      })
+      .catch(function() { keypadStatus.textContent = 'Could not reach the server'; });
+  }
+  keypad.querySelectorAll('button[data-d]').forEach(function(b) {
+    b.addEventListener('click', function() { sendKey(b.getAttribute('data-d')); });
+  });
+  document.addEventListener('keydown', function(e) {
+    if (!keypad.classList.contains('open') || !call) return;
+    var tag = (e.target && e.target.tagName) || '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;   // typing a note, not dialing
+    if (/^[0-9*#]$/.test(e.key)) { sendKey(e.key); e.preventDefault(); }
+  });
+
   let device = null;
   let call = null;
   let connectPending = false;
@@ -2466,6 +2567,7 @@ def softphone_page():
       if (call !== c || generation !== callGeneration) return;
       btnHangup.disabled = false;
       btnMute.disabled = false;
+      if (typeof btnKeypad !== 'undefined') btnKeypad.disabled = false;
       acceptedFired = true;
       if (batchId) {
         // Agent is now in the conference — tell the server to fire the calls.
@@ -2542,6 +2644,7 @@ def softphone_page():
     btnCall.disabled = false;
     btnHangup.disabled = true;
     btnMute.disabled = true;
+    if (typeof btnKeypad !== 'undefined') { btnKeypad.disabled = true; keypad.classList.remove('open'); }
     if (typeof btnDropVm !== 'undefined') btnDropVm.disabled = true;
     btnMute.textContent = '🔇 Mute';
     btnMute.classList.remove('active');

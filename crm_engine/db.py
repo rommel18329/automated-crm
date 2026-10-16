@@ -1463,6 +1463,19 @@ def dial_list_attempts(list_id: int, db_path: Path = DB_PATH) -> list[dict[str, 
     return out
 
 
+def count_dial_attempts(lead_id: int, db_path: Path = DB_PATH) -> int:
+    """Real dial attempts on this lead so far (answered or not), for the
+    softphone's "Attempt #N" line. Status-only rows and lines cut off because
+    another line won don't count."""
+    marks = ",".join("?" * len(NOT_A_TRY))
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS c FROM dispositions WHERE lead_id=? AND disposition NOT IN ({marks})",
+            (lead_id, *NOT_A_TRY),
+        ).fetchone()
+    return int(row["c"])
+
+
 def recent_list_outcomes(list_id: int, limit: int = 100, db_path: Path = DB_PATH) -> list[str]:
     """The latest real dial outcomes on a list's members, newest first."""
     marks = ",".join("?" * len(NOT_A_TRY))
