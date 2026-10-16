@@ -206,6 +206,35 @@ def generate_call_note(lead: dict, transcript_text: str, approval=None,
         return ""
 
 
+LIVE_BULLETS_SYSTEM_PROMPT = """You take live notes for a real-estate wholesaler
+DURING a phone call. You get the transcript so far ("Them" = the seller,
+"Rom"/"Gabby"/"You" = our caller). Write 2-5 short bullets of concrete things THEY have said:
+price or number in mind, timeline, condition, occupancy, why they'd sell, other
+decision makers, what they want next. Only facts literally in the transcript;
+never guess. Plain text, one fact per line starting with "• ", under 60 words
+total. If they haven't said anything useful yet, return exactly "• Listening…"."""
+
+
+def prepare_live_bullets(lead: dict, transcript_so_far: str) -> dict:
+    """Live in-call notes, refreshed while the seller talks (dial-session AI notes)."""
+    user_msg = (f"LEAD: {lead.get('name', 'Unknown')}\n\nTRANSCRIPT SO FAR:\n"
+                + transcript_so_far[-3000:] + "\n\nWrite the bullets now.")
+    return {"feature": "live_bullets", "system": LIVE_BULLETS_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user_msg}],
+            "model": HAIKU, "max_tokens": 120}
+
+
+def generate_live_bullets(lead: dict, transcript_so_far: str, approval=None,
+                          prepared: dict | None = None) -> str:
+    """Bullets for the softphone, only with an approved quote. '' on failure."""
+    if approval is None or not (transcript_so_far or "").strip():
+        return ""
+    try:
+        return response_text(run_request(approval, prepared or prepare_live_bullets(lead, transcript_so_far)))
+    except Exception:
+        return ""
+
+
 EXTRACT_SYSTEM_PROMPT = """You extract structured facts from a real-estate
 cold-call transcript ("Them" = the person called; "Rom"/"Gabby" = our caller).
 

@@ -555,7 +555,9 @@ def voice_recording():
         db.update_call_recording(lead_id, recording_url, DB_PATH)
         log.info(f"Attached recording {recording_sid} to lead {lead_id}")
         _call_sid_to_lead.pop(call_sid, None)
-        if VI_SERVICE_SID and recording_sid:
+        if _live_has_transcript(call_sid):
+            log.info(f"Live captions already transcribed {call_sid} — skipping after-call transcript")
+        elif VI_SERVICE_SID and recording_sid:
             threading.Thread(target=_start_transcription,
                              args=(recording_sid, lead_id), daemon=True).start()
     else:
@@ -670,6 +672,172 @@ def _save_transcript(transcript_sid: str) -> None:
         _auto_call_notes(lead_id, text)
     except Exception as exc:
         log.warning(f"Saving transcript {transcript_sid} failed: {exc}")
+
+
+# ── Live captions on dialer calls (Twilio real-time transcription) ──────────
+# Every connected multi-line dialer call is transcribed live (see
+# _live_transcription_twiml). The softphone polls /dialer/live-transcript and
+# shows the words as the seller talks; while the Dialer's "AI call notes"
+# switch is on, Haiku refreshes a few bullets during the call. When the call
+# ends the live transcript is saved on the lead and replaces the after-call
+# Voice Intelligence transcript (so it isn't paid for twice).
+_live_calls: dict[str, dict] = {}      # CallSid -> live call state
+_live_by_agent: dict[str, str] = {}    # agent -> CallSid of their latest call
+_live_lock = threading.Lock()
+LIVE_BULLETS_MAX = 8                   # bullet refreshes per call, at most
+LIVE_BULLETS_EVERY = 30                # seconds between refreshes
+_LIVE_KEEP_SECONDS = 30 * 60
+
+
+def _live_text(call: dict) -> str:
+    return "\n".join(f"{line['who']}: {line['text']}" for line in call["lines"])
+
+
+def _prune_live_calls() -> None:
+    """Caller holds _live_lock. Drop calls finished more than 30 minutes ago."""
+    cutoff = time.time() - _LIVE_KEEP_SECONDS
+    for sid in [s for s, c in _live_calls.items() if c["updated"] < cutoff]:
+        _live_calls.pop(sid, None)
+    for agent in [a for a, s in _live_by_agent.items() if s not in _live_calls]:
+        _live_by_agent.pop(agent, None)
+
+
+def _live_refresh_bullets(call_sid: str) -> None:
+    """Background: refresh the in-call AI bullets under the dial-session approval."""
+    from crm_engine import ai_budget
+    from crm_engine.ai_message_generator import generate_live_bullets, prepare_live_bullets
+    try:
+        with _live_lock:
+            call = _live_calls.get(call_sid)
+            if not call:
+                return
+            text, lead_id = _live_text(call), call["lead_id"]
+        lead = db.fetch_lead(lead_id, DB_PATH) or {}
+        request_ = prepare_live_bullets(lead, text)
+        bullets = generate_live_bullets(lead, text, approval=ai_budget.auto_approve(request_),
+                                        prepared=request_)
+        with _live_lock:
+            if bullets and call_sid in _live_calls:
+                _live_calls[call_sid]["bullets"] = bullets
+    except Exception as exc:
+        log.warning(f"Live bullets failed for {call_sid}: {exc}")
+    finally:
+        with _live_lock:
+            if call_sid in _live_calls:
+                _live_calls[call_sid]["bullets_busy"] = False
+
+
+def _maybe_refresh_bullets(call_sid: str) -> None:
+    """After the seller says something new: refresh bullets if the AI call
+    notes switch is on, it's been 30s, none is running and under the cap."""
+    from crm_engine import ai_budget
+    with _live_lock:
+        call = _live_calls.get(call_sid)
+        if (not call or call["ended"] or call["bullets_busy"]
+                or call["bullet_runs"] >= LIVE_BULLETS_MAX
+                or time.time() - call["bullets_at"] < LIVE_BULLETS_EVERY):
+            return
+    if not ai_budget.autonotes_status()["active"]:
+        return
+    with _live_lock:
+        call = _live_calls.get(call_sid)
+        if not call or call["bullets_busy"]:
+            return
+        call["bullets_busy"] = True
+        call["bullet_runs"] += 1
+        call["bullets_at"] = time.time()
+    threading.Thread(target=_live_refresh_bullets, args=(call_sid,), daemon=True).start()
+
+
+def _finish_live_call(call_sid: str) -> None:
+    """Call ended: save the live transcript on the lead once, then run the
+    AI call notes (they only run while the Dialer switch is on)."""
+    with _live_lock:
+        call = _live_calls.get(call_sid)
+        if not call or call["saved"]:
+            return
+        call["saved"] = True
+        call["ended"] = True
+        call["partial"] = {}
+        text, lead_id = _live_text(call), call["lead_id"]
+    if not text:
+        log.info(f"Live transcript {call_sid}: nothing said, nothing saved")
+        return
+    try:
+        db.add_interaction(lead_id, "note", "📝 Call transcript:\n" + text[:4000],
+                           "outbound", DB_PATH, ts=datetime.utcnow())
+        log.info(f"Saved live transcript for lead {lead_id} ({len(text)} chars)")
+    except Exception as exc:
+        log.warning(f"Saving live transcript for lead {lead_id} failed: {exc}")
+        return
+    _auto_call_notes(lead_id, text)
+
+
+def _live_has_transcript(call_sid: str) -> bool:
+    with _live_lock:
+        call = _live_calls.get(call_sid)
+        return bool(call and call["lines"])
+
+
+@app.route("/voice/live-transcript/<batch_id>/<int:lead_id>", methods=["POST"])
+def voice_live_transcript(batch_id: str, lead_id: int):
+    """Twilio real-time transcription events for one connected dialer call."""
+    event = request.form.get("TranscriptionEvent", "")
+    call_sid = request.form.get("CallSid", "")
+    if not call_sid:
+        return ("", 204)
+    with _batch_lock:
+        agent = (_multi_batches.get(batch_id) or {}).get("agent") or ""
+    caller = agent.capitalize() or "You"
+    new_seller_line = False
+    with _live_lock:
+        _prune_live_calls()
+        call = _live_calls.get(call_sid)
+        if call is None:
+            call = _live_calls[call_sid] = {
+                "lead_id": lead_id, "batch_id": batch_id, "agent": agent, "caller": caller,
+                "lines": [], "partial": {}, "bullets": "", "bullets_at": 0.0,
+                "bullets_busy": False, "bullet_runs": 0, "started": time.time(),
+                "updated": time.time(), "ended": False, "saved": False}
+        call["updated"] = time.time()
+        if agent:
+            _live_by_agent[agent] = call_sid
+        if event == "transcription-content":
+            try:
+                text = (json.loads(request.form.get("TranscriptionData") or "{}")
+                        .get("transcript") or "").strip()
+            except ValueError:
+                text = ""
+            who = "Them" if request.form.get("Track") == "inbound_track" else call["caller"]
+            if request.form.get("Final") == "true":
+                call["partial"].pop(who, None)
+                if text:
+                    call["lines"].append({"who": who, "text": text})
+                    new_seller_line = who == "Them"
+            else:
+                call["partial"][who] = text
+    if event == "transcription-content" and new_seller_line:
+        _maybe_refresh_bullets(call_sid)
+    elif event == "transcription-stopped":
+        threading.Thread(target=_finish_live_call, args=(call_sid,), daemon=True).start()
+    elif event == "transcription-error":
+        log.warning(f"Live transcript error on {call_sid}: "
+                    f"{request.form.get('TranscriptionErrorCode', '')} {request.form.get('TranscriptionError', '')}")
+    return ("", 204)
+
+
+@app.route("/dialer/live-transcript")
+def dialer_live_transcript():
+    """The agent's current (or just-ended) call, for the softphone caption panel."""
+    agent = (request.args.get("agent") or "rom").lower()
+    with _live_lock:
+        call = _live_calls.get(_live_by_agent.get(agent, ""))
+        if not call:
+            return _cors(jsonify({"active": False}))
+        return _cors(jsonify({
+            "active": True, "lead_id": call["lead_id"], "ended": call["ended"],
+            "lines": call["lines"][-60:], "bullets": call["bullets"],
+            "partial": [{"who": w, "text": t} for w, t in call["partial"].items() if t]}))
 
 
 @app.route("/recordings/<recording_sid>")
@@ -1061,13 +1229,25 @@ def dialer_agent_ready(batch_id: str):
 _HANGUP_TWIML = '<?xml version="1.0"?><Response><Hangup/></Response>'
 
 
-def _conference_twiml(conference: str, caller_id: str, stop_stream: bool = False) -> str:
+def _live_transcription_twiml(batch_id: str, lead_id: int) -> str:
+    """Start Twilio real-time transcription on the seller's call leg so the
+    softphone shows live captions. On this leg inbound_track = the seller and
+    outbound_track = our caller. It stops by itself when the call ends."""
+    return ('<Start><Transcription name="live" track="both_tracks" partialResults="true"'
+            ' inboundTrackLabel="Them" outboundTrackLabel="You"'
+            f' statusCallbackUrl="{PUBLIC_BASE_URL}/voice/live-transcript/{batch_id}/{lead_id}"/>'
+            '</Start>')
+
+
+def _conference_twiml(conference: str, caller_id: str, stop_stream: bool = False,
+                      live: str = "") -> str:
     """Winner TwiML: join the conference the softphone is waiting in.
-    stop_stream ends the AMD media stream first (AMD path only)."""
+    stop_stream ends the AMD media stream first (AMD path only); live starts
+    real-time transcription (see _live_transcription_twiml)."""
     stop = '<Stop><Stream name="amd"/></Stop>' if stop_stream else ''
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        '<Response>' + stop +
+        '<Response>' + stop + live +
         f'<Dial callerId="{caller_id}"'
         ' record="record-from-ringing-dual"'
         f' recordingStatusCallback="{PUBLIC_BASE_URL}/voice/recording"'
@@ -1150,7 +1330,8 @@ def voice_multi_answer(batch_id: str, lead_id: int):
 
     _finalize_winner(batch_id, batch, lead_id, call_sid)
     caller_id = pick_from_number(batch["winner_phone"])
-    twiml = _conference_twiml(conference, caller_id)
+    twiml = _conference_twiml(conference, caller_id,
+                              live=_live_transcription_twiml(batch_id, lead_id))
     # AMD auto-kill is RETIRED (2026-07-17). Even beep-only detection false-
     # fired on a live human voice ("well you got the wrong—" → killed mid-
     # sentence; 4 real people hung up on across two days). Voicemail skipping
@@ -1216,7 +1397,8 @@ def _declare_winner_via_rest(batch_id: str, batch: dict, lead_id: int, sid: str 
     if sid:
         try:
             twilio.calls(sid).update(
-                twiml=_conference_twiml(conference, caller_id, stop_stream=True))
+                twiml=_conference_twiml(conference, caller_id, stop_stream=True,
+                                        live=_live_transcription_twiml(batch_id, lead_id)))
         except Exception as exc:
             log.warning(f"AMD [{batch_id}] failed to redirect winner {lead_id}: {exc}")
     _finalize_winner(batch_id, batch, lead_id, sid)
@@ -1277,8 +1459,9 @@ def voice_amd_timeout(batch_id: str, lead_id: int):
             # race with this Redirect — return the same conference TwiML.
             conference = batch["conference"]
             phone = batch["winner_phone"]
-            return Response(_conference_twiml(conference, pick_from_number(phone),
-                                              stop_stream=True), mimetype="text/xml")
+            return Response(_conference_twiml(conference, pick_from_number(phone), stop_stream=True,
+                                              live=_live_transcription_twiml(batch_id, lead_id)),
+                            mimetype="text/xml")
         if batch["winner"] is not None:
             return Response(_HANGUP_TWIML, mimetype="text/xml")
         batch["winner"] = lead_id
@@ -1289,7 +1472,9 @@ def voice_amd_timeout(batch_id: str, lead_id: int):
     log.info(f"AMD [{batch_id}] no verdict for lead {lead_id} — failing open to connect")
     _finalize_winner(batch_id, batch, lead_id, call_sid)
     return Response(_conference_twiml(conference, pick_from_number(batch["winner_phone"]),
-                                      stop_stream=True), mimetype="text/xml")
+                                      stop_stream=True,
+                                      live=_live_transcription_twiml(batch_id, lead_id)),
+                    mimetype="text/xml")
 
 
 @app.route("/voice/multi-status/<batch_id>/<int:lead_id>", methods=["POST"])
@@ -1990,6 +2175,17 @@ def softphone_page():
              font-size:12px; font-weight:600; color:#4a5a4e; background:#f2f5f2;
              border:1px solid #dde5de; text-align:center; }
   .poolbar.low  { background:#fff6e6; border-color:#ecd9ae; color:#8a6510; }
+  .live-caps { margin-bottom:8px; padding:8px 10px; border:1px solid #dde5de;
+               border-radius:8px; background:#f7faf7; }
+  .live-caps-title { font-size:11px; font-weight:700; color:#5b6b5f; margin-bottom:4px; }
+  .live-bullets { font-size:12.5px; font-weight:600; color:#2f4a35; white-space:pre-line;
+                  padding:6px 8px; margin-bottom:6px; background:#eaf3ec; border-radius:6px; }
+  .live-lines { max-height:160px; overflow-y:auto; font-size:13px; line-height:1.4; }
+  .live-line { margin:2px 0; }
+  .live-who { font-weight:700; margin-right:4px; }
+  .live-who.them { color:#12508f; }
+  .live-who.you { color:#49764F; }
+  .live-line.partial { color:#8e8e93; font-style:italic; }
   .poolbar.warn { background:#fdecea; border-color:#e5b8b3; color:#a03225; }
 </style>
 </head><body>
@@ -2047,6 +2243,11 @@ def softphone_page():
 </div>
 <div id="liveNotes" style="display:none;margin-top:12px">
   <div class="disp-title">Call notes — available during your call</div>
+  <div id="liveCaps" class="live-caps" style="display:none">
+    <div class="live-caps-title">🎙 Live transcript</div>
+    <div id="liveBullets" class="live-bullets" style="display:none"></div>
+    <div id="liveLines" class="live-lines"></div>
+  </div>
   <textarea id="dispNote" placeholder="Type a quick note about this call…"
             style="width:100%;box-sizing:border-box;min-height:52px;padding:7px 9px;
                    border:1px solid #ccc;border-radius:7px;font-size:13px;
@@ -2786,6 +2987,51 @@ def softphone_page():
   }
   refreshAiNotes();
   setInterval(refreshAiNotes, 15000);
+
+  // ── Live captions: the seller's words as they talk (+ AI bullets) ───────
+  var liveCaps = document.getElementById('liveCaps');
+  var liveLines = document.getElementById('liveLines');
+  var liveBullets = document.getElementById('liveBullets');
+  var liveKey = '';
+  function liveLineEl(line, partial) {
+    var row = document.createElement('div');
+    row.className = 'live-line' + (partial ? ' partial' : '');
+    var who = document.createElement('span');
+    who.className = 'live-who ' + (line.who === 'Them' ? 'them' : 'you');
+    who.textContent = line.who + ':';
+    row.appendChild(who);
+    row.appendChild(document.createTextNode(line.text));
+    return row;
+  }
+  function refreshLiveCaptions() {
+    fetch('/dialer/live-transcript?agent=' + AGENT)
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        if (!j || !j.active) { liveCaps.style.display = 'none'; liveKey = ''; return; }
+        var lines = j.lines || [], partial = j.partial || [];
+        var key = j.lead_id + '|' + lines.length + '|' + JSON.stringify(partial) + '|' + (j.bullets || '');
+        if (key === liveKey) return;            // nothing new: leave scroll position alone
+        liveKey = key;
+        liveCaps.style.display = 'block';
+        liveBullets.style.display = j.bullets ? 'block' : 'none';
+        liveBullets.textContent = j.bullets || '';
+        // Stick to the bottom unless the agent scrolled up to reread.
+        var atBottom = liveLines.scrollHeight - liveLines.scrollTop - liveLines.clientHeight < 24;
+        liveLines.textContent = '';
+        lines.forEach(function(l) { liveLines.appendChild(liveLineEl(l, false)); });
+        partial.forEach(function(l) { liveLines.appendChild(liveLineEl(l, true)); });
+        if (!lines.length && !partial.length) {
+          var wait = document.createElement('div');
+          wait.className = 'live-line partial';
+          wait.textContent = j.ended ? 'Nothing was transcribed on this call.' : 'Listening…';
+          liveLines.appendChild(wait);
+        }
+        if (atBottom) liveLines.scrollTop = liveLines.scrollHeight;
+      })
+      .catch(function() {});
+  }
+  refreshLiveCaptions();
+  setInterval(refreshLiveCaptions, 1000);
 
   function updateTimer() {
     if (!callStart) return;

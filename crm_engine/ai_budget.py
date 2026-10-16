@@ -306,7 +306,8 @@ def run_anthropic(quote: AIQuote | dict, feature: str, system: str,
 # Turning this on in the Dialer is the user's price approval for one call
 # note + one fact extraction per transcribed call, for that day only. The
 # webhook server (a separate process) reads the same file.
-AUTONOTE_FEATURES = ("call_note", "call_facts")
+AUTONOTE_FEATURES = ("call_note", "call_facts", "live_bullets")
+LIVE_BULLET_UPDATES_PER_CALL = 4   # typical; capped at LIVE_BULLETS_MAX in the webhook
 
 
 def _autonotes_path() -> Path:
@@ -339,12 +340,15 @@ def _autonotes_file() -> dict:
 
 
 def autonote_estimate() -> dict:
-    """Conservative per-call price: note + facts on a transcript at the 3,500-char cap."""
-    from .ai_message_generator import prepare_call_facts, prepare_call_note
+    """Conservative per-call price: note + facts on a transcript at the 3,500-char
+    cap, plus the typical number of live bullet refreshes during the call."""
+    from .ai_message_generator import prepare_call_facts, prepare_call_note, prepare_live_bullets
     sample = "x" * 3500
+    requests = [prepare_call_note({}, sample), prepare_call_facts({}, sample)]
+    requests += [prepare_live_bullets({}, sample)] * LIVE_BULLET_UPDATES_PER_CALL
     quotes = [quote_estimate(r["feature"], r["system"], r["messages"], model=r["model"],
                              max_tokens=r["max_tokens"], provider="anthropic")
-              for r in (prepare_call_note({}, sample), prepare_call_facts({}, sample))]
+              for r in requests]
     return {"expected_usd": _money(sum(q.expected_total_usd for q in quotes)),
             "max_usd": _money(sum(q.hard_ceiling_usd for q in quotes))}
 
