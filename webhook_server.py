@@ -262,12 +262,56 @@ def voice_wait_music():
     return Response(twiml, mimetype="text/xml")
 
 
+_MEDIA_URL_RE = re.compile(r"/Messages/((?:MM|SM)[0-9a-f]{32})/Media/(ME[0-9a-f]{32})")
+
+
+def _inbound_media_lines() -> list[str]:
+    """One line per photo/file on an incoming MMS, e.g. "📷 Photo: MM…/ME…".
+    The dashboard turns these into images via /twilio/media (Twilio needs auth)."""
+    lines = []
+    try:
+        count = int(request.form.get("NumMedia", "0") or 0)
+    except ValueError:
+        count = 0
+    for i in range(min(count, 10)):
+        match = _MEDIA_URL_RE.search(request.form.get(f"MediaUrl{i}", ""))
+        if not match:
+            continue
+        kind = (request.form.get(f"MediaContentType{i}", "") or "").lower()
+        label = "📷 Photo" if kind.startswith("image/") else f"📎 File ({kind or 'unknown'})"
+        lines.append(f"{label}: {match.group(1)}/{match.group(2)}")
+    return lines
+
+
+@app.route("/twilio/media/<message_sid>/<media_sid>")
+def serve_media(message_sid, media_sid):
+    """Proxy an MMS photo so the CRM can show it without exposing credentials."""
+    if not (re.fullmatch(r"(?:MM|SM)[0-9a-f]{32}", message_sid)
+            and re.fullmatch(r"ME[0-9a-f]{32}", media_sid)):
+        return Response("Not found", status=404)
+    url = (f"https://api.twilio.com/2010-04-01/Accounts/{ACCOUNT_SID}"
+           f"/Messages/{message_sid}/Media/{media_sid}")
+    try:
+        r = _http.get(url, auth=(ACCOUNT_SID, AUTH_TOKEN), timeout=15)
+        if r.status_code != 200:
+            return Response("Photo unavailable", status=502)
+        return Response(r.content, content_type=r.headers.get("Content-Type", "application/octet-stream"))
+    except Exception as exc:
+        log.warning(f"Failed to proxy media {message_sid}/{media_sid}: {exc}")
+        return Response("Photo unavailable", status=502)
+
+
 @app.route("/twilio/inbound", methods=["POST"])
 def inbound_sms():
     from_raw = request.form.get("From", "")
     body = request.form.get("Body", "").strip()
+    media_lines = _inbound_media_lines()
+    # What the cell alert shows: the words, plus a photo marker instead of SIDs.
+    alert_body = (body + (" 📷" * min(len(media_lines), 3))).strip() or "📷"
+    if media_lines:
+        body = "\n".join([body] + media_lines if body else media_lines)
 
-    log.info(f"Inbound SMS from {from_raw}: {body[:80]}")
+    log.info(f"Inbound SMS from {from_raw}: {alert_body[:80]}")
 
     # Filter Twilio system messages regardless of who sent them
     if "Configure your number" in body or "Reply STOP to unsubscribe" in body:
@@ -290,7 +334,7 @@ def inbound_sms():
         if phone != normalize_phone(MY_CELL_NUMBER):
             threading.Thread(target=_alert_cell, args=(
                 f"sms:{phone}",
-                f"💬 CRM: text from unknown {phone}: \"{body[:120]}\""),
+                f"💬 CRM: text from unknown {phone}: \"{alert_body[:120]}\""),
                 daemon=True).start()
         return _twiml_response()
 
@@ -312,11 +356,11 @@ def inbound_sms():
     if phone != normalize_phone(MY_CELL_NUMBER):
         threading.Thread(target=_alert_cell, args=(
             f"lead:{lead['id']}",
-            f"💬 CRM: {lead['name']} ({lead['status']}) texted: \"{body[:130]}\" "
+            f"💬 CRM: {lead['name']} ({lead['status']}) texted: \"{alert_body[:130]}\" "
             f"— reply from Messages or text them at {lead['phone']}"),
             daemon=True).start()
 
-    log.info(f"Saved inbound text from {lead['name']} ({phone}): {body[:60]}")
+    log.info(f"Saved inbound text from {lead['name']} ({phone}): {alert_body[:60]}")
     return _twiml_response()
 
 

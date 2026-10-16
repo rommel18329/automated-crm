@@ -813,6 +813,28 @@ def completion_counts(call_list: list[dict]) -> tuple[int, int]:
     return completed, remaining
 
 
+_MEDIA_LINE_RE = re.compile(r"^(📷 Photo|📎 File[^:\n]*): ((?:MM|SM)[0-9a-f]{32})/(ME[0-9a-f]{32})$", re.M)
+
+
+def media_preview(text: str) -> str:
+    """Thread-list preview: show '📷 Photo' instead of the stored Twilio IDs."""
+    return _MEDIA_LINE_RE.sub(lambda m: m.group(1), text or "").replace("\n", " ")
+
+
+def render_media(text: str) -> str:
+    """Turn stored MMS lines into images served by the webhook's /twilio/media proxy."""
+    if not _MEDIA_LINE_RE.search(text):
+        return text
+
+    def _one(m):
+        src = f"http://localhost:5001/twilio/media/{m.group(2)}/{m.group(3)}"
+        if m.group(1).startswith("📷"):
+            return (f"<a href='{src}' target='_blank'><img src='{src}' alt='photo' "
+                    f"style='max-width:220px;max-height:260px;border-radius:10px;margin-top:4px'></a>")
+        return f"<a href='{src}' target='_blank'>{m.group(1)}</a>"
+    return _MEDIA_LINE_RE.sub(_one, text).replace("\n", "<br>")
+
+
 def render_imessage(items: list[dict], max_items: int | None = None) -> None:
     if max_items is None:
         max_items = len(items)
@@ -873,7 +895,7 @@ def render_imessage(items: list[dict], max_items: int | None = None) -> None:
         else:
             _gv_badge = ("<span title='Google Voice' style='font-size:0.72rem;"
                          "opacity:.75;margin-right:3px'>📱</span>" if _is_gv else "")
-            label = _gv_badge + _content
+            label = _gv_badge + render_media(_content)
 
         # Audio player for recorded calls / voicemails
         rec_url = msg.get("recording_url") or ""
@@ -1560,6 +1582,7 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
         st.markdown("**Send a Text**")
         if lead.get("phone", "") in _gv_contacts:
             st.markdown(_gv_flag(lead.get("phone", "")), unsafe_allow_html=True)
+        render_move_to_twilio(lead, "lead")
         manual_msg_key = f"manual_text_{lead_id}"
         # An AI draft staged on the previous run lands in the compose box here.
         _staged_lead_draft = st.session_state.pop(f"manual_text_stage_{lead_id}", None)
@@ -1636,10 +1659,13 @@ for _ix in all_interactions:
 result = _build_display_result(all_leads, _ixns_by_lead)
 try:
     from crm_engine.gv_gmail_import import load_gv_contacts, load_reply_addrs, has_reply_addr
-    _gv_contacts = load_gv_contacts()
+    from crm_engine.gv_gmail_import import load_moved_to_twilio
+    # Sellers already moved to Twilio count as Twilio contacts everywhere below.
+    _gv_moved = load_moved_to_twilio()
+    _gv_contacts = load_gv_contacts() - set(_gv_moved)
     _gv_replies = load_reply_addrs()
 except Exception:
-    _gv_contacts, _gv_replies = set(), {}
+    _gv_contacts, _gv_replies, _gv_moved = set(), {}, {}
     has_reply_addr = lambda phone, store=None: False  # noqa: E731
 _GV_OK_FLAG = "<div class='sl-flag' style='border-color:#8e44ad;color:#6c3483;background:#f4ecfa'>📱 <b>Google Voice</b> contact. Texts here send from your Google Voice number, the one they already know.</div>"
 _GV_NONE_FLAG = "<div class='sl-flag' style='border-color:#8e44ad;color:#6c3483;background:#f4ecfa'>📱 <b>Google Voice</b> contact, but no Google Voice text thread on file, so Google Voice can't text them first. Sending will offer your Twilio number instead.</div>"
@@ -1647,6 +1673,41 @@ _GV_NONE_FLAG = "<div class='sl-flag' style='border-color:#8e44ad;color:#6c3483;
 
 def _gv_flag(phone: str) -> str:
     return _GV_OK_FLAG if has_reply_addr(phone, _gv_replies) else _GV_NONE_FLAG
+
+
+def render_move_to_twilio(lead: dict, key_prefix: str) -> None:
+    """Next to every Google Voice seller: a ready text that moves them onto
+    your Twilio number. Sends only when you click; then texts route via Twilio."""
+    phone = lead.get("phone", "")
+    if lead.get("status") in ("dead", "contract"):
+        return
+    if phone in _gv_moved:
+        st.caption(f"📲 Moved to Twilio {_gv_moved[phone][:10]}: texts now go from your Twilio number.")
+        return
+    if phone not in _gv_contacts:
+        return
+    from crm_engine.gv_gmail_import import MOVE_TO_TWILIO_TEXT, send_move_to_twilio
+    from crm_engine.messaging_gateway import _pick_from_number
+    _first = (lead.get("name") or "").split()
+    _first = _first[0] if _first and not any(ch.isdigit() for ch in _first[0]) else "there"
+    if _first.isupper() or _first.islower():
+        _first = _first.capitalize()  # "PAUL" / "paul" -> "Paul"
+    _sender = "Rom" if st.session_state.get("user", "RJ") == "RJ" else "Gabby"
+    _key = f"{key_prefix}_move_twilio_{lead['id']}"
+    with st.container(border=True):
+        st.markdown(f"📲 **Get them off Google Voice.** Send this from your Twilio number "
+                    f"`{_pick_from_number(phone)}` so they save it. After it sends, texts to "
+                    f"them go from Twilio.")
+        st.text_area("Move to Twilio text", key=_key, height=80, label_visibility="collapsed",
+                     value=MOVE_TO_TWILIO_TEXT.format(first=_first, sender=_sender))
+        if st.button("📲 Send from Twilio", key=f"{_key}_send", type="primary",
+                     disabled=not st.session_state.get(_key, "").strip()):
+            with st.spinner("Sending from Twilio..."):
+                _res = send_move_to_twilio(lead["id"], st.session_state[_key].strip())
+            if _res.get("sent"):
+                flag_sent(lead.get("name", ""), st.session_state[_key].strip())
+                st.rerun()
+            st.error(f"❌ NOT sent: {_res.get('error', 'unknown error')}. Still on Google Voice; fix and retry.")
 
 
 def render_gv_fallback(lead_id: int, compose_key: str, lead_name: str, key: str) -> None:
@@ -1825,7 +1886,8 @@ elif page == "dashboard":
         reply_cols = st.columns(min(len(reply_leads), 4))
         for i, r in enumerate(reply_leads[:4]):
             with reply_cols[i]:
-                preview = r["content"][:40] + ("..." if len(r["content"]) > 40 else "")
+                _rc = media_preview(r["content"])
+                preview = _rc[:40] + ("..." if len(_rc) > 40 else "")
                 label = r["name"] + "\n" + preview
                 if st.button(label, key="reply_badge_" + str(r["lead_id"])):
                     nav_to("leads", r["lead_id"])
@@ -2288,6 +2350,7 @@ elif page == "followups":
             _is_gv_lead = lead.get("phone", "") in _gv_contacts
             if _is_gv_lead:
                 st.markdown(_gv_flag(lead.get("phone", "")), unsafe_allow_html=True)
+            render_move_to_twilio(lead, "fu")
             # First text from this number -> the draft must identify the new number.
             _never_texted = not any(
                 h.get("type") == "text" and h.get("direction") == "outbound"
@@ -2603,7 +2666,8 @@ elif page == "messages":
             for _t in _threads:
                 _is_sel = st.session_state["msg_selected_lead"] == _t["lead_id"]
                 _is_unread = _t["lead_id"] in _unread_ids
-                _preview = (_t["last_text"][:48] + "…") if len(_t["last_text"]) > 48 else _t["last_text"]
+                _last_text = media_preview(_t["last_text"])
+                _preview = (_last_text[:48] + "…") if len(_last_text) > 48 else _last_text
                 if _t.get("gv"):
                     _preview = "📱 " + _preview
                 _d, _tm = fmt_date_time(_t["last_ts"])
@@ -2677,6 +2741,7 @@ elif page == "messages":
 
                 # Compose row
                 st.markdown("---")
+                render_move_to_twilio(_sel_lead, "msg")
                 if not any(i.get("type") == "text" and i.get("direction") == "outbound"
                            for i in _convo_items):
                     if _sel_lead["phone"] in _gv_contacts:

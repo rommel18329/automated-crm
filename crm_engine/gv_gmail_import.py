@@ -256,8 +256,50 @@ def _save_contacts(contacts: set) -> None:
         pass
 
 
+# ── Moving Google Voice sellers onto a Twilio number ─────────────────────
+_MOVED = Path(__file__).resolve().parents[1] / "gv_moved.json"
+MOVE_TO_TWILIO_TEXT = ("Hi {first}, it's {sender} with Silverline. I'm moving my texts to this "
+                       "number, so please save it and text me here from now on. Photos of the "
+                       "property come through here too.")
+
+
+def load_moved_to_twilio() -> dict:
+    """{'XXX-XXX-XXXX': ISO time the move text was sent from Twilio}."""
+    try:
+        return json.loads(_MOVED.read_text())
+    except Exception:
+        return {}
+
+
+def mark_moved_to_twilio(phone: str) -> None:
+    moved = load_moved_to_twilio()
+    moved[phone] = datetime.now().astimezone().isoformat(timespec="seconds")
+    tmp = _MOVED.with_suffix(".tmp")
+    tmp.write_text(json.dumps(moved, indent=1, sort_keys=True))
+    tmp.replace(_MOVED)
+
+
+def send_move_to_twilio(lead_id: int, body: str, db_path=db.DB_PATH) -> dict:
+    """Send the switch text from Twilio (never Google Voice). Once it is sent,
+    this lead's future texts route through Twilio. Manual click only."""
+    from .messaging_gateway import send_sms, _pick_from_number
+    lead = db.fetch_lead(lead_id, db_path)
+    if not lead:
+        return {"sent": False, "error": "lead not found"}
+    result = send_sms(lead_id, body, db_path)
+    if result.get("sent"):
+        mark_moved_to_twilio(lead["phone"])
+        db.add_interaction(
+            lead_id, "note",
+            f"📲 Moved to Twilio: sent the switch text from {_pick_from_number(lead['phone'])}. "
+            "Texts to this lead now go from Twilio.",
+            "outbound", db_path)
+    return result
+
+
 def is_gv_contact(phone: str) -> bool:
-    return bool(phone) and phone in load_gv_contacts()
+    """Texts to this contact go from Google Voice (not yet moved to Twilio)."""
+    return bool(phone) and phone in load_gv_contacts() and phone not in load_moved_to_twilio()
 
 
 def _fmt_phone(digits: str) -> str | None:
@@ -515,11 +557,12 @@ def route_text(lead_id: int, body: str, db_path=db.DB_PATH) -> dict:
     """Send a text the way this lead knows us: Google Voice contacts get it from
     the Google Voice number (if they have a thread); everyone else from Twilio.
     Never falls back to Twilio on its own -- a GV contact with no thread comes
-    back as {"sent": False, "no_gv_thread": True} so the user decides."""
+    back as {"sent": False, "no_gv_thread": True} so the user decides.
+    Contacts already moved to Twilio (send_move_to_twilio) text from Twilio."""
     lead = db.fetch_lead(lead_id, db_path)
     if not lead:
         return {"sent": False, "error": "lead not found"}
-    if lead.get("phone") in load_gv_contacts():
+    if lead.get("phone") in load_gv_contacts() and lead.get("phone") not in load_moved_to_twilio():
         return send_gv(lead_id, body, db_path)
     from .messaging_gateway import send_sms
     return send_sms(lead_id, body, db_path)
