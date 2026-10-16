@@ -16,7 +16,7 @@ from crm_engine import db, engine
 from crm_engine.followup_engine import generate_followup_message, prepare_followup_request
 from crm_engine.messaging_gateway import send_sms, place_call, place_call_number
 from crm_engine.dialer_import import parse_contacts, prepare_import
-from crm_engine.ai_ui import priced_action, budget_panel
+from crm_engine.ai_ui import priced_action, budget_panel, autonotes_control
 from crm_engine import caller_id_pool
 from crm_engine import buyer_match
 from crm_engine.email_ui import render_email_review, catch_up_if_due
@@ -2171,7 +2171,7 @@ elif page == "followups":
     if _session_ai_cost > 0:
         st.caption(f"🤖 AI cost this session: **${_session_ai_cost:.4f}** "
                    f"(Claude Haiku 5.5 — resets when you restart the app)")
-    st.caption("AI drafts only run when you click ✨ Draft / Regenerate and approve the price.")
+    st.caption("AI drafts only run when you click ✨ Draft / Regenerate and say yes to the cost.")
     overdue_only = st.session_state.get("followup_overdue_only", False)
     queue = result["followup_queue"]
 
@@ -3148,6 +3148,9 @@ elif page == "dialer":
                                    key="dialer_lines_slider")
                 st.session_state["dialer_lines"] = _lines
 
+            # One switch before dialing covers AI notes for every call (with a running count).
+            autonotes_control()
+
             if _is_browser and _browser_ready:
                 # AMD auto-kill retired 2026-07-17: even beep-only detection
                 # hung up on a live person mid-sentence. Instant connect stays;
@@ -3315,6 +3318,11 @@ elif page == "dialer":
                 nav_to("Leads", lead_id)
         else:
             # ── On-call view ──────────────────────────────────────────────
+            from crm_engine.ai_budget import autonotes_status as _ai_notes_status
+            _ains = _ai_notes_status()
+            if _ains["active"]:
+                st.caption(f"🤖 AI call notes on · {_ains['notes']} noted · "
+                           f"\\${_ains['cost_usd']:.4f} so far")
             _batch_id = st.session_state.get("dialer_batch_id")
             _winner_id = None
             _winner_name = ""

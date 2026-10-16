@@ -302,6 +302,86 @@ def run_anthropic(quote: AIQuote | dict, feature: str, system: str,
     return response
 
 
+# ── Dial-session AI call notes ────────────────────────────────────────────
+# Turning this on in the Dialer is the user's price approval for one call
+# note + one fact extraction per transcribed call, for that day only. The
+# webhook server (a separate process) reads the same file.
+AUTONOTE_FEATURES = ("call_note", "call_facts")
+
+
+def _autonotes_path() -> Path:
+    return LOCAL / "autonotes.json"
+
+
+def _today_local() -> str:
+    return datetime.now().astimezone().date().isoformat()
+
+
+def set_autonotes(enabled: bool) -> dict:
+    """Turning on starts a fresh running count; turning off keeps the last count."""
+    state = {"enabled": bool(enabled), "day": _today_local(),
+             "started_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+    if not enabled:
+        state["started_at"] = _autonotes_file().get("started_at", state["started_at"])
+    with _lock:
+        LOCAL.mkdir(parents=True, exist_ok=True)
+        tmp = _autonotes_path().with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        tmp.replace(_autonotes_path())
+    return autonotes_status()
+
+
+def _autonotes_file() -> dict:
+    try:
+        return json.loads(_autonotes_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def autonote_estimate() -> dict:
+    """Conservative per-call price: note + facts on a transcript at the 3,500-char cap."""
+    from .ai_message_generator import prepare_call_facts, prepare_call_note
+    sample = "x" * 3500
+    quotes = [quote_estimate(r["feature"], r["system"], r["messages"], model=r["model"],
+                             max_tokens=r["max_tokens"], provider="anthropic")
+              for r in (prepare_call_note({}, sample), prepare_call_facts({}, sample))]
+    return {"expected_usd": _money(sum(q.expected_total_usd for q in quotes)),
+            "max_usd": _money(sum(q.hard_ceiling_usd for q in quotes))}
+
+
+def autonotes_status() -> dict:
+    """Is the switch on today, and the running count since it was turned on."""
+    state = _autonotes_file()
+    active = bool(state.get("enabled")) and state.get("day") == _today_local()
+    started = state.get("started_at")
+    notes, cost = 0, 0.0
+    if started:
+        since = datetime.fromisoformat(started)
+        for row in usage_rows():
+            if row.get("feature") not in AUTONOTE_FEATURES or row.get("status") != "success":
+                continue
+            try:
+                if datetime.fromisoformat(row["timestamp"]) < since:
+                    continue
+            except (KeyError, ValueError):
+                continue
+            notes += row["feature"] == "call_note"
+            cost += float(row.get("cost_usd", 0))
+    remaining = usage_summary()["remaining_usd"]
+    per_call = autonote_estimate()
+    return {"active": active, "started_at": started, "notes": notes, "cost_usd": _money(cost),
+            "per_call_usd": per_call["expected_usd"], "per_call_max_usd": per_call["max_usd"],
+            "limit_reached": active and remaining < per_call["max_usd"]}
+
+
+def auto_approve(request: dict, client=None) -> AIQuote | None:
+    """A quote for one call-note request, only while the dial-session switch is on.
+    The run itself still goes through run_anthropic's checks and the daily limit."""
+    if request.get("feature") not in AUTONOTE_FEATURES or not autonotes_status()["active"]:
+        return None
+    return quote_request(request, client=client)
+
+
 def quote_lines(quote: AIQuote | dict) -> list[str]:
     q = AIQuote.from_value(quote)
     source = "provider count" if q.counted_by_provider else "conservative local estimate"

@@ -549,9 +549,54 @@ def voice_transcript():
     return ("", 204)
 
 
+def _auto_call_notes(lead_id: int, text: str) -> None:
+    """AI call note + call facts for one transcript, only while the Dialer's
+    "AI call notes" switch is on (turning it on is the price approval). Every
+    call still goes through the ledger and the daily limit. Best-effort: never
+    blocks or fails the transcript save."""
+    from crm_engine import ai_budget
+    from crm_engine.ai_message_generator import (extract_call_facts, generate_call_note,
+                                                 prepare_call_facts, prepare_call_note)
+    try:
+        if not ai_budget.autonotes_status()["active"]:
+            return
+        lead = db.fetch_lead(lead_id, DB_PATH) or {}
+        request = prepare_call_note(lead, text)
+        note = generate_call_note(lead, text, approval=ai_budget.auto_approve(request), prepared=request)
+        if note:
+            db.add_interaction(lead_id, "note", "🤖 " + note, "outbound",
+                               DB_PATH, ts=datetime.utcnow())
+            log.info(f"Saved AI call note for lead {lead_id}")
+    except Exception as exc:
+        log.warning(f"AI call note failed for lead {lead_id}: {exc}")
+    # Structured extraction: update motivation from what THEY actually said,
+    # and log the concrete facts.
+    try:
+        if not ai_budget.autonotes_status()["active"]:
+            return
+        lead = db.fetch_lead(lead_id, DB_PATH)
+        request = prepare_call_facts(lead or {}, text)
+        facts = extract_call_facts(lead or {}, text, approval=ai_budget.auto_approve(request),
+                                   prepared=request)
+        ms = facts.get("motivation_score")
+        fact_line = (facts.get("facts") or "").strip()
+        parts = []
+        if isinstance(ms, int) and 1 <= ms <= 10 and lead and ms != lead.get("motivation_score"):
+            db.update_lead(lead_id, {"motivation_score": ms}, DB_PATH)
+            parts.append(f"motivation {lead.get('motivation_score')}→{ms}")
+        if fact_line:
+            parts.append(fact_line)
+        if parts:
+            db.add_interaction(lead_id, "note", "📊 From the call: " + " · ".join(parts),
+                               "outbound", DB_PATH, ts=datetime.utcnow())
+            log.info(f"Extracted call facts for lead {lead_id}: {parts}")
+    except Exception as exc:
+        log.warning(f"Call fact extraction failed for lead {lead_id}: {exc}")
+
+
 def _save_transcript(transcript_sid: str) -> None:
     """Fetch a completed transcript's sentences, assemble readable text, and
-    log the raw transcript on the lead. AI analysis is a manual priced action."""
+    log the raw transcript on the lead (+ AI notes when the Dialer switch is on)."""
     try:
         from twilio.rest import Client as TwilioClient
         twilio = TwilioClient(ACCOUNT_SID, AUTH_TOKEN)
@@ -578,6 +623,7 @@ def _save_transcript(transcript_sid: str) -> None:
         db.add_interaction(lead_id, "note", "📝 Call transcript:\n" + text[:4000],
                            "outbound", DB_PATH, ts=datetime.utcnow())
         log.info(f"Saved transcript {transcript_sid} to lead {lead_id} ({len(text)} chars)")
+        _auto_call_notes(lead_id, text)
     except Exception as exc:
         log.warning(f"Saving transcript {transcript_sid} failed: {exc}")
 
@@ -1694,6 +1740,13 @@ def dialer_queue_status():
                           "amd": q["amd"]}))
 
 
+@app.route("/dialer/ai-notes-status")
+def dialer_ai_notes_status():
+    """Running count for the softphone's AI call notes bar."""
+    from crm_engine import ai_budget
+    return _cors(jsonify(ai_budget.autonotes_status()))
+
+
 @app.route("/dialer/pool-status")
 def dialer_pool_status():
     """Caller ID pool health for the softphone bar: capacity used/left today,
@@ -1828,6 +1881,7 @@ def softphone_page():
   </span>
 </div>
 <div class="poolbar" id="poolBar" title="Caller ID pool: today's call volume vs the spam-safe caps (limits shared by Rom and Gabby; per-number limits ramp with usage). Dialing hard-stops at the cap."></div>
+<div class="poolbar" id="aiBar" title="AI call notes: turned on in the CRM Dialer before dialing. Each answered, transcribed call gets an AI note; this is the running count and cost since you turned it on."></div>
 <div class="buttons">
   <button class="btn btn-call" id="btnCall" disabled>📞 Call</button>
   <button class="btn btn-mute" id="btnMute" disabled>🔇 Mute</button>
@@ -2567,6 +2621,29 @@ def softphone_page():
   }
   refreshPool();
   setInterval(refreshPool, 30000);
+
+  // ── AI call notes bar: running count while the Dialer switch is on ─────
+  var aiBar = document.getElementById('aiBar');
+  function refreshAiNotes() {
+    fetch('/dialer/ai-notes-status')
+      .then(function(r) { return r.json(); })
+      .then(function(a) {
+        if (!a || !a.active) { aiBar.style.display = 'none'; return; }
+        aiBar.style.display = 'block';
+        var txt = '🤖 AI notes on · ' + a.notes + (a.notes === 1 ? ' call' : ' calls') +
+                  ' · $' + Number(a.cost_usd).toFixed(4);
+        if (a.limit_reached) {
+          aiBar.className = 'poolbar warn';
+          aiBar.textContent = txt + ' — daily AI limit reached, notes paused';
+        } else {
+          aiBar.className = 'poolbar';
+          aiBar.textContent = txt;
+        }
+      })
+      .catch(function() {});
+  }
+  refreshAiNotes();
+  setInterval(refreshAiNotes, 15000);
 
   function updateTimer() {
     if (!callStart) return;

@@ -1,15 +1,16 @@
-"""Streamlit price-approval step for every paid AI action.
+"""Streamlit "this will use about $X of AI credit, OK?" step for every paid AI action.
 
-The first click prices the exact prompt with Anthropic's free token counter.
-The second click runs it with that quote. Nothing paid runs without the
-second click, and ai_budget refuses a call whose prompt changed after pricing.
+Clicking an AI button prices the exact prompt with Anthropic's free token
+counter and asks. Yes runs it with that quote; No runs nothing. ai_budget
+refuses a call whose prompt changed after pricing.
 """
 from __future__ import annotations
 
 import streamlit as st
 
-from crm_engine.ai_budget import (AIApprovalError, AIBudgetError, AIQuote, daily_limit,
-                                  quote_lines, quote_request, set_daily_limit, usage_summary)
+from crm_engine.ai_budget import (AIApprovalError, AIBudgetError, AIQuote, autonotes_status,
+                                  daily_limit, quote_lines, quote_request, set_autonotes,
+                                  set_daily_limit, usage_summary)
 
 
 def _is_request(value) -> bool:
@@ -36,11 +37,11 @@ def priced_action(key: str, label: str, prepare, run, *, area=None, help: str | 
     state_key = f"{key}__ai_quote"
     pending = st.session_state.get(state_key)
     if pending is None:
-        if area.button(button_label or f"{label} · check price", key=f"{key}__price", type=button_type,
+        if area.button(button_label or label, key=f"{key}__price", type=button_type,
                        use_container_width=use_container_width,
-                       help=help or "Counts tokens for free and shows the price. Nothing paid runs yet."):
+                       help=help or "Shows what it will cost and asks before using AI credit."):
             try:
-                with st.spinner("Pricing…"):
+                with st.spinner("Checking the cost…"):
                     prepared = prepare()
                     if isinstance(prepared, list) and prepared and all(_is_request(r) for r in prepared):
                         quotes = [quote_request(r).to_dict() for r in prepared]
@@ -60,19 +61,19 @@ def priced_action(key: str, label: str, prepare, run, *, area=None, help: str | 
     expected = sum(q.expected_total_usd for q in quotes)
     remaining = usage_summary()["remaining_usd"]
     box = st.container(border=True)
-    calls = f" across {len(quotes)} calls" if len(quotes) > 1 else ""
-    box.markdown(f"**🤖 {label}**: expected **{_usd(expected)}**, max **{_usd(ceiling)}**{calls}")
-    box.caption(f"{_usd(remaining)} left of today's {_usd(daily_limit(), 2)} AI limit. This prices the content "
-                "as it was when you clicked. If you changed it, cancel and check the price again.")
-    with box.expander("Price details"):
+    calls = f" across {len(quotes)} AI calls" if len(quotes) > 1 else ""
+    box.markdown(f"🤖 **{label}** will use about **{_usd(expected)}** of AI credit"
+                 f" (at most {_usd(ceiling)}){calls}. OK?")
+    box.caption(f"{_usd(remaining)} left of today's {_usd(daily_limit(), 2)} AI limit.")
+    with box.expander("Cost details"):
         for q in quotes:
             for line in quote_lines(q):
                 st.caption(line.replace("$", "\\$"))
     over = ceiling > remaining + 1e-9
     if over:
-        box.warning("This would go over today's AI limit. Raise it under AI spend in the sidebar, or cancel.")
+        box.warning("This would go over today's AI limit. Raise it under AI spend in the sidebar, or say no.")
     approve_col, cancel_col = box.columns(2)
-    if approve_col.button(f"Approve & run (max {_usd(ceiling)})", key=f"{key}__approve",
+    if approve_col.button("Yes", key=f"{key}__approve",
                           type="primary", disabled=over, use_container_width=True):
         st.session_state.pop(state_key, None)
         approval = quotes if isinstance(pending["prepared"], list) else quotes[0]
@@ -82,10 +83,49 @@ def priced_action(key: str, label: str, prepare, run, *, area=None, help: str | 
         except (AIApprovalError, AIBudgetError) as exc:
             box.error(str(exc).replace("$", "\\$"))
             return None
-    if cancel_col.button("Cancel", key=f"{key}__cancel", use_container_width=True):
+    if cancel_col.button("No", key=f"{key}__cancel", use_container_width=True):
         st.session_state.pop(state_key, None)
         st.rerun()
     return None
+
+
+def autonotes_control() -> None:
+    """Dialer switch: one approval covers AI notes on every transcribed call
+    until it's turned off (or midnight), with a running count."""
+    status = autonotes_status()
+    if status["active"]:
+        info_col, off_col = st.columns([4, 1])
+        line = (f"🤖 AI call notes ON · {status['notes']} "
+                f"{'call' if status['notes'] == 1 else 'calls'} noted · {_usd(status['cost_usd'])} so far")
+        if status["limit_reached"]:
+            info_col.warning(line + " · daily AI limit reached, notes paused")
+        else:
+            info_col.success(line)
+        if off_col.button("Turn off", key="autonotes_off", use_container_width=True):
+            set_autonotes(False)
+            st.rerun()
+        return
+    if not st.session_state.get("autonotes_confirm"):
+        if st.button("🤖 Turn on AI call notes", key="autonotes_on",
+                     help="Each answered call's transcript gets an AI note plus the facts they said."):
+            st.session_state["autonotes_confirm"] = True
+            st.rerun()
+        return
+    summary = usage_summary()
+    box = st.container(border=True)
+    box.markdown(f"**AI call notes will use about {_usd(status['per_call_usd'])} per answered call** "
+                 f"(at most {_usd(status['per_call_max_usd'])}), about "
+                 f"{_usd(status['per_call_usd'] * 100, 2)} per 100 calls. OK?")
+    box.caption(f"Stays on until you turn it off or midnight. Pauses by itself at today's "
+                f"{_usd(summary['daily_limit_usd'], 2)} AI limit ({_usd(summary['remaining_usd'])} left).")
+    yes_col, no_col = box.columns(2)
+    if yes_col.button("Yes, turn on", key="autonotes_yes", type="primary", use_container_width=True):
+        st.session_state.pop("autonotes_confirm", None)
+        set_autonotes(True)
+        st.rerun()
+    if no_col.button("No", key="autonotes_no", use_container_width=True):
+        st.session_state.pop("autonotes_confirm", None)
+        st.rerun()
 
 
 def budget_panel() -> None:
