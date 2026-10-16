@@ -157,6 +157,19 @@ class ContextIndex:
             # Only explicitly recorded contact-email fields, not arbitrary quoted addresses.
             for value in re.findall(r'(?i)Email:\s*([\w.+-]+@[\w.-]+\.[A-Za-z]{2,})', lead.get('timeline') or ''):
                 self.email_leads.setdefault(value.lower(), set()).add(lead['id'])
+        # An address that the contact explicitly sends in an inbound text is
+        # direct identity evidence for that lead. Outbound text and notes are
+        # excluded because they can quote an unrelated address.
+        for row in local['interactions']:
+            if row.get('direction') != 'inbound' or row.get('type') != 'text':
+                continue
+            if row.get('lead_id') not in self.leads:
+                continue
+            for value in EMAIL_RE.findall(row.get('content') or ''):
+                value = value.lower()
+                if value == MAILBOX or value.endswith('@txt.voice.google.com'):
+                    continue
+                self.email_leads.setdefault(value, set()).add(row['lead_id'])
         self.events = list(events)
         for row in local['interactions']:
             lead = self.leads.get(row['lead_id'])
