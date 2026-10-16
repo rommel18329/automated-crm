@@ -17,6 +17,7 @@ from crm_engine.followup_engine import generate_followup_message, prepare_follow
 from crm_engine.messaging_gateway import send_sms, place_call, place_call_number
 from crm_engine.dialer_import import parse_contacts, prepare_import
 from crm_engine.ai_ui import priced_action, budget_panel, autonotes_control
+from crm_engine.list_health import list_health
 from crm_engine import caller_id_pool
 from crm_engine import buyer_match
 from crm_engine.email_ui import render_email_review, catch_up_if_due
@@ -3046,6 +3047,8 @@ elif page == "dialer":
                     if new_ids:
                         _new_list_id = db.create_dial_list(_list_name)
                         db.add_list_members(_new_list_id, new_ids)
+                        if not queue:  # the dialer is now working exactly this list
+                            st.session_state["dialer_list"] = {"id": _new_list_id, "name": _list_name}
                     st.session_state["dialer_queue"] = queue + new_ids
                     st.session_state["dialer_idx"] = len(queue)   # jump to first new lead
                     st.session_state["dialer_on_call"] = False
@@ -3089,8 +3092,11 @@ elif page == "dialer":
             with _lc1:
                 st.markdown(f"**{_dl['name']}**")
                 _created = _dl["created_at"][:10] if _dl.get("created_at") else ""
-                st.caption(f"📇 {_dl['contacts']} contacts · ✅ {_dl['dialed']} dialed · "
-                           f"⏳ {_dl['remaining']} left · {_created}")
+                st.caption(f"📇 {_dl['contacts']} contacts · 📞 {_dl['dialed']} dialed · "
+                           f"🗣 {_dl['reached']} reached · ⏳ {_dl['remaining']} never dialed · "
+                           f"🔁 avg {_dl['avg_tries']} tries · {_created}")
+                for _alert in list_health(_dl["id"], _dl["name"])["alerts"]:
+                    (st.error if _alert["level"] == "dry" else st.warning)(_alert["message"])
             with _lc2:
                 _rn_key = f"rename_val_{_dl['id']}"
                 st.text_input("Rename", value=_dl["name"], key=_rn_key,
@@ -3102,6 +3108,7 @@ elif page == "dialer":
                 if st.button("▶ Start dialing", key=f"start_list_{_dl['id']}", type="primary"):
                     _ids = db.fetch_list_lead_ids(_dl["id"])
                     st.session_state["dialer_queue"] = _ids
+                    st.session_state["dialer_list"] = {"id": _dl["id"], "name": _dl["name"]}
                     st.session_state["dialer_idx"] = 0
                     st.session_state["dialer_on_call"] = False
                     st.session_state["dialer_batch_id"] = None
@@ -3216,6 +3223,12 @@ elif page == "dialer":
             # One switch before dialing covers AI notes for every call (with a running count).
             autonotes_control()
 
+            # Is the saved list being dialed running low / dry / bad?
+            _dlist = st.session_state.get("dialer_list")
+            if _dlist:
+                for _alert in list_health(_dlist["id"], _dlist["name"])["alerts"]:
+                    (st.error if _alert["level"] == "dry" else st.warning)(_alert["message"])
+
             if _is_browser and _browser_ready:
                 # AMD auto-kill retired 2026-07-17: even beep-only detection
                 # hung up on a live person mid-sentence. Instant connect stays;
@@ -3265,6 +3278,11 @@ elif page == "dialer":
                     # scripts, and window.open from a real click passes blockers.
                     _lead_js = "[" + ",".join(str(int(l)) for l in _remaining) + "]"
                     _amd_js = "true" if _amd_on else "false"
+                    # Which saved list this is, so the server can warn when it runs dry.
+                    import json as _json
+                    _dlist = st.session_state.get("dialer_list") or {}
+                    _list_id_js = str(int(_dlist["id"])) if _dlist.get("id") else "null"
+                    _list_name_js = _json.dumps(_dlist.get("name", "")).replace("<", "\\u003c")
                     _lines_word = "line" if _batch_size == 1 else "lines"
                     components.html(f"""
 <style>
@@ -3288,7 +3306,8 @@ elif page == "dialer":
     fetch('{_base_url}/dialer/queue/start', {{
       method: 'POST',
       body: JSON.stringify({{agent: '{_agent}', lead_ids: {_lead_js},
-                             lines: {_batch_size}, amd: {_amd_js}}})
+                             lines: {_batch_size}, amd: {_amd_js},
+                             list_id: {_list_id_js}, list_name: {_list_name_js}}})
     }})
     .then(function(r) {{ return r.json(); }})
     .then(function(j) {{

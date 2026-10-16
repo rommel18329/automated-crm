@@ -799,6 +799,35 @@ def _mark_resolved(batch: dict, lead_id: int) -> None:
 
 
 _TERMINAL_CALL_STATES = {"completed", "busy", "no-answer", "failed", "canceled"}
+_AUTO_LINE_OUTCOMES = {"no-answer": "No Answer (auto)", "busy": "Busy (auto)",
+                       "failed": "Failed (auto)"}
+
+
+def _record_line_outcome(batch: dict, lead_id: int, state: str) -> None:
+    """Save what happened on a multi-line batch line nobody worked, so list
+    counts, the same-day redial guard and list-dry alerts see every dial.
+    The winner is logged by the agent's disposition (or AMD), and a line
+    canceled because another line won is re-queued, so neither is logged here.
+    Idempotent per line. Caller must NOT hold _batch_lock (this writes the DB)."""
+    with _batch_lock:
+        logged = batch.setdefault("logged_outcomes", set())
+        if lead_id in logged or lead_id == batch.get("winner") or lead_id in batch.get("machines", []):
+            return
+        if state in _AUTO_LINE_OUTCOMES:
+            label = _AUTO_LINE_OUTCOMES[state]
+        elif state == "completed" and batch.get("winner") is not None:
+            label = db.CUT_OFF_DISPOSITION   # picked up after another line won
+        else:
+            return
+        logged.add(lead_id)
+        frm = batch.get("from_numbers", {}).get(lead_id)
+    try:
+        lead = db.fetch_lead(lead_id, DB_PATH) or {}
+        db.log_disposition(lead_id, label, source="auto", agent=batch.get("agent"),
+                           batch_id=batch.get("batch_id"), from_number=frm,
+                           to_number=lead.get("phone"), db_path=DB_PATH)
+    except Exception as exc:
+        log.warning(f"Multi [{batch.get('batch_id')}] could not log {label} for lead {lead_id}: {exc}")
 
 
 def _reconcile_batch(batch_id: str, twilio, first_wait: float = 40, step: float = 10,
@@ -831,6 +860,7 @@ def _reconcile_batch(batch_id: str, twilio, first_wait: float = 40, step: float 
                         log.info(f"Multi [{batch_id}] reconcile: lead {lid} was {state} "
                                  f"(status callback never arrived)")
                     _mark_resolved(batch, lid)
+                _record_line_outcome(batch, lid, state)
         with _batch_lock:
             if batch["status"] not in ("waiting_agent", "ringing"):
                 return
@@ -1274,6 +1304,8 @@ def voice_multi_status(batch_id: str, lead_id: int):
             _mark_resolved(batch, lead_id)
             if batch["status"] == "no_answer":
                 log.info(f"Multi [{batch_id}] all lines resolved — no one answered")
+    if batch:
+        _record_line_outcome(batch, lead_id, call_status)
     return ("", 204)
 
 
@@ -1702,9 +1734,52 @@ def _requeue_leads(agent: str, lead_ids: list[int]) -> None:
     _save_queues()
 
 
+_LIST_ALERT_STATE = PROJECT_ROOT / "list_alert_state.json"
+_list_health_cache: dict[int, tuple[float, dict]] = {}
+
+
+def _list_health(list_id, name: str = "") -> dict | None:
+    """Low / dry / bad status for the saved list a queue is working (30s cache)."""
+    if not list_id:
+        return None
+    hit = _list_health_cache.get(list_id)
+    if hit and time.time() - hit[0] < 30:
+        return hit[1]
+    from crm_engine import list_health
+    health = list_health.list_health(list_id, name, DB_PATH)
+    _list_health_cache[list_id] = (time.time(), health)
+    return health
+
+
+def _maybe_alert_list(q: dict | None) -> None:
+    """Text the user's cell once per list, per alert, per day when the list
+    they're dialing runs low, runs dry or looks bad. Never blocks dialing."""
+    try:
+        health = _list_health((q or {}).get("list_id"), (q or {}).get("list_name", ""))
+        if not health or not health["alerts"]:
+            return
+        try:
+            sent = json.loads(_LIST_ALERT_STATE.read_text())
+        except Exception:
+            sent = {}
+        today = db.crm_today().isoformat()
+        for alert in health["alerts"]:
+            key = f"{health['list_id']}:{alert['level']}"
+            if sent.get(key) == today:
+                continue
+            sent[key] = today
+            _LIST_ALERT_STATE.write_text(json.dumps(sent, indent=1))
+            threading.Thread(target=_alert_cell, args=(f"list:{key}", "📞 CRM: " + alert["message"]),
+                             daemon=True).start()
+            log.info(f"List alert ({key}): {alert['message']}")
+    except Exception as exc:
+        log.warning(f"List health check failed: {exc}")
+
+
 def _queue_next(agent: str) -> dict:
     """Claim the next batch off the agent's queue and fire it."""
     q = _dial_queues.get(agent)
+    _maybe_alert_list(q)
     if not q or not q["pending"]:
         _dial_queues.pop(agent, None)
         return {"done": True, "remaining": 0}
@@ -1755,6 +1830,11 @@ def dialer_queue_start():
         return _cors(jsonify({"error": "a batch is already ringing — finish or end it first"})), 409
     _dial_queues[agent] = {"pending": lead_ids, "total": len(lead_ids),
                            "lines": lines, "amd": bool(data.get("amd", True))}
+    try:  # which saved list this is, for list-dry alerts (None for a one-off import)
+        _dial_queues[agent]["list_id"] = int(data["list_id"]) if data.get("list_id") else None
+    except (TypeError, ValueError):
+        _dial_queues[agent]["list_id"] = None
+    _dial_queues[agent]["list_name"] = str(data.get("list_name") or "")[:80]
     result = _queue_next(agent)
     _save_queues()
     log.info(f"Queue [{agent}]: loaded {len(lead_ids)} leads × {lines} lines")
@@ -1779,9 +1859,14 @@ def dialer_queue_status():
     q = _dial_queues.get(agent)
     if not q:
         return _cors(jsonify({"active": False}))
+    try:
+        health = _list_health(q.get("list_id"), q.get("list_name", ""))
+    except Exception:
+        health = None
     return _cors(jsonify({"active": True, "remaining": len(q["pending"]),
                           "total": q["total"], "lines": q["lines"],
-                          "amd": q["amd"]}))
+                          "amd": q["amd"],
+                          "list_alerts": health["alerts"] if health else []}))
 
 
 @app.route("/dialer/ai-notes-status")
@@ -1925,6 +2010,7 @@ def softphone_page():
   </span>
 </div>
 <div class="poolbar" id="poolBar" title="Caller ID pool: today's call volume vs the spam-safe caps (limits shared by Rom and Gabby; per-number limits ramp with usage). Dialing hard-stops at the cap."></div>
+<div class="poolbar" id="listBar" title="Health of the saved list you're dialing: running low, dry (every lead tried 3+ times or finished), or bad (too many failed / wrong numbers)."></div>
 <div class="poolbar" id="aiBar" title="AI call notes: turned on in the CRM Dialer before dialing. Each answered, transcribed call gets an AI note; this is the running count and cost since you turned it on."></div>
 <div class="buttons">
   <button class="btn btn-call" id="btnCall" disabled>📞 Call</button>
@@ -2425,6 +2511,17 @@ def softphone_page():
     scheduleNext(1500, 'Resuming queue');
   }
 
+  // List running low / dry / bad: the same alerts the CRM texts to your cell.
+  var listBar = document.getElementById('listBar');
+  function updateListBar(alerts) {
+    if (!listBar) return;
+    if (!alerts.length) { listBar.style.display = 'none'; return; }
+    var dry = alerts.some(function(a) { return a.level === 'dry'; });
+    listBar.style.display = 'block';
+    listBar.className = 'poolbar ' + (dry ? 'warn' : 'low');
+    listBar.textContent = alerts.map(function(a) { return a.message; }).join('  ·  ');
+  }
+
   function refreshQueue() {
     fetch('/dialer/queue/status?agent=' + AGENT)
       .then(function(r) { return r.json(); })
@@ -2432,6 +2529,7 @@ def softphone_page():
         queueActive = !!j.active;
         if (j.active) { queueRemaining = j.remaining; queueTotal = j.total; }
         updateQueueBar();
+        updateListBar(j.list_alerts || []);
         maybeAutoResume();
       })
       .catch(function() {});

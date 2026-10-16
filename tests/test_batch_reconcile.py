@@ -1,5 +1,17 @@
 """Multi-line batches must close even when Twilio status callbacks are lost."""
+import pytest
+
 import webhook_server as ws
+from crm_engine import db
+
+
+@pytest.fixture(autouse=True)
+def isolated_db(tmp_path, monkeypatch):
+    # The reconciler now logs each line's outcome; keep that out of the real crm.db.
+    path = tmp_path / "crm.db"
+    db.init_db(path)
+    monkeypatch.setattr(ws, "DB_PATH", path)
+    return path
 
 
 class _Call:
@@ -42,13 +54,16 @@ def test_mark_resolved_is_idempotent():
     assert b["status"] == "no_answer"
 
 
-def test_lost_callbacks_are_reconciled_from_twilio():
+def test_lost_callbacks_are_reconciled_from_twilio(isolated_db):
     # Today's case: 10 lines, 7 callbacks arrived, 3 lost.
     b = _batch(10, resolved=range(1, 8))
     tw = _FakeTwilio({f"CA{i}": "no-answer" for i in range(1, 11)})
     ws._reconcile_batch("t", tw, sleep=lambda s: None)
     assert b["status"] == "no_answer" and b["resolved_count"] == 10
     assert sorted(tw.fetched) == ["CA10", "CA8", "CA9"]   # only the missing ones
+    with db.get_conn(isolated_db) as conn:              # and their dials are recorded
+        logged = sorted((r["lead_id"], r["disposition"]) for r in conn.execute("SELECT * FROM dispositions"))
+    assert logged == [(8, "No Answer (auto)"), (9, "No Answer (auto)"), (10, "No Answer (auto)")]
 
 
 def test_cap_closes_batch_even_if_twilio_says_in_progress():

@@ -1413,47 +1413,96 @@ def add_list_members(list_id: int, lead_ids: Iterable[int], db_path: Path = DB_P
         )
 
 
-def fetch_dial_lists(db_path: Path = DB_PATH) -> list[dict[str, Any]]:
-    """Return each list with contact/dialed/remaining counts. 'dialed' = members
-    whose lead has advanced past 'not_contacted' (i.e., actually worked)."""
+# Multi-line dialer outcomes logged automatically for lines nobody worked
+# (webhook voice_multi_status). A line someone picked up after another line
+# had already won is re-queued, so it never counts as a try or as dialed today.
+CUT_OFF_DISPOSITION = "Picked up, cut off (auto)"
+NOT_A_TRY = ("(status only)", CUT_OFF_DISPOSITION)
+# A list member is finished: no reason to cold-dial them again from this list.
+TERMINAL_DISPOSITIONS = ("Wrong Number", "Not Interested", "No Longer Owns", "Investor")
+LIST_DONE_STATUSES = ("warm", "hot", "dead", "contract", "investor")
+
+
+def dial_list_attempts(list_id: int, db_path: Path = DB_PATH) -> list[dict[str, Any]]:
+    """One row per list member: tries (real dial attempts), last try time,
+    whether they're finished, and whether we've actually reached them."""
+    marks = ",".join("?" * len(NOT_A_TRY))
+    terms = ",".join("?" * len(TERMINAL_DISPOSITIONS))
     with get_conn(db_path) as conn:
         rows = conn.execute(
-            """
-            SELECT dl.id, dl.name, dl.created_at, dl.notes,
-                   COUNT(m.lead_id) AS contacts,
-                   SUM(CASE WHEN l.conversation_stage != 'not_contacted' THEN 1 ELSE 0 END) AS dialed
-            FROM dial_lists dl
-            LEFT JOIN dial_list_members m ON m.list_id = dl.id
-            LEFT JOIN leads l ON l.id = m.lead_id
-            GROUP BY dl.id
-            ORDER BY dl.created_at DESC
-            """
+            f"""
+            WITH d AS (
+                SELECT lead_id,
+                       SUM(CASE WHEN disposition NOT IN ({marks}) THEN 1 ELSE 0 END) AS tries,
+                       MAX(CASE WHEN disposition NOT IN ({marks}) THEN created_at END) AS last_try,
+                       MAX(CASE WHEN disposition IN ({terms}) THEN 1 ELSE 0 END) AS terminal
+                FROM dispositions GROUP BY lead_id),
+            c AS (
+                SELECT lead_id, COUNT(*) AS calls, MAX(timestamp) AS last_call
+                FROM interactions WHERE type='call' AND direction='outbound' GROUP BY lead_id)
+            SELECT m.lead_id, l.status, l.conversation_stage,
+                   COALESCE(d.tries, 0) AS tries, COALESCE(c.calls, 0) AS calls,
+                   d.last_try, c.last_call, COALESCE(d.terminal, 0) AS terminal
+            FROM dial_list_members m
+            JOIN leads l ON l.id = m.lead_id
+            LEFT JOIN d ON d.lead_id = m.lead_id
+            LEFT JOIN c ON c.lead_id = m.lead_id
+            WHERE m.list_id = ?
+            """,
+            (*NOT_A_TRY, *NOT_A_TRY, *TERMINAL_DISPOSITIONS, list_id),
         ).fetchall()
     out = []
     for r in rows:
         d = _to_dict(r)
-        d["contacts"] = d["contacts"] or 0
-        d["dialed"] = d["dialed"] or 0
+        # A worked call logs both an interaction and a disposition; count it once.
+        d["attempts"] = max(d["tries"], d["calls"])
+        d["last_attempt"] = max(filter(None, (d["last_try"], d["last_call"])), default=None)
+        d["finished"] = bool(d["terminal"]) or d["status"] in LIST_DONE_STATUSES
+        d["reached"] = bool(d["conversation_stage"]) and d["conversation_stage"] != "not_contacted"
+        out.append(d)
+    return out
+
+
+def recent_list_outcomes(list_id: int, limit: int = 100, db_path: Path = DB_PATH) -> list[str]:
+    """The latest real dial outcomes on a list's members, newest first."""
+    marks = ",".join("?" * len(NOT_A_TRY))
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            f"""SELECT d.disposition FROM dispositions d
+                JOIN dial_list_members m ON m.lead_id = d.lead_id
+                WHERE m.list_id = ? AND d.disposition NOT IN ({marks})
+                ORDER BY d.id DESC LIMIT ?""",
+            (list_id, *NOT_A_TRY, limit),
+        ).fetchall()
+    return [r["disposition"] for r in rows]
+
+
+def fetch_dial_lists(db_path: Path = DB_PATH) -> list[dict[str, Any]]:
+    """Return each list with honest counts. 'dialed' = members called at least
+    once (answered or not); 'reached' = members actually talked to/worked;
+    'remaining' = members never dialed yet."""
+    with get_conn(db_path) as conn:
+        lists = [_to_dict(r) for r in conn.execute(
+            "SELECT id, name, created_at, notes FROM dial_lists ORDER BY created_at DESC")]
+    out = []
+    for d in lists:
+        members = dial_list_attempts(d["id"], db_path)
+        dialed = [m for m in members if m["attempts"]]
+        d["contacts"] = len(members)
+        d["dialed"] = len(dialed)
+        d["reached"] = sum(m["reached"] for m in members)
         d["remaining"] = d["contacts"] - d["dialed"]
+        d["avg_tries"] = round(sum(m["attempts"] for m in dialed) / len(dialed), 1) if dialed else 0.0
         out.append(d)
     return out
 
 
 def fetch_list_lead_ids(list_id: int, db_path: Path = DB_PATH) -> list[int]:
-    """Lead ids in a list that still exist, uncontacted first (so a fresh
-    dialing run starts with people you haven't reached yet)."""
-    with get_conn(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT m.lead_id
-            FROM dial_list_members m
-            JOIN leads l ON l.id = m.lead_id
-            WHERE m.list_id = ?
-            ORDER BY CASE WHEN l.conversation_stage = 'not_contacted' THEN 0 ELSE 1 END, m.lead_id
-            """,
-            (list_id,),
-        ).fetchall()
-    return [r["lead_id"] for r in rows]
+    """Lead ids in a list that still exist, in dialing order: never-dialed
+    first, then fewest tries (oldest try first); finished leads go last."""
+    members = dial_list_attempts(list_id, db_path)
+    members.sort(key=lambda m: (m["finished"], m["attempts"], m["last_attempt"] or "", m["lead_id"]))
+    return [m["lead_id"] for m in members]
 
 
 def rename_dial_list(list_id: int, name: str, db_path: Path = DB_PATH) -> None:
@@ -1525,9 +1574,10 @@ def leads_dialed_today(db_path: Path = DB_PATH) -> set[int]:
     outbound call interactions. Drives the two-agent no-double-dial guard."""
     today = date.today().isoformat()
     with get_conn(db_path) as conn:
+        # A line cut off because another line won is re-queued, not "dialed".
         d = conn.execute(
-            "SELECT DISTINCT lead_id FROM dispositions WHERE created_at >= ?",
-            (today,),
+            "SELECT DISTINCT lead_id FROM dispositions WHERE created_at >= ? AND disposition != ?",
+            (today, CUT_OFF_DISPOSITION),
         ).fetchall()
         i = conn.execute(
             "SELECT DISTINCT lead_id FROM interactions "
