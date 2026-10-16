@@ -19,12 +19,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
-import anthropic
+
+from .ai_budget import OPUS, response_text, run_request
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-MODEL = "claude-opus-4-8"
+MODEL = OPUS  # claude-opus-4-8
 MAX_TOKENS = 16384       # large lists need room; 4096 truncated big imports
 CHUNK_CHARS = 12000      # split big pastes so each batch fits one API round-trip
 
@@ -93,21 +93,22 @@ def _chunk_text(raw_text: str, max_chars: int) -> list[str]:
     return chunks or [raw_text]
 
 
-def _call_claude_batch(text: str) -> tuple[list[dict], str | None]:
-    """Extract rows from one batch. Returns (rows, error_message).
+def _batch_request(text: str) -> dict:
+    return {"feature": "contact_import", "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": text}],
+            "model": MODEL, "max_tokens": MAX_TOKENS}
+
+
+def _call_claude_batch(request: dict, approval) -> tuple[list[dict], str | None]:
+    """Extract rows from one priced batch. Returns (rows, error_message).
 
     The batch is small enough that the JSON array fits in one response. We pull
     the array out of whatever the model returns (tolerating any stray preamble
     or markdown fences) rather than relying on assistant prefill, which
     claude-opus-4-8 does not support.
     """
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": text}],
-    )
-    out = (resp.content[0].text or "")
+    resp = run_request(approval, request)
+    out = response_text(resp)
     out = re.sub(r"^```(?:json)?|```$", "", out, flags=re.MULTILINE).strip()
     start = out.find("[")
     end = out.rfind("]") + 1
@@ -237,7 +238,25 @@ def _parse_table(raw_text: str) -> list[dict] | None:
     return rows
 
 
-def parse_contacts(raw_text: str, mode: str = "auto") -> tuple[list[ImportedContact], list[str]]:
+def prepare_import(raw_text: str, mode: str = "auto") -> dict | list[dict]:
+    """Free table parse when it works: {"result": (contacts, warnings)}.
+    Otherwise the list of paid AI batch requests, to price before running."""
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
+        return {"result": ([], ["Nothing pasted."])}
+
+    if mode in ("auto", "table"):
+        table_rows = _parse_table(raw_text)
+        if table_rows is not None:
+            return {"result": _rows_to_contacts(table_rows)}
+        if mode == "table":
+            return {"result": ([], ["Could not detect a table with name + phone columns. "
+                                    "Try 'Auto' or 'AI cleanup' mode instead."])}
+    return [_batch_request(chunk) for chunk in _chunk_text(raw_text, CHUNK_CHARS)]
+
+
+def parse_contacts(raw_text: str, mode: str = "auto", approval=None,
+                   prepared: dict | list[dict] | None = None) -> tuple[list[ImportedContact], list[str]]:
     """Extract dialable contacts from a pasted blob and return (contacts, warnings).
 
     contacts: clean, phone-normalized, de-duplicated by phone.
@@ -247,26 +266,23 @@ def parse_contacts(raw_text: str, mode: str = "auto") -> tuple[list[ImportedCont
       "auto"  — try table parse first; fall back to AI if not a table (default).
       "table" — table parse only; error if format not recognized.
       "ai"    — always send through Claude, skip table parse.
+
+    The AI path runs only with approved price quotes, one per batch.
     """
-    raw_text = (raw_text or "").strip()
-    if not raw_text:
-        return [], ["Nothing pasted."]
+    if prepared is None:
+        prepared = prepare_import(raw_text, mode)
+    if isinstance(prepared, dict):
+        return prepared["result"]
+    if approval is None:
+        return [], [f"AI cleanup not run: {len(prepared)} batch(es) need your price approval."]
+    approvals = approval if isinstance(approval, list) else [approval]
 
-    if mode in ("auto", "table"):
-        table_rows = _parse_table(raw_text)
-        if table_rows is not None:
-            return _rows_to_contacts(table_rows)
-        if mode == "table":
-            return [], ["Could not detect a table with name + phone columns. "
-                        "Try 'Auto' or 'AI cleanup' mode instead."]
-
-    chunks = _chunk_text(raw_text, CHUNK_CHARS)
     rows: list[dict] = []
     warnings: list[str] = []
-    for i, chunk in enumerate(chunks, 1):
-        label = f"Batch {i}/{len(chunks)}: " if len(chunks) > 1 else ""
+    for i, (quote, request) in enumerate(zip(approvals, prepared), 1):
+        label = f"Batch {i}/{len(prepared)}: " if len(prepared) > 1 else ""
         try:
-            batch_rows, err = _call_claude_batch(chunk)
+            batch_rows, err = _call_claude_batch(request, quote)
         except Exception as exc:
             warnings.append(f"{label}AI import failed: {exc}")
             continue

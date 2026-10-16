@@ -26,14 +26,15 @@ def test_current_instructions_and_coaching_survive_followup_pipeline(monkeypatch
     from crm_engine.followup_engine import generate_followup_message
 
     captured = {}
-    def create(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(content=[SimpleNamespace(text=json.dumps({
+    def run_request(approval, request):
+        assert approval == "approved-quote"
+        captured.update(request)
+        return SimpleNamespace(content=[SimpleNamespace(type="text", text=json.dumps({
             "message": "Hey Jimmie, it's been a while. Can we talk tomorrow?",
             "coaching": "A brief acknowledgment fits the long gap. You don't need a lengthy apology.",
         }))], usage=SimpleNamespace(input_tokens=20, output_tokens=30))
 
-    monkeypatch.setattr(ai, "client", SimpleNamespace(messages=SimpleNamespace(create=create)))
+    monkeypatch.setattr(ai, "run_request", run_request)
     monkeypatch.setattr(ai, "load_email_context", lambda lead: {
         'messages': [], 'status': 'Gmail checked: no matched emails.', 'complete': True})
     request = "lets say we can talk tomorrow and should we say sorry for delay?"
@@ -43,6 +44,7 @@ def test_current_instructions_and_coaching_survive_followup_pipeline(monkeypatch
         conversation=[{"type": "text", "direction": "inbound", "content": "Any time",
                        "timestamp": (datetime.now(timezone.utc) - timedelta(days=70)).isoformat()}],
         extra_context=request,
+        approval="approved-quote",
     )
     prompt = captured["messages"][0]["content"]
     assert prompt.index(request) > prompt.index("Any time")
@@ -52,6 +54,23 @@ def test_current_instructions_and_coaching_survive_followup_pipeline(monkeypatch
     assert "tomorrow" in draft.message
     assert "A brief acknowledgment" in draft.coaching
     assert draft.cost_usd > 0
+
+
+def test_no_approval_means_no_prompt_and_no_paid_call(monkeypatch):
+    from crm_engine.followup_engine import generate_followup_message
+
+    def boom(*args, **kwargs):
+        raise AssertionError("must not run without an approved price")
+    monkeypatch.setattr(ai, "run_request", boom)
+    monkeypatch.setattr(ai, "load_email_context", boom)  # not even the free Gmail lookup
+    draft = generate_followup_message(lead={"id": 1, "name": "Jimmie", "status": "warm"},
+                                      last_message="", ignored_texts=0, strong_intent=False)
+    assert draft.message == ""
+    assert any("price approval" in f for f in draft.flags)
+    assert ai.generate_interaction_note({}, [], "hi", "inbound") == ""
+    assert ai.generate_call_note({}, "transcript") == ""
+    assert ai.extract_call_facts({}, "transcript") == {}
+    assert "price approval" in ai.generate_coaching_report(["a call"])[0]
 
 
 def test_messages_coach_survives_rerun_and_clears_on_next_draft():
@@ -66,10 +85,18 @@ def test_messages_coach_survives_rerun_and_clears_on_next_draft():
 import streamlit as st
 from types import SimpleNamespace
 db = SimpleNamespace(fetch_interactions=lambda lead_id: [])
+def prepare_followup_request(lead, last_message, ignored, strong, conversation, extra_context):
+    return {'extra_context': extra_context}
+def priced_action(key, label, prepare, run, area=None, **kwargs):
+    # Stand-in for the price step: one click approves and runs.
+    if (area or st).button(label, key=key):
+        return run('approved', prepare())
 def generate_followup_message(**kwargs):
-    st.session_state['received_context'] = kwargs['extra_context']
-    return SimpleNamespace(message='Can we talk tomorrow?', cost_usd=.001,
-        coaching='I suggested tomorrow because you requested it.' if kwargs['extra_context'] else '')
+    assert kwargs['approval'] == 'approved'
+    context = kwargs['prepared']['extra_context']
+    st.session_state['received_context'] = context
+    return SimpleNamespace(message='Can we talk tomorrow?', cost_usd=.001, flags=[],
+        coaching='I suggested tomorrow because you requested it.' if context else '')
 ''' + function + '''
 render_ai_draft_row({'id': 1}, 'staged', 'test_ai')
 '''

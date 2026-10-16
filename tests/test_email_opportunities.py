@@ -94,20 +94,21 @@ def test_cross_context_changed_blocks_email_before_transport(tmp_path, monkeypat
     assert db.email_attempts(MAILBOX, path) == []
 
 
-def test_large_history_is_fully_examined_in_chunks():
+def test_large_history_is_fully_examined_in_one_priced_call():
+    # One call per conversation, so the priced prompt is exactly the prompt that runs.
     t = mail()
     events = [{'id': str(n), 'channel': 'text', 'direction': 'inbound', 'body': str(n) + 'x' * 1200,
                'status': 'historical', 'timestamp': '2026-09-20T12:00:00+00:00'} for n in range(100)]
     t['cross_channel'] = {'events': events}
-    seen = []
+    calls = []
     def fake(system, payload):
-        if isinstance(payload, list):
-            seen.extend(p['id'] for p in payload)
-            return {'facts': [{'id': p['id']} for p in payload]}
+        calls.append(json.dumps(payload, ensure_ascii=False))
         return answer(evidence_ids=['0'])
     result = opportunities.analyze(t, ai=fake)
     assert result['is_opportunity']
-    assert set(seen) == {str(n) for n in range(100)}
+    assert len(calls) == 1
+    assert {e['id'] for e in json.loads(calls[0])['conversation']} == {str(n) for n in range(100)}
+    assert opportunities.prepare_analysis_request(t)['messages'][0]['content'] == calls[0]
 
 
 def test_snapshot_analysis_persists_results_and_reports_incomplete(tmp_path, monkeypatch):
@@ -143,14 +144,37 @@ def test_prior_staff_personal_details_are_not_borrowed():
     assert result['draft_text'] == ''
 
 
-def test_independent_audit_can_correct_a_bad_draft():
+def test_bad_offer_draft_is_rejected_without_a_second_paid_review():
+    # The second "skeptical reviewer" call was removed so each analysis has one
+    # known price; the deterministic draft checks still block unsupported offers.
     calls = []
     def ai(system, payload):
         calls.append(payload)
-        if len(calls) == 1:
-            return answer(draft_text='I can pay $500000.')
-        assert 'proposed_assessment' in payload
-        return answer(draft_text='What terms would you be comfortable with?')
+        return answer(draft_text='I can pay $500000.')
     result = opportunities.analyze(mail(), ai=ai)
-    assert len(calls) == 2
-    assert result['draft_text'] == 'What terms would you be comfortable with?'
+    assert len(calls) == 1
+    assert result['analysis_state'] == 'failed'
+    assert result['draft_text'] == ''
+
+
+def test_unapproved_analysis_never_overwrites_the_last_good_one(tmp_path, monkeypatch):
+    path = tmp_path / 'crm.db'
+    db.migrate_email(path)
+    t = mail()
+    index = ContextIndex(local(), [], [], [t])
+    good = {**answer(stage='needs_reply'), 'analysis_state': 'complete', 'version': opportunities.VERSION,
+            'evaluated_on': '2026-01-01', 'draft_text': 'Are you still open to discussing the property?'}
+    email_review.store_thread(index.attach(t), path, opportunity_result=good)
+    # A later sync with no price approval: analysis is attempted but cannot run.
+    email_review.store_thread(index.attach(mail()), path)
+    row = db.email_review(MAILBOX, 't1', path)
+    kept = json.loads(row['thread_json'])['opportunity']
+    assert kept['analysis_state'] == 'complete'
+    assert kept['draft_text'] == good['draft_text']
+    assert row['draft_text'] == good['draft_text']
+    # A brand-new conversation is parked as waiting for approval, not marked failed.
+    other = mail('t2', 'm2', 'second@example.com')
+    email_review.store_thread(ContextIndex(local(), [], [], [other]).attach(other), path)
+    parked = json.loads(db.email_review(MAILBOX, 't2', path)['thread_json'])['opportunity']
+    assert parked['analysis_state'] == 'pending_price'
+    assert db.email_review(MAILBOX, 't2', path)['review_state'] == 'needs_review'

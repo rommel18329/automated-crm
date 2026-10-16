@@ -16,3 +16,4 @@ token.json
 gv_imported_ids.json
 gv_contacts.json
 logs/
+.ai-local/

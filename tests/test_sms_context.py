@@ -118,13 +118,13 @@ def test_generator_includes_email_and_preserves_recommendation_to_wait(monkeypat
     monkeypatch.setattr(ai, 'load_email_context', lambda lead: {
         'messages': [email], 'status': 'Gmail checked: 1 email.', 'complete': True})
     captured = {}
-    def create(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(content=[SimpleNamespace(text=json.dumps({
+    def run_request(approval, request):
+        captured.update(request)
+        return SimpleNamespace(content=[SimpleNamespace(type='text', text=json.dumps({
             'message': '', 'coaching': 'You already emailed this question. Wait for their reply.'}))],
             usage=SimpleNamespace(input_tokens=10, output_tokens=10))
-    monkeypatch.setattr(ai, 'client', SimpleNamespace(messages=SimpleNamespace(create=create)))
-    draft = ai.generate_message(LEAD, [], 'Follow up', 'Casual', 'Ask about Tuesday')
+    monkeypatch.setattr(ai, 'run_request', run_request)
+    draft = ai.generate_message(LEAD, [], 'Follow up', 'Casual', 'Ask about Tuesday', approval='approved')
     prompt = captured['messages'][0]['content']
     assert 'EMAIL YOU' in prompt
     assert email['content'] in prompt

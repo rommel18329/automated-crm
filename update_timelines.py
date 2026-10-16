@@ -160,6 +160,19 @@ def build_new_timeline(lead: dict, analysis: dict) -> str:
 def main():
     db.init_db(DB_PATH)
     leads = db.fetch_leads(DB_PATH)
+
+    # Paid AI needs approval: show a conservative upper bound (every lead at
+    # the 3,500-character note cap) and ask before making any call.
+    from crm_engine.ai_budget import quote_estimate
+    per_lead = quote_estimate("timeline_update", SYSTEM_PROMPT,
+                              [{"role": "user", "content": "x" * 3700}],
+                              model="gpt-4o-mini", max_tokens=300, provider="openai")
+    print(f"{len(leads)} leads, one gpt-4o-mini call each.")
+    print(f"Estimated cost: up to ${per_lead.hard_ceiling_usd * len(leads):.4f} "
+          f"(conservative; most leads have fewer notes). It also rewrites each lead's timeline in crm.db.")
+    if input("Proceed? [y/N] ").strip().lower() != "y":
+        print("Cancelled. No AI calls made, nothing changed.")
+        return
     print(f"Processing {len(leads)} leads...\n")
 
     updated = 0

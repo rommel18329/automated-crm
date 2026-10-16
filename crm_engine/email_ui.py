@@ -6,10 +6,42 @@ from email.utils import parseaddr
 import streamlit as st
 
 from crm_engine import db
-from crm_engine.email_review import approve, email_lock, save_edit, store_thread, sync
+from crm_engine.email_review import (approve, email_lock, prepare_suggestion, save_edit,
+                                     store_thread, suggest, sync)
 from crm_engine.gmail_client import GmailClient, LOCAL, MAILBOX, recipient_for, addresses
-from crm_engine.email_opportunities import period, months_ago
+from crm_engine.email_opportunities import analyze, period, months_ago, prepare_analysis_request
 from crm_engine.catchup_sources import build_context
+from crm_engine.ai_ui import priced_action
+
+BULK_ANALYZE_LIMIT = 25
+
+
+def needs_analysis(op):
+    return bool(op) and (op.get('analysis_state') in ('pending_price', 'failed')
+                         or bool(op.get('price_pending')))
+
+
+def prepare_thread_ai(thread):
+    """The paid request for one conversation, or {'result': ...} when no AI is needed."""
+    if thread.get('cross_channel'):
+        return prepare_analysis_request(thread)
+    return prepare_suggestion(thread)
+
+
+def run_thread_ai(thread, approval, prepared):
+    """Run one priced analysis and store it. Caller holds email_lock."""
+    if thread.get('cross_channel'):
+        result = prepared['result'] if 'result' in prepared else analyze(thread, approval=approval)
+        store_thread(thread, force=True, opportunity_result=result)
+    else:
+        advice = suggest(thread, approval=approval, prepared=prepared)
+        store_thread(thread, generator=lambda _thread: advice, force=True)
+
+
+def run_thread_ai_locked(thread, approval, prepared):
+    with email_lock():
+        run_thread_ai(thread, approval, prepared)
+    return True
 
 
 def setup_help():
@@ -88,6 +120,34 @@ def render_email_review():
     st.metric('Opportunities to review', pending)
     st.caption('Personal seller, buyer, agent, investor and referral conversations. Routine alerts and newsletters '
                'are excluded. Suggestions use available text/CRM history; attachments are not analyzed.')
+    waiting = [r for r in rows if period(assessment(r).get('last_contact_at', r['latest_received_at'])) != 'Outside last year'
+               and r['review_state'] not in ('dismissed', 'answered') and needs_analysis(assessment(r))]
+    if waiting:
+        st.info(f'{len(waiting)} conversations have new activity or no AI analysis yet. Sync never runs paid AI; '
+                'analyze them here or one at a time below.')
+        batch = sorted(waiting, key=lambda r: r['latest_received_at'], reverse=True)[:BULK_ANALYZE_LIMIT]
+
+        def prepare_bulk():
+            requests = []
+            for r in batch:
+                request = prepare_thread_ai(details[r['thread_id']])
+                if 'result' not in request:
+                    requests.append({**request, 'thread_id': r['thread_id']})
+            return requests or {'no_ai': True}
+
+        def run_bulk(approval, prepared):
+            if not isinstance(prepared, list):
+                return 0
+            with email_lock():
+                for quote, request in zip(approval, prepared):
+                    thread = json.loads(db.email_review(MAILBOX, request['thread_id'])['thread_json'])
+                    run_thread_ai(thread, quote, request)
+            return len(prepared)
+
+        done = priced_action('email_bulk_analyze', f'Analyze {len(batch)} newest with AI', prepare_bulk, run_bulk)
+        if done is not None:
+            st.session_state['email_notice'] = f'Analyzed {done} conversations.'
+            st.rerun()
     scan_file = LOCAL / 'opportunity-scan.json'
     if scan_file.exists():
         try:
@@ -121,7 +181,7 @@ def render_email_review():
         if cohort == 'Outside last year' or (selected_period != 'All last 12 months' and cohort != selected_period):
             return False
         if selected == 'Analysis pending':
-            return not op or op.get('analysis_state') != 'complete'
+            return not op or op.get('analysis_state') != 'complete' or bool(op.get('price_pending'))
         if selected == 'Dismissed':
             return row['review_state'] == 'dismissed'
         if selected == 'Waiting on them':
@@ -150,6 +210,8 @@ def render_email_review():
             st.caption(latest['timestamp'])
             st.write(row['summary'])
             st.write(row['reply_reason'])
+            if op.get('price_pending'):
+                st.warning('New activity since this analysis. Use "Analyze with AI" to refresh it.')
             if op.get('is_opportunity'):
                 st.caption(f"{op.get('category', '').replace('-', ' ')} · priority {op.get('priority', '?')}/5 · {op.get('stage', '').replace('_', ' ')} · confidence {op.get('confidence', 'unknown')}")
                 st.write('Suggested next step: ' + op.get('next_step', 'Review the conversation.'))
@@ -213,8 +275,14 @@ def render_email_review():
                 action = 'save'
             if deny_col.button('Deny', key=key + '_deny'):
                 action = 'deny'
-            if regenerate_col.button('Suggest again', key=key + '_generate'):
-                action = 'generate'
+            analyzed = priced_action(
+                key + '_generate', 'Analyze with AI',
+                lambda thread=thread: prepare_thread_ai(thread),
+                lambda approval, prepared, thread=thread: run_thread_ai_locked(thread, approval, prepared),
+                area=regenerate_col)
+            if analyzed is not None:
+                st.session_state['email_reset_widget'] = key + '_text'
+                st.rerun()
             if action:
                 try:
                     with st.spinner('Processing…'), email_lock():

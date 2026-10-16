@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .ai_message_generator import generate_message, MessageResult
+from .ai_message_generator import generate_message, prepare_message_request, MessageResult
 
 
 STRATEGY_ROTATION = ["casual follow-up", "value-based", "pattern break", "call attempt", "reset tone"]
@@ -46,6 +46,8 @@ def generate_followup_message(
     strong_intent: bool,
     conversation: list[dict] | None = None,
     extra_context: str = "",
+    approval=None,
+    prepared: dict | None = None,
 ) -> FollowupDraft:
     objective = _choose_objective(strong_intent, ignored_texts)
     strategy = _choose_strategy(lead.get("last_strategy_used"), ignored_texts)
@@ -56,8 +58,9 @@ def generate_followup_message(
         objective=objective,
         strategy=strategy,
         extra_context=extra_context,
+        approval=approval,
+        prepared=prepared,
     )
-
     reasoning = (
         f"Objective: {objective} | Strategy: {strategy} | Tone: {result.tone}"
     )
@@ -73,3 +76,11 @@ def generate_followup_message(
         output_tokens=result.output_tokens,
         cost_usd=result.cost_usd,
     )
+
+
+def prepare_followup_request(lead: dict, last_message: str, ignored_texts: int,
+                             strong_intent: bool, conversation: list[dict] | None = None,
+                             extra_context: str = "") -> dict:
+    objective = _choose_objective(strong_intent, ignored_texts)
+    strategy = _choose_strategy(lead.get("last_strategy_used"), ignored_texts)
+    return prepare_message_request(lead, conversation or [], objective, strategy, extra_context)

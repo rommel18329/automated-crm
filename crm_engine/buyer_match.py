@@ -13,7 +13,7 @@ import json
 import re
 
 from . import db
-from .ai_message_generator import client
+from .ai_budget import HAIKU, response_cost, response_text, run_request
 
 MATCH_SYSTEM_PROMPT = """You match a property a real-estate wholesaler has
 (or may get) under contract to the investor BUYERS on their list.
@@ -88,35 +88,42 @@ def _buyer_line(lead: dict) -> str | None:
 _IN_RATE, _OUT_RATE = 1.00, 5.00
 
 
-def match_buyers(seller_lead: dict, interactions: list[dict],
-                 db_path=db.DB_PATH) -> dict:
-    """Rank all investor buy boxes against this seller's property.
-    Returns {"matches": [{lead_id, score, reason, name, phone}], "cost_usd",
-    "buyers_scanned"} — or {"error": ...}."""
+def prepare_match_request(seller_lead: dict, interactions: list[dict],
+                          db_path=db.DB_PATH) -> dict:
+    """The exact paid request behind match_buyers, for pricing before it runs.
+    Returns {"error": ...} when there is nothing to match."""
     buyers = [l for l in db.fetch_leads(db_path) if l.get("status") == "investor"]
     lines = [b for b in (_buyer_line(l) for l in buyers) if b]
     if not lines:
         return {"error": "No investor buy boxes on file."}
-    lookup = {l["id"]: l for l in buyers}
-
     user_msg = (
         "SELLER PROPERTY:\n" + _seller_summary(seller_lead, interactions)
         + "\n\nBUYERS (id | name | criteria):\n" + "\n".join(lines)
         + "\n\nReturn the JSON array now."
     )
+    return {"feature": "buyer_match", "system": MATCH_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user_msg}],
+            "model": HAIKU, "max_tokens": 900, "buyers_scanned": len(lines)}
+
+
+def match_buyers(seller_lead: dict, interactions: list[dict],
+                 db_path=db.DB_PATH, approval=None, prepared: dict | None = None) -> dict:
+    """Rank all investor buy boxes against this seller's property.
+    Returns {"matches": [{lead_id, score, reason, name, phone}], "cost_usd",
+    "buyers_scanned"} — or {"error": ...}. Runs only with an approved price."""
+    request = prepared or prepare_match_request(seller_lead, interactions, db_path)
+    if request.get("error"):
+        return {"error": request["error"]}
+    if approval is None:
+        return {"error": "Buyer match not run: it needs your price approval."}
+    lookup = {l["id"]: l for l in db.fetch_leads(db_path) if l.get("status") == "investor"}
     try:
-        resp = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=900,
-            system=MATCH_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        raw = (resp.content[0].text or "").strip()
+        resp = run_request(approval, request)
+        raw = response_text(resp)
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
         start, end = raw.find("["), raw.rfind("]") + 1
         matches = json.loads(raw[start:end]) if start >= 0 else []
-        cost = (resp.usage.input_tokens * _IN_RATE
-                + resp.usage.output_tokens * _OUT_RATE) / 1_000_000
+        cost = response_cost(resp, request["model"])
     except Exception as exc:
         return {"error": f"Match failed: {exc}"}
 
@@ -134,7 +141,7 @@ def match_buyers(seller_lead: dict, interactions: list[dict],
         })
     out.sort(key=lambda x: x["score"], reverse=True)
     return {"matches": out, "cost_usd": round(cost, 4),
-            "buyers_scanned": len(lines)}
+            "buyers_scanned": request["buyers_scanned"]}
 
 
 BUYER_TEXT_SYSTEM_PROMPT = """You write ONE short SMS from a wholesaler to an
@@ -146,24 +153,30 @@ text, nothing else. Never invent price, condition, or address details that
 aren't in the property summary."""
 
 
-def draft_buyer_text(buyer: dict, seller_lead: dict, interactions: list[dict],
-                     reason: str, sender: str = "Rom") -> dict:
-    """One-tap intro text to a matched buyer. Returns {message, cost_usd}."""
+def prepare_buyer_text(buyer: dict, seller_lead: dict, interactions: list[dict],
+                       reason: str, sender: str = "Rom") -> dict:
+    """The exact paid request behind draft_buyer_text, for pricing first."""
     user_msg = (
         f"BUYER: {buyer.get('name')} — their criteria fit because: {reason}\n\n"
         "PROPERTY SUMMARY:\n" + _seller_summary(seller_lead, interactions)
         + f"\n\nSender first name: {sender}\nWrite the SMS."
     )
+    return {"feature": "buyer_text", "system": BUYER_TEXT_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user_msg}],
+            "model": HAIKU, "max_tokens": 200}
+
+
+def draft_buyer_text(buyer: dict, seller_lead: dict, interactions: list[dict],
+                     reason: str, sender: str = "Rom", approval=None,
+                     prepared: dict | None = None) -> dict:
+    """One-tap intro text to a matched buyer. Returns {message, cost_usd}.
+    Runs only with an approved price; never sends anything."""
+    if approval is None:
+        return {"message": "", "error": "Draft not run: it needs your price approval.", "cost_usd": 0.0}
+    request = prepared or prepare_buyer_text(buyer, seller_lead, interactions, reason, sender)
     try:
-        resp = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=200,
-            system=BUYER_TEXT_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        cost = (resp.usage.input_tokens * _IN_RATE
-                + resp.usage.output_tokens * _OUT_RATE) / 1_000_000
-        return {"message": (resp.content[0].text or "").strip(),
-                "cost_usd": round(cost, 4)}
+        resp = run_request(approval, request)
+        return {"message": response_text(resp),
+                "cost_usd": round(response_cost(resp, request["model"]), 4)}
     except Exception as exc:
         return {"message": "", "error": str(exc), "cost_usd": 0.0}

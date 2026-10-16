@@ -191,9 +191,4 @@ def send_sms(lead_id: int, message: str, db_path: Path = db.DB_PATH) -> dict:
             },
             db_path,
         )
-        # AI auto-note (what we said / what changed / next move) — background
-        # thread so the send returns instantly.
-        threading.Thread(target=auto_note_after_text, args=(lead_id, db_path),
-                         daemon=True).start()
-
     return {"lead_id": lead_id, "sent": sent, "message": clean_message, "error": error_msg}

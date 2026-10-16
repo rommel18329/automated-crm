@@ -13,9 +13,10 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from crm_engine import db, engine
-from crm_engine.followup_engine import generate_followup_message
+from crm_engine.followup_engine import generate_followup_message, prepare_followup_request
 from crm_engine.messaging_gateway import send_sms, place_call, place_call_number
-from crm_engine.dialer_import import parse_contacts
+from crm_engine.dialer_import import parse_contacts, prepare_import
+from crm_engine.ai_ui import priced_action, budget_panel
 from crm_engine import caller_id_pool
 from crm_engine import buyer_match
 from crm_engine.email_ui import render_email_review, catch_up_if_due
@@ -647,16 +648,14 @@ def build_followups(leads: list[dict]) -> tuple[list[dict], list[dict]]:
         eval_ = engine.evaluate_lead(lead, interactions)
         texts = [i for i in interactions if i["type"] == "text"]
         last_message = texts[0]["content"] if texts else ""
-        draft = generate_followup_message(
-            lead=lead,
-            last_message=last_message,
-            ignored_texts=eval_.ignored_outbound_texts,
-            strong_intent=eval_.strong_intent,
-        )
+        # No AI call here: drafts are priced and approved per lead on the page.
         entry = {
             "lead_id": lead["id"],
             "lead_name": lead["name"],
-            "new_message": draft.message,
+            "last_message": last_message,
+            "ignored_texts": engine.ignored_outbound_texts(interactions),
+            "strong_intent": bool(eval_.intent_signals),
+            "new_message": "",
         }
         if lead["status"] == "warm":
             warm_items.append(entry)
@@ -1113,20 +1112,22 @@ def render_ai_draft_row(lead: dict, stage_key: str, widget_prefix: str) -> None:
         placeholder="context for the AI — e.g. she just called about the shed price",
         label_visibility="collapsed",
     )
-    if _c1.button("✨ AI draft", key=f"{widget_prefix}_btn", use_container_width=True):
-        with st.spinner("Checking matched emails and reading the conversation..."):
-            _ixns = db.fetch_interactions(lead["id"])
-            _last_in = next((i["content"] for i in _ixns
-                             if i["type"] == "text" and i["direction"] == "inbound"), "")
-            _draft = generate_followup_message(
-                lead=lead,
-                last_message=_last_in,
-                ignored_texts=0,
-                strong_intent=False,
-                conversation=_ixns,
-                extra_context=st.session_state.get(ctx_key, ""),
-            )
+    def _prepare_draft():
+        _ixns = db.fetch_interactions(lead["id"])
+        _last_in = next((i["content"] for i in _ixns
+                         if i["type"] == "text" and i["direction"] == "inbound"), "")
+        return prepare_followup_request(lead, _last_in, 0, False, conversation=_ixns,
+                                        extra_context=st.session_state.get(ctx_key, ""))
+
+    def _run_draft(approval, prepared):
+        return generate_followup_message(lead=lead, last_message="", ignored_texts=0,
+                                         strong_intent=False, approval=approval, prepared=prepared)
+
+    _draft = priced_action(f"{widget_prefix}_btn", "✨ AI draft", _prepare_draft, _run_draft,
+                           area=_c1, use_container_width=True)
+    if _draft is not None:
         st.session_state[stage_key] = _draft.message
+        st.session_state[f"{widget_prefix}_flags"] = _draft.flags
         st.session_state[f"{widget_prefix}_coaching"] = _draft.coaching
         st.session_state[f"{widget_prefix}_cost"] = _draft.cost_usd
         st.session_state["ai_cost_session_total"] = (
@@ -1135,6 +1136,9 @@ def render_ai_draft_row(lead: dict, stage_key: str, widget_prefix: str) -> None:
     _cost = st.session_state.get(f"{widget_prefix}_cost")
     if _cost:
         st.caption(f"💰 draft cost ${_cost:.4f} — edit the message above, then send")
+    for _flag in st.session_state.get(f"{widget_prefix}_flags", []):
+        if _flag.startswith("🔴"):
+            st.error(_flag)
     _coaching = st.session_state.get(f"{widget_prefix}_coaching", "")
     if _coaching:
         with st.container(border=True):
@@ -1450,9 +1454,12 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
     if lead["status"] in ("warm", "hot", "contract"):
         with st.expander("🤝 Match Buyers — AI scans every investor buy box", expanded=False):
             _bm_key = f"buyer_matches_{lead_id}"
-            if st.button("🔎 Find matching buyers", key=f"bm_run_{lead_id}"):
-                with st.spinner("Scanning buy boxes..."):
-                    _bm_res = buyer_match.match_buyers(lead, interactions)
+            _bm_res = priced_action(
+                f"bm_run_{lead_id}", "🔎 Find matching buyers",
+                lambda: buyer_match.prepare_match_request(lead, interactions),
+                lambda approval, prepared: buyer_match.match_buyers(
+                    lead, interactions, approval=approval, prepared=prepared))
+            if _bm_res is not None:
                 st.session_state[_bm_key] = _bm_res
                 st.session_state["ai_cost_session_total"] = (
                     st.session_state.get("ai_cost_session_total", 0.0)
@@ -1478,13 +1485,16 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
                             if st.button("Open", key=f"bm_open_{lead_id}_{m['lead_id']}",
                                          use_container_width=True):
                                 nav_to("Leads", m["lead_id"])
-                            if st.button("✍️ Draft text",
-                                         key=f"bm_draft_{lead_id}_{m['lead_id']}",
-                                         use_container_width=True):
-                                with st.spinner("Drafting..."):
-                                    _bd = buyer_match.draft_buyer_text(
-                                        m, lead, interactions, m["reason"],
-                                        sender="Rom" if st.session_state.get("user", "RJ") == "RJ" else "Gabby")
+                            _bm_sender = "Rom" if st.session_state.get("user", "RJ") == "RJ" else "Gabby"
+                            _bd = priced_action(
+                                f"bm_draft_{lead_id}_{m['lead_id']}", "✍️ Draft text",
+                                lambda: buyer_match.prepare_buyer_text(
+                                    m, lead, interactions, m["reason"], sender=_bm_sender),
+                                lambda approval, prepared: buyer_match.draft_buyer_text(
+                                    m, lead, interactions, m["reason"], sender=_bm_sender,
+                                    approval=approval, prepared=prepared),
+                                use_container_width=True)
+                            if _bd is not None:
                                 if _bd.get("message"):
                                     st.session_state[f"bm_edit_{lead_id}_{m['lead_id']}"] = _bd["message"]
                                     st.session_state["ai_cost_session_total"] = (
@@ -1775,6 +1785,7 @@ with st.sidebar:
     nav_link("Messages", "messages", badge=_unread_count)
     nav_link("Opportunities", "email_review", badge=db.email_opportunity_count(EMAIL_MAILBOX))
     st.caption("💡 Middle-click (or Ctrl-click) any page to open it in a new tab.")
+    budget_panel()
 
 st.divider()
 page = st.session_state["page"]
@@ -1904,16 +1915,19 @@ elif page == "dashboard":
     # 🧠 AI call coaching — reads the week's transcripts and reports what's
     # working, what's costing calls, and the objections heard.
     with st.expander("🧠 Call Coaching — AI review of this week's transcripts", expanded=False):
-        if st.button("Generate this week's report", key="coach_gen"):
-            _cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
-            _tx = [i["content"].replace("📝 Call transcript:\n", "")
-                   for i in all_interactions
-                   if i["type"] == "note"
-                   and i["content"].startswith("📝 Call transcript:")
-                   and i["timestamp"] >= _cutoff]
-            with st.spinner(f"Reading {len(_tx)} transcripts..."):
-                from crm_engine.ai_message_generator import generate_coaching_report
-                _report, _ccost = generate_coaching_report(_tx)
+        from crm_engine.ai_message_generator import generate_coaching_report, prepare_coaching_report
+        _cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        _tx = [i["content"].replace("📝 Call transcript:\n", "")
+               for i in all_interactions
+               if i["type"] == "note"
+               and i["content"].startswith("📝 Call transcript:")
+               and i["timestamp"] >= _cutoff]
+        _coach = priced_action(
+            "coach_gen", "Generate this week's report",
+            lambda: prepare_coaching_report(_tx),
+            lambda approval, prepared: generate_coaching_report(_tx, approval=approval, prepared=prepared))
+        if _coach is not None:
+            _report, _ccost = _coach
             st.session_state["coach_report"] = (_report, _ccost, len(_tx))
             st.session_state["ai_cost_session_total"] = (
                 st.session_state.get("ai_cost_session_total", 0.0) + _ccost)
@@ -2156,7 +2170,8 @@ elif page == "followups":
     _session_ai_cost = st.session_state.get("ai_cost_session_total", 0.0)
     if _session_ai_cost > 0:
         st.caption(f"🤖 AI cost this session: **${_session_ai_cost:.4f}** "
-                   f"(Claude Haiku 4.5 — resets when you restart the app)")
+                   f"(Claude Haiku 5.5 — resets when you restart the app)")
+    st.caption("AI drafts only run when you click ✨ Draft / Regenerate and approve the price.")
     overdue_only = st.session_state.get("followup_overdue_only", False)
     queue = result["followup_queue"]
 
@@ -2199,29 +2214,24 @@ elif page == "followups":
             cost_key = f"f_cost_{lid}"
             reasoning_key = f"f_reasoning_{lid}"
 
+            stage_key = f"f_stage_{lid}"
+
             def _run_generation(target_lead, target_item, target_msg_key, target_flags_key, target_coaching_key, target_cost_key, target_reasoning_key, force=False, extra_context=""):
+                """Load the cached suggestion if it is still current. Never calls
+                AI: new drafts come only from the priced button below."""
                 import json as _json
-                ixns_g = db.fetch_interactions(target_lead["id"])
-                ixn_count = len(ixns_g)
+                ixn_count = len(db.fetch_interactions(target_lead["id"]))
+                cached = db.get_followup_suggestion(target_lead["id"])
+                if cached and cached["interaction_count"] == ixn_count:
+                    st.session_state[target_msg_key] = cached["message"]
+                    st.session_state[target_flags_key] = _json.loads(cached["flags"])
+                    st.session_state[target_cost_key] = 0.0  # cached — no API call, no cost
+                    st.session_state[target_reasoning_key] = f"Tone: {cached['tone']} (cached suggestion)"
+                else:
+                    st.session_state[target_msg_key] = ""
 
-                # Use cached suggestion if interactions haven't changed (unless forced)
-                if not force:
-                    cached = db.get_followup_suggestion(target_lead["id"])
-                    if cached and cached["interaction_count"] == ixn_count:
-                        st.session_state[target_msg_key] = cached["message"]
-                        st.session_state[target_flags_key] = _json.loads(cached["flags"])
-                        st.session_state[target_cost_key] = 0.0  # cached — no API call, no cost
-                        st.session_state[target_reasoning_key] = f"Tone: {cached['tone']} (cached suggestion)"
-                        return
-
-                draft = generate_followup_message(
-                    lead=target_lead,
-                    last_message=target_item["last_message"],
-                    ignored_texts=target_item["ignored_texts"],
-                    strong_intent=target_item["strong_intent"],
-                    conversation=ixns_g,
-                    extra_context=extra_context,
-                )
+            def _apply_draft(staged, target_lead, target_msg_key, target_flags_key, target_coaching_key, target_cost_key, target_reasoning_key):
+                draft, ixn_count = staged["draft"], staged["ixn_count"]
                 st.session_state[target_msg_key] = draft.message
                 st.session_state[target_flags_key] = draft.flags
                 st.session_state[target_cost_key] = draft.cost_usd
@@ -2233,21 +2243,21 @@ elif page == "followups":
                     st.session_state[target_coaching_key] = draft.coaching
                 else:
                     st.session_state.pop(target_coaching_key, None)
-                db.save_followup_suggestion(
-                    target_lead["id"], draft.message, draft.flags,
-                    draft.tone, ixn_count,
-                )
+                if draft.message:  # never cache a failed or unapproved draft
+                    db.save_followup_suggestion(
+                        target_lead["id"], draft.message, draft.flags,
+                        draft.tone, ixn_count,
+                    )
 
-            # Handle regenerate (force=True skips cache)
-            if st.session_state.pop(regen_key, False):
-                with st.spinner("Regenerating..."):
-                    _run_generation(lead, item, msg_key, flags_key, coaching_key, cost_key, reasoning_key, force=True,
-                                    extra_context=st.session_state.get(ctx_key, ""))
+            # A just-approved draft is staged by the button below and applied
+            # here, before the text box is drawn.
+            _staged = st.session_state.pop(stage_key, None)
+            if _staged:
+                _apply_draft(_staged, lead, msg_key, flags_key, coaching_key, cost_key, reasoning_key)
 
-            # Lazy-generate on first view (uses cache if available)
+            # First view: show the cached suggestion if it is still current.
             if msg_key not in st.session_state:
-                with st.spinner(f"Analyzing {item['lead_name']}..."):
-                    _run_generation(lead, item, msg_key, flags_key, coaching_key, cost_key, reasoning_key)
+                _run_generation(lead, item, msg_key, flags_key, coaching_key, cost_key, reasoning_key)
 
             flags = st.session_state.get(flags_key, [])
 
@@ -2327,7 +2337,8 @@ elif page == "followups":
             c1, c2, c_ctx, c3 = st.columns([2, 1, 3, 1])
             _SNOOZE_DAYS = {"warm": 5, "cold": 30}
 
-            if c1.button("Approve & Send", key=f"f_app_{lid}"):
+            if c1.button("Approve & Send", key=f"f_app_{lid}",
+                         disabled=not st.session_state.get(msg_key, "").strip()):
                 if lid > 0:
                     ts = datetime.utcnow()
                     approved_text = st.session_state[msg_key]
@@ -2385,10 +2396,26 @@ elif page == "followups":
                 label_visibility="collapsed",
             )
 
-            def _request_regen(lead_id=lid):
-                st.session_state[f"f_regen_flag_{lead_id}"] = True
+            def _prepare_followup(target_lead=lead, target_item=item, target_ctx=ctx_key):
+                return prepare_followup_request(
+                    target_lead, target_item["last_message"], target_item["ignored_texts"],
+                    target_item["strong_intent"], conversation=db.fetch_interactions(target_lead["id"]),
+                    extra_context=st.session_state.get(target_ctx, ""))
 
-            c3.button("Regenerate", key=f"f_regen_{lid}", on_click=_request_regen)
+            def _run_followup(approval, prepared, target_lead=lead, target_item=item):
+                return {"ixn_count": len(db.fetch_interactions(target_lead["id"])),
+                        "draft": generate_followup_message(
+                            lead=target_lead, last_message=target_item["last_message"],
+                            ignored_texts=target_item["ignored_texts"],
+                            strong_intent=target_item["strong_intent"],
+                            approval=approval, prepared=prepared)}
+
+            _staged_new = priced_action(
+                f"f_regen_{lid}", "Regenerate" if st.session_state.get(msg_key) else "✨ Draft",
+                _prepare_followup, _run_followup, area=c3)
+            if _staged_new is not None:
+                st.session_state[stage_key] = _staged_new
+                st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
 
 elif page == "messages":
@@ -2857,18 +2884,24 @@ elif page == "dialer":
                 "Drag & drop or browse — CSV, XLSX, or TXT",
                 type=["csv", "tsv", "txt", "xlsx"], key="dialer_file_upload",
             )
-            if uploaded and st.button("Parse file", key="dialer_parse_file"):
-                with st.spinner("Parsing file..."):
-                    if uploaded.name.endswith(".xlsx"):
-                        import pandas as pd
-                        df = pd.read_excel(uploaded)
-                        file_text = df.to_csv(index=False)
-                    else:
-                        file_text = uploaded.read().decode("utf-8", errors="replace")
-                    contacts, warnings = parse_contacts(file_text, mode=_selected_mode)
-                st.session_state["dialer_preview"] = contacts
-                st.session_state["dialer_warnings"] = warnings
-                st.rerun()
+            def _uploaded_text():
+                if uploaded.name.endswith(".xlsx"):
+                    import pandas as pd
+                    return pd.read_excel(io.BytesIO(uploaded.getvalue())).to_csv(index=False)
+                return uploaded.getvalue().decode("utf-8", errors="replace")
+
+            if uploaded:
+                # Table parsing is free and runs at once; AI cleanup shows its price first.
+                _parsed = priced_action(
+                    "dialer_parse_file", "Parse file",
+                    lambda: prepare_import(_uploaded_text(), _selected_mode),
+                    lambda approval, prepared: parse_contacts(
+                        "", _selected_mode, approval=approval, prepared=prepared),
+                    button_label="Parse file",
+                    help="Table files parse free. If AI cleanup is needed, you see the price first.")
+                if _parsed is not None:
+                    st.session_state["dialer_preview"], st.session_state["dialer_warnings"] = _parsed
+                    st.rerun()
 
         with _imp_tab2:
             raw = st.text_area(
@@ -2876,11 +2909,15 @@ elif page == "dialer":
                 key="dialer_raw_input", height=160,
                 placeholder="John Smith 773-555-0100 123 Main St\n(515) 555-0199 Jane Doe ...",
             )
-            if st.button("Parse text", key="dialer_parse"):
-                with st.spinner("Parsing contacts..."):
-                    contacts, warnings = parse_contacts(raw, mode=_selected_mode)
-                st.session_state["dialer_preview"] = contacts
-                st.session_state["dialer_warnings"] = warnings
+            _parsed = priced_action(
+                "dialer_parse", "Parse text",
+                lambda: prepare_import(raw, _selected_mode),
+                lambda approval, prepared: parse_contacts(
+                    "", _selected_mode, approval=approval, prepared=prepared),
+                button_label="Parse text",
+                help="Tables parse free. If AI cleanup is needed, you see the price first.")
+            if _parsed is not None:
+                st.session_state["dialer_preview"], st.session_state["dialer_warnings"] = _parsed
                 st.rerun()
 
         preview = st.session_state.get("dialer_preview")

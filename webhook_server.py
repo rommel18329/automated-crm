@@ -36,7 +36,7 @@ load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 from crm_engine import db
 from crm_engine import caller_id_pool
-from crm_engine.messaging_gateway import place_call_number, auto_note_after_text
+from crm_engine.messaging_gateway import place_call_number
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -308,10 +308,6 @@ def inbound_sms():
             "DELETE FROM followup_suggestions WHERE lead_id=?", (lead["id"],)
         )
 
-    # AI auto-note: what they said, what it changes, next move (background).
-    threading.Thread(target=auto_note_after_text, args=(lead["id"], DB_PATH),
-                     daemon=True).start()
-
     # Speed-to-lead: ping the user's cell so the reply happens in minutes.
     if phone != normalize_phone(MY_CELL_NUMBER):
         threading.Thread(target=_alert_cell, args=(
@@ -555,7 +551,7 @@ def voice_transcript():
 
 def _save_transcript(transcript_sid: str) -> None:
     """Fetch a completed transcript's sentences, assemble readable text, and
-    log it on the lead (+ an AI note). Background thread."""
+    log the raw transcript on the lead. AI analysis is a manual priced action."""
     try:
         from twilio.rest import Client as TwilioClient
         twilio = TwilioClient(ACCOUNT_SID, AUTH_TOKEN)
@@ -582,39 +578,6 @@ def _save_transcript(transcript_sid: str) -> None:
         db.add_interaction(lead_id, "note", "📝 Call transcript:\n" + text[:4000],
                            "outbound", DB_PATH, ts=datetime.utcnow())
         log.info(f"Saved transcript {transcript_sid} to lead {lead_id} ({len(text)} chars)")
-        # AI call note: Call / Said / Change / Next, summarized from the
-        # transcript (best-effort — never blocks or fails the save).
-        try:
-            from crm_engine.ai_message_generator import generate_call_note
-            lead = db.fetch_lead(lead_id, DB_PATH)
-            note = generate_call_note(lead or {}, text)
-            if note:
-                db.add_interaction(lead_id, "note", "🤖 " + note, "outbound",
-                                   DB_PATH, ts=datetime.utcnow())
-                log.info(f"Saved AI call note for lead {lead_id}")
-        except Exception as exc:
-            log.warning(f"AI call note failed for lead {lead_id}: {exc}")
-        # Structured extraction: update motivation from what THEY actually
-        # said, and log the concrete facts — feeds the priority engine and
-        # the follow-up AI with real data instead of import defaults.
-        try:
-            from crm_engine.ai_message_generator import extract_call_facts
-            lead = db.fetch_lead(lead_id, DB_PATH)
-            facts = extract_call_facts(lead or {}, text)
-            ms = facts.get("motivation_score")
-            fact_line = (facts.get("facts") or "").strip()
-            parts = []
-            if isinstance(ms, int) and 1 <= ms <= 10 and lead and ms != lead.get("motivation_score"):
-                db.update_lead(lead_id, {"motivation_score": ms}, DB_PATH)
-                parts.append(f"motivation {lead.get('motivation_score')}→{ms}")
-            if fact_line:
-                parts.append(fact_line)
-            if parts:
-                db.add_interaction(lead_id, "note", "📊 From the call: " + " · ".join(parts),
-                                   "outbound", DB_PATH, ts=datetime.utcnow())
-                log.info(f"Extracted call facts for lead {lead_id}: {parts}")
-        except Exception as exc:
-            log.warning(f"Call fact extraction failed for lead {lead_id}: {exc}")
     except Exception as exc:
         log.warning(f"Saving transcript {transcript_sid} failed: {exc}")
 

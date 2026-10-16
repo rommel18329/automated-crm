@@ -473,14 +473,6 @@ def sync_google_voice(client=None, since_days: int = 60, db_path=db.DB_PATH) -> 
     _save_contacts(contacts)
     _save_reply_addrs(reply_store)
 
-    # AI auto-note on the leads that got new GV messages (best-effort).
-    for lid in touched:
-        try:
-            from .messaging_gateway import auto_note_after_text
-            auto_note_after_text(lid, db_path)
-        except Exception:
-            pass
-
     return {"matched": matched, "unmatched": unmatched, "skipped": skipped,
             "leads_touched": len(touched)}
 

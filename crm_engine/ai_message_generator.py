@@ -8,17 +8,12 @@ from pathlib import Path
 
 import os
 from dotenv import load_dotenv
-import anthropic
 from .sms_context import load_email_context, format_email_context
+from .ai_budget import (HAIKU, quote_anthropic, response_cost, response_text,
+                        run_anthropic, run_request, usage_cost)
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-DEFAULT_FALLBACK = "Hey, just wanted to follow up. Still a good time to connect on the property?"
-
-# claude-haiku-4-5 pricing: $1.00 / 1M input tokens, $5.00 / 1M output tokens
-_PRICE_IN_PER_TOKEN = 1.00 / 1_000_000
-_PRICE_OUT_PER_TOKEN = 5.00 / 1_000_000
+DEFAULT_FALLBACK = ""
 
 SYSTEM_PROMPT = """You are an expert real estate acquisitions specialist and negotiation coach helping a wholesaler/investor close cash deals with motivated sellers.
 
@@ -132,8 +127,8 @@ address, price, or date that isn't literally in the conversation. If the message
 is trivial (ok / thumbs up), say so plainly and keep Next short."""
 
 
-def generate_interaction_note(lead: dict, conversation: list[dict],
-                              latest_content: str, direction: str) -> str:
+def prepare_interaction_note(lead: dict, conversation: list[dict],
+                             latest_content: str, direction: str) -> dict:
     """AI auto-note logged after every text: what was said, what it changes,
     what to do next. Returns '' on any failure — a broken note generator must
     never affect texting itself. ~$0.002 per note on Haiku."""
@@ -148,14 +143,20 @@ RECENT CONVERSATION:
 NEW MESSAGE ({who}): {latest_content[:400]}
 
 Write the note."""
+    return {"feature": "text_note", "system": NOTE_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user_msg}],
+            "model": HAIKU, "max_tokens": 120}
+
+
+def generate_interaction_note(lead: dict, conversation: list[dict],
+                              latest_content: str, direction: str,
+                              approval=None, prepared: dict | None = None) -> str:
+    """Create a manual AI text note after its exact price is approved."""
+    if approval is None:
+        return ""
+    request = prepared or prepare_interaction_note(lead, conversation, latest_content, direction)
     try:
-        resp = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=120,
-            system=NOTE_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        return (resp.content[0].text or "").strip()
+        return response_text(run_request(approval, request))
     except Exception:
         return ""
 
@@ -178,12 +179,10 @@ transcript is empty or unintelligible, say "Call didn't transcribe clearly" and
 keep the rest short."""
 
 
-def generate_call_note(lead: dict, transcript_text: str) -> str:
+def prepare_call_note(lead: dict, transcript_text: str) -> dict:
     """AI auto-note summarizing a phone call from its transcript: what happened,
     what they said, what it changes, next move. Returns '' on failure so a
     broken generator never affects the call flow. ~$0.003 per note on Haiku."""
-    if not (transcript_text or "").strip():
-        return ""
     user_msg = f"""LEAD: {lead.get('name', 'Unknown')} — status {lead.get('status', '?')}
 CONTEXT: {(lead.get('timeline') or 'unknown')[:250]}
 
@@ -191,14 +190,18 @@ CALL TRANSCRIPT (speaker-labeled):
 {transcript_text[:3500]}
 
 Write the note."""
+    return {"feature": "call_note", "system": CALL_NOTE_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user_msg}],
+            "model": HAIKU, "max_tokens": 200}
+
+
+def generate_call_note(lead: dict, transcript_text: str, approval=None,
+                       prepared: dict | None = None) -> str:
+    """Create a manual call note after its exact price is approved."""
+    if approval is None or not (transcript_text or "").strip():
+        return ""
     try:
-        resp = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=200,
-            system=CALL_NOTE_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        return (resp.content[0].text or "").strip()
+        return response_text(run_request(approval, prepared or prepare_call_note(lead, transcript_text)))
     except Exception:
         return ""
 
@@ -218,23 +221,26 @@ occupancy, other properties, buyer criteria. Never invent numbers or names.
 No text outside the JSON."""
 
 
-def extract_call_facts(lead: dict, transcript_text: str) -> dict:
+def prepare_call_facts(lead: dict, transcript_text: str) -> dict:
     """Mine a call transcript for structured lead facts. Returns
     {"motivation_score": int|None, "facts": str} — {} on failure."""
-    if not (transcript_text or "").strip():
-        return {}
     user_msg = (f"LEAD: {lead.get('name', 'Unknown')} — current motivation "
                 f"{lead.get('motivation_score', '?')}/10\n\nTRANSCRIPT:\n"
                 + transcript_text[:3500] + "\n\nReturn the JSON now.")
+    return {"feature": "call_facts", "system": EXTRACT_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user_msg}],
+            "model": HAIKU, "max_tokens": 150}
+
+
+def extract_call_facts(lead: dict, transcript_text: str, approval=None,
+                       prepared: dict | None = None) -> dict:
+    """Extract call facts after its exact price is approved."""
+    if approval is None or not (transcript_text or "").strip():
+        return {}
     try:
         import json as _json
-        resp = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=150,
-            system=EXTRACT_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        raw = (resp.content[0].text or "").strip()
+        resp = run_request(approval, prepared or prepare_call_facts(lead, transcript_text))
+        raw = response_text(resp)
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
         start, end = raw.find("{"), raw.rfind("}") + 1
         return _json.loads(raw[start:end]) if start >= 0 else {}
@@ -256,23 +262,28 @@ quote short fragments. No generic sales advice that isn't tied to a call.
 Under 350 words, markdown."""
 
 
-def generate_coaching_report(transcripts: list[str]) -> tuple[str, float]:
+def prepare_coaching_report(transcripts: list[str]) -> dict | None:
     """Weekly coaching from real call transcripts. Returns (markdown, cost)."""
     if not transcripts:
-        return ("No call transcripts in this period yet — make some calls "
-                "and check back.", 0.0)
+        return None
     body = "\n\n---\n\n".join(t[:2500] for t in transcripts[:25])
+    return {"feature": "call_coaching", "system": COACHING_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content":
+                           f"TRANSCRIPTS ({len(transcripts)} calls):\n\n{body}"}],
+            "model": HAIKU, "max_tokens": 800}
+
+
+def generate_coaching_report(transcripts: list[str], approval=None,
+                             prepared: dict | None = None) -> tuple[str, float]:
+    """Weekly coaching from real call transcripts after price approval."""
+    request = prepared or prepare_coaching_report(transcripts)
+    if not request:
+        return ("No call transcripts in this period yet. Make some calls and check back.", 0.0)
+    if approval is None:
+        return ("Coaching report not run: it needs your price approval.", 0.0)
     try:
-        resp = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=800,
-            system=COACHING_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content":
-                       f"TRANSCRIPTS ({len(transcripts)} calls):\n\n{body}"}],
-        )
-        cost = (resp.usage.input_tokens * 1.00
-                + resp.usage.output_tokens * 5.00) / 1_000_000
-        return ((resp.content[0].text or "").strip(), round(cost, 4))
+        resp = run_request(approval, request)
+        return (response_text(resp), response_cost(resp, request["model"]))
     except Exception as exc:
         return (f"Coaching report failed: {exc}", 0.0)
 
@@ -309,13 +320,13 @@ def _days_since_last_contact(conversation: list[dict]) -> int | None:
     return max(0, (datetime.now(timezone.utc) - max(contacts)).days) if contacts else None
 
 
-def generate_message(
+def prepare_message_request(
     lead: dict,
     conversation: list[dict],
     objective: str,
     strategy: str,
     extra_context: str = "",
-) -> MessageResult:
+) -> dict:
     email_context = load_email_context(lead)
     convo_text = _build_conversation_text(conversation)
 
@@ -395,14 +406,30 @@ CURRENT AGENT REQUEST (for this draft, takes precedence over default suggestions
 
 Write the SMS and separate coaching. Before returning, check that the SMS honors the requested timing and wording, does not revive an old appointment as current, and that coaching answers any question the agent asked."""
 
+    return {"feature": "text_draft", "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user_msg}],
+            "model": HAIKU, "max_tokens": 512,
+            "email_status": email_context["status"]}
+
+
+def generate_message(
+    lead: dict,
+    conversation: list[dict],
+    objective: str,
+    strategy: str,
+    extra_context: str = "",
+    approval=None,
+    prepared: dict | None = None,
+) -> MessageResult:
+    if approval is None:
+        # Background callers (daily queue, legacy pages) get an empty draft
+        # instead of a paid call; the dashboard prices and runs it on request.
+        return MessageResult(message="", flags=["AI draft not generated: needs your price approval."])
+    request = prepared or prepare_message_request(lead, conversation, objective, strategy, extra_context)
+    email_status = request.get("email_status", "")
     try:
-        resp = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=512,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        raw = (resp.content[0].text or "").strip()
+        resp = run_request(approval, request)
+        raw = response_text(resp)
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
         # Extract just the first complete JSON object, ignoring any trailing text
         start = raw.find("{")
@@ -410,12 +437,11 @@ Write the SMS and separate coaching. Before returning, check that the SMS honors
         if start == -1 or end == 0:
             raise ValueError("No JSON object found in response")
         data = json.loads(raw[start:end])
-        message = _strip_ai_tells(str(data.get("message", DEFAULT_FALLBACK)))
+        message = _strip_ai_tells(str(data.get("message", "")))
         coaching = _strip_ai_tells(str(data.get("coaching", "")))
-        coaching = email_context['status'] + ("\n\n" + coaching if coaching else "")
+        coaching = email_status + ("\n\n" + coaching if coaching else "")
         in_tok = getattr(resp.usage, "input_tokens", 0) or 0
         out_tok = getattr(resp.usage, "output_tokens", 0) or 0
-        cost = in_tok * _PRICE_IN_PER_TOKEN + out_tok * _PRICE_OUT_PER_TOKEN
         return MessageResult(
             message=message,
             flags=[str(f) for f in data.get("flags", [])[:5]],
@@ -423,11 +449,11 @@ Write the SMS and separate coaching. Before returning, check that the SMS honors
             coaching=coaching,
             input_tokens=in_tok,
             output_tokens=out_tok,
-            cost_usd=cost,
+            cost_usd=usage_cost(request["model"], in_tok, out_tok),
         )
     except Exception as exc:
         return MessageResult(
-            message=DEFAULT_FALLBACK,
+            message="",
             flags=[f"🔴 AI generation failed: {exc}"],
-            coaching=email_context['status'] + "\n\nAI generation failed. Review the conversation before using the fallback text.",
+            coaching=email_status + f"\n\nAI generation failed: {exc}. No fallback message was inserted.",
         )
