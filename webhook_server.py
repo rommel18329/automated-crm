@@ -86,6 +86,36 @@ def _alert_cell(key: str, message: str) -> None:
         log.warning(f"Cell alert failed: {exc}")
 
 
+def _text_my_cell(message: str) -> bool:
+    """Text the user's cell now (no cooldown; appointment reminders must all go out)."""
+    if not MY_CELL_NUMBER or not FROM_NUMBER:
+        log.warning("Appointment text not sent: MY_CELL_NUMBER / TWILIO_FROM_NUMBER not set")
+        return False
+    try:
+        from twilio.rest import Client as TwilioClient
+        _kw = {"body": message[:320], "from_": FROM_NUMBER, "to": to_e164(MY_CELL_NUMBER)}
+        if MESSAGING_SERVICE_SID:
+            _kw["messaging_service_sid"] = MESSAGING_SERVICE_SID
+        TwilioClient(ACCOUNT_SID, AUTH_TOKEN).messages.create(**_kw)
+        log.info(f"Texted my cell: {message[:70]}")
+        return True
+    except Exception as exc:
+        log.warning(f"Text to my cell failed: {exc}")
+        return False
+
+
+def _appointment_reminder_loop() -> None:
+    """Every 30s, text any appointment reminders that are due. Started only
+    when the server runs (not on import), so tests never text the real cell."""
+    from crm_engine import appointments
+    while True:
+        try:
+            appointments.send_due_reminders(_text_my_cell, DB_PATH)
+        except Exception as exc:
+            log.warning(f"Appointment reminder loop error: {exc}")
+        time.sleep(30)
+
+
 # ── Daily "sellers are waiting on you" reminder ─────────────────────────────
 # Every morning (DAILY_REMINDER_HOUR local, default 9), text the user's cell a
 # digest of every thread where a seller had the last word and every missed
@@ -322,6 +352,19 @@ def inbound_sms():
     if not phone:
         log.warning(f"Could not normalize phone: {from_raw}")
         return _twiml_response()
+
+    # "OK" / "got it" from the user's own cell stops that appointment's reminders.
+    if MY_CELL_NUMBER and phone == normalize_phone(MY_CELL_NUMBER):
+        try:
+            from crm_engine import appointments
+            reply = appointments.acknowledge_reply(body, DB_PATH)
+        except Exception as exc:
+            log.warning(f"Appointment OK reply failed: {exc}")
+            reply = None
+        if reply:
+            log.info(f"Appointment reply from my cell: {body[:40]!r} -> {reply}")
+            threading.Thread(target=_text_my_cell, args=(reply,), daemon=True).start()
+            return _twiml_response()
 
     # Match to lead
     leads = db.fetch_leads(DB_PATH)
@@ -2054,6 +2097,40 @@ def dialer_queue_status():
                           "list_alerts": health["alerts"] if health else []}))
 
 
+@app.route("/dialer/appointment", methods=["POST", "OPTIONS"])
+def dialer_appointment():
+    """Book an appointment from the softphone and text a confirmation.
+    Body: {lead_id, agent, date: YYYY-MM-DD, time: HH:MM (Central), kind, note}."""
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    from crm_engine import appointments
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        lead_id = int(data.get("lead_id"))
+        if not db.fetch_lead(lead_id, DB_PATH):
+            return _cors(jsonify({"ok": False, "error": "lead not found"})), 404
+        appt = appointments.book(lead_id, str(data.get("date", "")), str(data.get("time", "")),
+                                 kind=str(data.get("kind") or "call"), note=str(data.get("note") or ""),
+                                 agent=(data.get("agent") or None), db_path=DB_PATH)
+    except (TypeError, ValueError) as exc:
+        return _cors(jsonify({"ok": False, "error": str(exc) or "bad date or time"})), 400
+    threading.Thread(target=_text_my_cell, args=(appointments.booked_text(appt),), daemon=True).start()
+    log.info(f"Appointment #{appt['id']} booked for lead {lead_id} at {appt['starts_at']}Z")
+    return _cors(jsonify({"ok": True, "id": appt["id"], "label": appointments.when_label(appt["starts_at"])}))
+
+
+@app.route("/dialer/appointments")
+def dialer_appointments():
+    """Upcoming appointments (optionally for one lead) for the softphone."""
+    from crm_engine import appointments
+    lead_id = request.args.get("lead_id", type=int)
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    rows = db.upcoming_appointments(now, lead_id, DB_PATH)
+    return _cors(jsonify([{"id": r["id"], "lead_id": r["lead_id"], "lead_name": r["lead_name"],
+                           "kind": r["kind"], "status": r["status"],
+                           "label": appointments.when_label(r["starts_at"])} for r in rows]))
+
+
 _DTMF_RE = re.compile(r"[0-9*#w]{1,20}")
 
 
@@ -2179,6 +2256,11 @@ def softphone_page():
   .btn-mute.active { background:#ffc107; color:#000; }
   .disp { margin-top:12px; display:none; }
   .disp.show { display:block; }
+  .appt-row { display:flex; gap:6px; margin-bottom:6px; }
+  .appt-row input, .appt-row select, #apptNote { flex:1; min-width:0; padding:7px 6px; border:1px solid #ccc;
+      border-radius:7px; font-size:13px; font-family:inherit; box-sizing:border-box; }
+  #apptNote { width:100%; margin-bottom:6px; }
+  #apptStatus { font-size:12px; margin-top:6px; text-align:center; }
   .disp-title { font-size:12px; color:#777; text-align:center; margin-bottom:6px;
                 text-transform:uppercase; letter-spacing:.5px; }
   .disp-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; }
@@ -2303,6 +2385,21 @@ def softphone_page():
       <button class="disp-btn st-warm" onclick="setLeadStatus('warm')">🌤 Warm</button>
       <button class="disp-btn st-cold" onclick="setLeadStatus('cold')">❄️ Cold</button>
     </div>
+  </div>
+  <div id="apptSection">
+    <div class="disp-title" style="margin-top:10px">📅 Set appointment (Central time)</div>
+    <div class="appt-row">
+      <input type="date" id="apptDate" aria-label="Appointment date">
+      <input type="time" id="apptTime" step="300" aria-label="Appointment time">
+      <select id="apptKind" aria-label="Appointment type">
+        <option value="call">Call back</option>
+        <option value="walkthrough">Walkthrough</option>
+        <option value="meeting">Meeting</option>
+      </select>
+    </div>
+    <input id="apptNote" maxlength="140" placeholder="Appointment note (optional)">
+    <button class="btn btn-call" id="btnAppt" style="width:100%">📅 Book + text me reminders</button>
+    <div id="apptStatus" role="status"></div>
   </div>
   <button class="btn btn-call" id="btnDispNext"
           style="width:100%;margin-top:8px">✓ Save & Next lead</button>
@@ -2468,6 +2565,7 @@ def softphone_page():
   }
 
   function loadScriptForLead(leadId) {
+    if (typeof showLeadAppointments === 'function') showLeadAppointments(leadId);
     if (!leadId) { renderScript(null); attemptLine.textContent = ''; return; }
     fetch('/dialer/lead/' + leadId)
       .then(function(r) { return r.json(); })
@@ -2476,6 +2574,56 @@ def softphone_page():
   }
 
   renderScript(null);   // show generic script until a lead is dialed
+
+  // ── Appointments: book from the disposition panel; the CRM texts your cell
+  // reminders 1 day, 1 hr, 30, 10 and 5 min before (reply OK to stop them).
+  var apptDate = document.getElementById('apptDate');
+  var apptTime = document.getElementById('apptTime');
+  var apptKind = document.getElementById('apptKind');
+  var apptNote = document.getElementById('apptNote');
+  var apptStatus = document.getElementById('apptStatus');
+  var btnAppt = document.getElementById('btnAppt');
+  function resetApptForm() {
+    var d = new Date(Date.now() + 86400000);   // default: tomorrow, 10:00
+    apptDate.value = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' +
+                     String(d.getDate()).padStart(2, '0');
+    apptTime.value = '10:00';
+    apptKind.value = 'call';
+    apptNote.value = '';
+  }
+  function showLeadAppointments(leadId) {
+    apptStatus.textContent = '';
+    if (!leadId) return;
+    fetch('/dialer/appointments?lead_id=' + leadId)
+      .then(function(r) { return r.json(); })
+      .then(function(list) {
+        if (list.length) apptStatus.textContent = '📅 Already booked: ' +
+          list.map(function(a) { return a.label + ' (#' + a.id + ')'; }).join(', ');
+      })
+      .catch(function() {});
+  }
+  resetApptForm();
+  btnAppt.addEventListener('click', function() {
+    var leadId = currentLeadId || noteLeadId;
+    if (!leadId) { apptStatus.textContent = 'No lead on this call to book.'; return; }
+    if (!apptDate.value || !apptTime.value) { apptStatus.textContent = 'Pick a date and time.'; return; }
+    btnAppt.disabled = true;
+    apptStatus.textContent = 'Booking…';
+    fetch('/dialer/appointment', { method: 'POST', body: JSON.stringify({
+        lead_id: leadId, agent: AGENT, date: apptDate.value, time: apptTime.value,
+        kind: apptKind.value, note: apptNote.value }) })
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        if (j.ok) {
+          apptStatus.textContent = '✅ Booked ' + j.label + ' (#' + j.id + ') — reminder texts on';
+          resetApptForm();
+        } else {
+          apptStatus.textContent = '⚠️ Not booked: ' + (j.error || 'unknown error');
+        }
+      })
+      .catch(function() { apptStatus.textContent = '⚠️ Not booked: server unreachable'; })
+      .finally(function() { btnAppt.disabled = false; });
+  });
 
   // ── Keypad: answer phone menus / call screeners ("press 1 to be connected")
   // Single-line calls are bridged straight to the seller, so the browser sends
@@ -3636,6 +3784,7 @@ def _twiml_response() -> Response:
 
 if __name__ == "__main__":
     db.init_db(DB_PATH)
+    threading.Thread(target=_appointment_reminder_loop, daemon=True).start()
     print("Twilio webhook server starting on http://localhost:5001")
     # Use waitress (production WSGI, multi-threaded) so concurrent softphone
     # polls + simultaneous Twilio callbacks during multi-line dialing don't

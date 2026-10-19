@@ -401,6 +401,35 @@ def _init_db_once(db_path: Path = DB_PATH) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_interactions_lead_ts
                 ON interactions(lead_id, timestamp DESC);
+
+            -- Appointments set from the softphone; reminders text the user's cell.
+            -- Approved by the user 2026-10-19 (additive, no existing rows touched).
+            CREATE TABLE IF NOT EXISTS appointments (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id         INTEGER NOT NULL,
+                starts_at       TEXT NOT NULL,
+                kind            TEXT NOT NULL DEFAULT 'call',
+                note            TEXT NOT NULL DEFAULT '',
+                agent           TEXT,
+                status          TEXT NOT NULL DEFAULT 'scheduled'
+                                CHECK (status IN ('scheduled','acknowledged','cancelled')),
+                created_at      TEXT NOT NULL,
+                acknowledged_at TEXT,
+                FOREIGN KEY (lead_id) REFERENCES leads (id)
+            );
+
+            CREATE TABLE IF NOT EXISTS appointment_reminders (
+                appointment_id INTEGER NOT NULL,
+                offset_min     INTEGER NOT NULL,
+                send_at        TEXT NOT NULL,
+                status         TEXT NOT NULL DEFAULT 'pending'
+                               CHECK (status IN ('pending','sent','skipped','stopped')),
+                sent_at        TEXT,
+                PRIMARY KEY (appointment_id, offset_min)
+            );
+
+            CREATE INDEX IF NOT EXISTS appointment_reminders_due
+                ON appointment_reminders (status, send_at);
             """
         )
         # Migration: add 'investor' to status CHECK (requires table recreation in SQLite)
@@ -1463,6 +1492,93 @@ def dial_list_attempts(list_id: int, db_path: Path = DB_PATH) -> list[dict[str, 
     return out
 
 
+# ── Appointments + reminder texts (schedule logic lives in crm_engine/appointments.py)
+
+def create_appointment(lead_id: int, starts_at: str, kind: str, note: str, agent: str | None,
+                       reminders: list[tuple[int, str, str]], db_path: Path = DB_PATH) -> int:
+    """starts_at: UTC ISO. reminders: (offset_min, send_at UTC ISO, status)."""
+    with get_conn(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO appointments (lead_id, starts_at, kind, note, agent, created_at) VALUES (?,?,?,?,?,?)",
+            (lead_id, starts_at, kind, note, agent, datetime.utcnow().isoformat(timespec="seconds")))
+        appt_id = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO appointment_reminders (appointment_id, offset_min, send_at, status) VALUES (?,?,?,?)",
+            [(appt_id, off, send_at, status) for off, send_at, status in reminders])
+    return int(appt_id)
+
+
+def reschedule_appointment(appt_id: int, starts_at: str, reminders: list[tuple[int, str, str]],
+                           db_path: Path = DB_PATH) -> None:
+    """New time; every reminder is rebuilt for it (and turned back on)."""
+    with get_conn(db_path) as conn:
+        conn.execute("UPDATE appointments SET starts_at=?, status='scheduled', acknowledged_at=NULL WHERE id=?",
+                     (starts_at, appt_id))
+        conn.executemany(
+            "INSERT OR REPLACE INTO appointment_reminders (appointment_id, offset_min, send_at, status, sent_at) "
+            "VALUES (?,?,?,?,NULL)", [(appt_id, off, send_at, status) for off, send_at, status in reminders])
+
+
+def set_appointment_status(appt_id: int, status: str, db_path: Path = DB_PATH) -> None:
+    """acknowledged / cancelled: also stops that appointment's pending reminders."""
+    with get_conn(db_path) as conn:
+        conn.execute("UPDATE appointments SET status=?, acknowledged_at=? WHERE id=?",
+                     (status, datetime.utcnow().isoformat(timespec="seconds") if status == "acknowledged" else None,
+                      appt_id))
+        if status in ("acknowledged", "cancelled"):
+            conn.execute("UPDATE appointment_reminders SET status='stopped' "
+                         "WHERE appointment_id=? AND status='pending'", (appt_id,))
+
+
+def fetch_appointment(appt_id: int, db_path: Path = DB_PATH) -> dict | None:
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT a.*, l.name AS lead_name, l.phone AS lead_phone, l.timeline AS lead_timeline "
+            "FROM appointments a JOIN leads l ON l.id = a.lead_id WHERE a.id=?", (appt_id,)).fetchone()
+    return _to_dict(row) if row else None
+
+
+def upcoming_appointments(since_utc: str, lead_id: int | None = None,
+                          db_path: Path = DB_PATH) -> list[dict[str, Any]]:
+    """Not-cancelled appointments starting at or after since_utc, soonest first."""
+    sql = ("SELECT a.*, l.name AS lead_name, l.phone AS lead_phone FROM appointments a "
+           "JOIN leads l ON l.id = a.lead_id WHERE a.status != 'cancelled' AND a.starts_at >= ?")
+    args: list[Any] = [since_utc]
+    if lead_id is not None:
+        sql += " AND a.lead_id = ?"
+        args.append(lead_id)
+    with get_conn(db_path) as conn:
+        return [_to_dict(r) for r in conn.execute(sql + " ORDER BY a.starts_at", args)]
+
+
+def pending_reminders_due(now_utc: str, db_path: Path = DB_PATH) -> list[dict[str, Any]]:
+    """Pending reminders whose send time has come, for still-scheduled appointments."""
+    with get_conn(db_path) as conn:
+        return [_to_dict(r) for r in conn.execute(
+            "SELECT r.appointment_id, r.offset_min, r.send_at FROM appointment_reminders r "
+            "JOIN appointments a ON a.id = r.appointment_id "
+            "WHERE r.status='pending' AND a.status='scheduled' AND r.send_at <= ? "
+            "ORDER BY r.appointment_id, r.offset_min", (now_utc,))]
+
+
+def mark_reminder(appt_id: int, offset_min: int, status: str, db_path: Path = DB_PATH) -> None:
+    with get_conn(db_path) as conn:
+        conn.execute("UPDATE appointment_reminders SET status=?, sent_at=? WHERE appointment_id=? AND offset_min=?",
+                     (status, datetime.utcnow().isoformat(timespec="seconds") if status == "sent" else None,
+                      appt_id, offset_min))
+
+
+def last_reminded_appointment(since_utc: str, db_path: Path = DB_PATH) -> int | None:
+    """The still-scheduled appointment whose reminder was texted most recently
+    (what a bare "OK" from the user's cell refers to)."""
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT r.appointment_id FROM appointment_reminders r JOIN appointments a ON a.id = r.appointment_id "
+            "WHERE r.status='sent' AND r.sent_at >= ? AND a.status='scheduled' "
+            "ORDER BY r.sent_at DESC LIMIT 1", (since_utc,)).fetchone()
+    return int(row["appointment_id"]) if row else None
+
+
 def count_dial_attempts(lead_id: int, db_path: Path = DB_PATH) -> int:
     """Real dial attempts on this lead so far (answered or not), for the
     softphone's "Attempt #N" line. Status-only rows and lines cut off because
@@ -1484,7 +1600,7 @@ def recent_list_outcomes(list_id: int, limit: int = 100, db_path: Path = DB_PATH
             f"""SELECT d.disposition FROM dispositions d
                 JOIN dial_list_members m ON m.lead_id = d.lead_id
                 WHERE m.list_id = ? AND d.disposition NOT IN ({marks})
-                ORDER BY d.id DESC LIMIT ?""",
+                ORDER BY d.created_at DESC, d.id DESC LIMIT ?""",
             (list_id, *NOT_A_TRY, limit),
         ).fetchall()
     return [r["disposition"] for r in rows]

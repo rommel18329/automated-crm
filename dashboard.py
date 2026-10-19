@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import base64
 import html
 import io
@@ -1587,6 +1587,8 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("**📅 Appointments**")
+        render_appointments("lead", lead_id)
         st.markdown("**Send a Text**")
         if lead.get("phone", "") in _gv_contacts:
             st.markdown(_gv_flag(lead.get("phone", "")), unsafe_allow_html=True)
@@ -1681,6 +1683,44 @@ _GV_NONE_FLAG = "<div class='sl-flag' style='border-color:#8e44ad;color:#6c3483;
 
 def _gv_flag(phone: str) -> str:
     return _GV_OK_FLAG if has_reply_addr(phone, _gv_replies) else _GV_NONE_FLAG
+
+
+def render_appointments(key_prefix: str, lead_id: int | None = None) -> None:
+    """Upcoming appointments (all, or one lead's) with Cancel and Reschedule.
+    Booking happens in the softphone; reminders text your cell."""
+    from crm_engine import appointments as _ap
+    _rows = db.upcoming_appointments(datetime.utcnow().isoformat(timespec="seconds"), lead_id)
+    if not _rows:
+        if lead_id is not None:
+            st.caption("📅 No upcoming appointment. Book one from the softphone after a call.")
+        return
+    for _a in _rows:
+        _key = f"{key_prefix}_appt_{_a['id']}"
+        _state = {"scheduled": "reminders on", "acknowledged": "reminders off (you replied OK)"}.get(_a["status"], "")
+        _c1, _c2, _c3 = st.columns([5, 1.2, 1.2])
+        _who = "" if lead_id is not None else f"**{_a['lead_name']}** `{_a['lead_phone']}` · "
+        _c1.markdown(f"📅 {_who}{_ap.KINDS.get(_a['kind'], _a['kind'])} · **{_ap.when_label(_a['starts_at'])}**"
+                     + (f" · {html.escape(_a['note'])}" if _a["note"] else "") + f"  \n_{_state} · #{_a['id']}_")
+        if _c2.button("Reschedule", key=f"{_key}_rs", use_container_width=True):
+            st.session_state[f"{_key}_editing"] = True
+        if _c3.button("Cancel", key=f"{_key}_cancel", use_container_width=True):
+            _ap.cancel(_a["id"])
+            st.toast(f"Cancelled appointment #{_a['id']} and its reminders.")
+            st.rerun()
+        if st.session_state.get(f"{_key}_editing"):
+            _local = datetime.fromisoformat(_a["starts_at"]).replace(tzinfo=timezone.utc).astimezone(_ap.CRM_TZ)
+            _d1, _d2, _d3 = st.columns([2, 2, 1.4])
+            _new_date = _d1.date_input("New date", value=_local.date(), key=f"{_key}_date")
+            _new_time = _d2.time_input("New time (Central)", value=_local.time().replace(second=0),
+                                       step=300, key=f"{_key}_time")
+            if _d3.button("Save", key=f"{_key}_save", type="primary", use_container_width=True):
+                try:
+                    _ap.reschedule(_a["id"], _new_date.isoformat(), _new_time.strftime("%H:%M"))
+                    st.session_state.pop(f"{_key}_editing", None)
+                    st.toast("Rescheduled. Reminder texts reset for the new time.")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
 
 
 def render_move_to_twilio(lead: dict, key_prefix: str) -> None:
@@ -2006,6 +2046,11 @@ elif page == "dashboard":
             _report, _ccost, _n = st.session_state["coach_report"]
             st.caption(f"Based on {_n} transcripts · ${_ccost:.4f}")
             st.markdown(_report)
+
+    with st.expander("📅 Upcoming appointments", expanded=True):
+        render_appointments("home")
+        st.caption("Book from the softphone after a call. Reminder texts go to your cell "
+                   "1 day, 1 hr, 30, 10 and 5 min before; reply OK to stop them. Never reply STOP.")
 
     st.markdown("### Today’s Priorities")
     pcols = st.columns(5)
