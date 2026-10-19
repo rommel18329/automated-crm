@@ -94,6 +94,18 @@ def booked_text(appt: dict) -> str:
             "Reply OK to any reminder to stop the rest. Never reply STOP.")[:320]
 
 
+def whatsapp_vars(appt: dict, headline: str) -> dict:
+    """Template variables for the family WhatsApp copy. Template to approve:
+    "📅 {{1}}: {{2}} · {{3}}"  e.g. "📅 In 1 hour: Trent Holliday 641-344-7109 · 5:00 PM Mon Oct 19, call back, 311 S Maple St"."""
+    detail = f"{when_label(appt['starts_at'])}, {KINDS.get(appt['kind'], appt['kind'])}"
+    address = _address(appt.get("lead_timeline"))
+    if address:
+        detail += f", {address}"
+    if appt.get("note"):
+        detail += f", {appt['note'][:80]}"
+    return {"1": headline, "2": f"{appt['lead_name']} {appt['lead_phone']}", "3": detail[:300]}
+
+
 def parse_ack(text: str) -> tuple[bool, int | None]:
     """(is an OK-style reply, appointment # if they named one)."""
     m = _ACK_RE.match(text or "")
@@ -148,10 +160,16 @@ def cancel(appt_id: int, db_path: Path = db.DB_PATH) -> None:
                        f"📅 Appointment {when_label(appt['starts_at'])} cancelled", "outbound", db_path)
 
 
-def send_due_reminders(send_text, db_path: Path = db.DB_PATH, now: datetime | None = None) -> int:
+WHATSAPP_OFFSETS = (60,)       # the family copy gets the 1-hour reminder (and the booking text)
+
+
+def send_due_reminders(send_text, db_path: Path = db.DB_PATH, now: datetime | None = None,
+                       send_whatsapp=None) -> int:
     """Text every reminder that's due. send_text(message) -> bool. Per
     appointment only the latest due reminder goes out (after downtime the
-    older ones are skipped). Returns how many were sent."""
+    older ones are skipped). send_whatsapp(vars) is called once, best-effort,
+    after the 1-hour reminder was texted to the cell (never retried, so a
+    WhatsApp failure can't repeat the cell text). Returns how many were sent."""
     now = now or datetime.now(timezone.utc)
     due: dict[int, list[dict]] = {}
     for row in db.pending_reminders_due(_utc(now), db_path):
@@ -169,6 +187,11 @@ def send_due_reminders(send_text, db_path: Path = db.DB_PATH, now: datetime | No
         if send_text(reminder_text(appt, now)):
             db.mark_reminder(appt_id, latest["offset_min"], "sent", db_path)
             sent += 1
+            if send_whatsapp and latest["offset_min"] in WHATSAPP_OFFSETS:
+                try:
+                    send_whatsapp(whatsapp_vars(appt, "In 1 hour"))
+                except Exception:
+                    pass
         # On a failed send the reminder stays pending and is retried next loop.
     return sent
 

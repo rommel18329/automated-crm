@@ -104,13 +104,42 @@ def _text_my_cell(message: str) -> bool:
         return False
 
 
+WIFE_WHATSAPP_NUMBER = os.getenv("WIFE_WHATSAPP_NUMBER", "")          # e.g. +18297644394
+WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")                  # sandbox: +14155238886
+WHATSAPP_TEMPLATE_SID = os.getenv("TWILIO_WHATSAPP_TEMPLATE_SID", "")  # approved "📅 {{1}}: {{2}} · {{3}}"
+
+
+def _whatsapp_family(variables: dict) -> bool:
+    """WhatsApp copy of a booking / 1-hour reminder to the family number.
+    Uses the approved template when configured (required outside WhatsApp's
+    24-hour reply window); otherwise a plain message (works in Twilio's
+    sandbox, or within 24h of her last message). Best-effort, never raises."""
+    if not (WIFE_WHATSAPP_NUMBER and WHATSAPP_FROM):
+        return False
+    try:
+        from twilio.rest import Client as TwilioClient
+        kw = {"from_": f"whatsapp:{to_e164(WHATSAPP_FROM)}",
+              "to": f"whatsapp:{to_e164(WIFE_WHATSAPP_NUMBER)}"}
+        if WHATSAPP_TEMPLATE_SID:
+            kw["content_sid"] = WHATSAPP_TEMPLATE_SID
+            kw["content_variables"] = json.dumps(variables, ensure_ascii=False)
+        else:
+            kw["body"] = f"📅 {variables['1']}: {variables['2']} · {variables['3']}"
+        TwilioClient(ACCOUNT_SID, AUTH_TOKEN).messages.create(**kw)
+        log.info(f"WhatsApp sent to family: {variables.get('1')} · {variables.get('2')}")
+        return True
+    except Exception as exc:
+        log.warning(f"WhatsApp to family failed: {exc}")
+        return False
+
+
 def _appointment_reminder_loop() -> None:
     """Every 30s, text any appointment reminders that are due. Started only
     when the server runs (not on import), so tests never text the real cell."""
     from crm_engine import appointments
     while True:
         try:
-            appointments.send_due_reminders(_text_my_cell, DB_PATH)
+            appointments.send_due_reminders(_text_my_cell, DB_PATH, send_whatsapp=_whatsapp_family)
         except Exception as exc:
             log.warning(f"Appointment reminder loop error: {exc}")
         time.sleep(30)
@@ -2115,6 +2144,8 @@ def dialer_appointment():
     except (TypeError, ValueError) as exc:
         return _cors(jsonify({"ok": False, "error": str(exc) or "bad date or time"})), 400
     threading.Thread(target=_text_my_cell, args=(appointments.booked_text(appt),), daemon=True).start()
+    threading.Thread(target=_whatsapp_family, args=(appointments.whatsapp_vars(appt, "Booked"),),
+                     daemon=True).start()
     log.info(f"Appointment #{appt['id']} booked for lead {lead_id} at {appt['starts_at']}Z")
     return _cors(jsonify({"ok": True, "id": appt["id"], "label": appointments.when_label(appt["starts_at"])}))
 

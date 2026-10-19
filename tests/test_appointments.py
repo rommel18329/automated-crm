@@ -69,6 +69,26 @@ def test_reminders_go_out_on_time_and_only_the_latest_after_downtime(setup):
     assert ap.send_due_reminders(send, path, now=at(117)) == 0           # nothing left
 
 
+def test_family_whatsapp_gets_only_the_one_hour_reminder_and_never_blocks_the_cell_text(setup):
+    path, lead = setup
+    appt = ap.book(lead, "2026-10-16", "15:00", "call", "roof", db_path=path, now=NOW)   # 2 hours out
+    wa = []
+    send = lambda msg: True
+    ap.send_due_reminders(send, path, now=at(61), send_whatsapp=wa.append)               # 1-hour reminder
+    assert len(wa) == 1 and wa[0]["1"] == "In 1 hour" and wa[0]["2"] == "Trent Holliday 641-344-7109"
+    assert wa[0]["3"].startswith("3:00 PM Fri Oct 16, call back, 311 S Maple St") and wa[0]["3"].endswith("roof")
+    ap.send_due_reminders(send, path, now=at(113), send_whatsapp=wa.append)              # 7 min before
+    assert len(wa) == 1                                                                   # not the 10/5 min ones
+
+    def boom(_):
+        raise RuntimeError("whatsapp down")
+    ap.book(lead, "2026-10-16", "16:30", db_path=path, now=NOW)
+    texts = []
+    assert ap.send_due_reminders(lambda m: texts.append(m) or True, path, now=at(150),
+                                 send_whatsapp=boom) == 1                                 # cell text still sent
+    assert len(texts) == 1
+
+
 def test_failed_send_is_retried_and_old_appointments_are_dropped(setup):
     path, lead = setup
     ap.book(lead, "2026-10-16", "13:20", db_path=path, now=NOW)
@@ -123,10 +143,11 @@ def test_booking_route(setup, monkeypatch):
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef)
              and n.name in ("dialer_appointment", "dialer_appointments")]
     app = Flask(__name__)
-    texts = []
+    texts, whatsapps = [], []
     ns = {"app": app, "request": request, "Response": Response, "jsonify": jsonify, "db": db,
           "DB_PATH": path, "_cors": lambda r: r, "log": logging.getLogger(__name__), "datetime": datetime,
           "_text_my_cell": lambda m: texts.append(m) or True,
+          "_whatsapp_family": lambda v: whatsapps.append(v) or True,
           "threading": type("T", (), {"Thread": lambda target, args, daemon:
                                       type("R", (), {"start": lambda self: target(*args)})()})}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), ns)
@@ -136,6 +157,7 @@ def test_booking_route(setup, monkeypatch):
                                                  "time": "17:00", "kind": "call", "note": "x"})
     assert r.json["ok"] and r.json["label"].startswith("5:00 PM")
     assert texts and texts[0].startswith("📅 Booked: Trent Holliday")
+    assert whatsapps[0]["1"] == "Booked" and whatsapps[0]["2"] == "Trent Holliday 641-344-7109"
     listed = client.get(f"/dialer/appointments?lead_id={lead}").json
     assert [a["id"] for a in listed] == [r.json["id"]]
     bad = client.post("/dialer/appointment", json={"lead_id": lead, "date": "nope", "time": "17:00"})
