@@ -20,13 +20,14 @@ Ctrl+C stops everything cleanly.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import subprocess
 import sys
 import threading
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -123,6 +124,103 @@ class FunnelWatch:
             self.last_repair = now
             return True
         return False
+
+    def request_repair(self, now: float) -> bool:
+        """Repair requested by an outside signal (Twilio saw a 502). Honors the
+        same cooldown as record() and shares its last_repair clock."""
+        if now - self.last_repair < self.cooldown:
+            return False
+        self.fails = 0
+        self.last_repair = now
+        return True
+
+
+TWILIO_ALERT_POLL = 30.0      # seconds between Twilio Monitor alert reads
+TWILIO_ALERT_WINDOW = 300.0   # only alerts created in the last 5 minutes count
+
+
+def find_funnel_502(alerts, base_url: str, now_utc: datetime,
+                    since_utc: datetime | None = None,
+                    window: float = TWILIO_ALERT_WINDOW):
+    """Return the newest Twilio alert that shows Twilio got HTTP 502 (error
+    11200) from our public webhook URL within `window` seconds, ignoring any
+    created before `since_utc` (the last repair). None if there isn't one.
+    Pure function: `alerts` is any iterable of objects with error_code,
+    alert_text, request_url and date_created (tz-aware datetime)."""
+    if not base_url:
+        return None
+    best = None
+    for a in alerts:
+        try:
+            if str(a.error_code) != "11200":
+                continue
+            created = a.date_created
+            if created is None:
+                continue
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if (now_utc - created).total_seconds() > window:
+                continue
+            if since_utc is not None and created <= since_utc:
+                continue
+            url = str(getattr(a, "request_url", "") or "")
+            text = str(getattr(a, "alert_text", "") or "")
+            if not (url.startswith(base_url) or base_url in text):
+                continue
+            if not re.search(r"\b502\b", text):
+                continue
+            if best is None or created > best.date_created:
+                best = a
+        except Exception:
+            continue
+    return best
+
+
+class TwilioAlertWatch:
+    """Polls Twilio Monitor for 'Got HTTP 502' alerts on our funnel URL --
+    the failure Twilio sees but a probe from this PC does not. Cheap (one
+    small list call per `interval`) and never raises."""
+
+    def __init__(self, base_url: str, interval: float = TWILIO_ALERT_POLL):
+        self.base_url = base_url
+        self.interval = interval
+        self.next_poll = 0.0
+        self.last_repair_utc: datetime | None = None
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            from dotenv import load_dotenv
+            from twilio.rest import Client
+            load_dotenv(ROOT / ".env")
+            sid, token = os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")
+            if not (sid and token):
+                raise RuntimeError("TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN not set")
+            self._client = Client(sid, token)
+        return self._client
+
+    def _fetch(self, now_utc: datetime):
+        return self._get_client().monitor.v1.alerts.list(
+            log_level="error",
+            start_date=now_utc - timedelta(seconds=TWILIO_ALERT_WINDOW + 60),
+            limit=50)
+
+    def check(self, now: float, now_utc: datetime | None = None, fetch=None):
+        """Return the matching alert if one is due for repair, else None.
+        `now` is monotonic-ish seconds for scheduling; `fetch` is injectable."""
+        if now < self.next_poll:
+            return None
+        self.next_poll = now + self.interval
+        now_utc = now_utc or datetime.now(timezone.utc)
+        try:
+            alerts = (fetch or self._fetch)(now_utc)
+            return find_funnel_502(alerts, self.base_url, now_utc, self.last_repair_utc)
+        except Exception as e:
+            log(f"twilio alert check failed: {type(e).__name__}: {e}")
+            return None
+
+    def mark_repaired(self, now_utc: datetime | None = None) -> None:
+        self.last_repair_utc = now_utc or datetime.now(timezone.utc)
 
 
 def port_open(port: int) -> bool:
@@ -257,6 +355,7 @@ def main() -> None:
     _refresh_funnel()
     public_health = _public_base_url() + "/health" if _public_base_url() else ""
     funnel_watch = FunnelWatch()
+    alert_watch = TwilioAlertWatch(_public_base_url()) if public_health else None
     if public_health:
         log(f"watching public URL {public_health}")
     else:
@@ -280,6 +379,16 @@ def main() -> None:
                     _refresh_funnel()
                     ok = http_ok(public_health)
                     log(f"public URL after funnel repair: {'OK' if ok else 'STILL FAILING'}")
+                    alert_watch.mark_repaired()
+                # Twilio's own alert log is the reliable signal: it sees 502s
+                # the probe above (same PC) never reproduces.
+                hit = alert_watch.check(now) if alert_watch else None
+                if hit is not None and funnel_watch.request_repair(now):
+                    log(f"Twilio reported HTTP 502 from the funnel "
+                        f"({getattr(hit, 'request_url', '?')} at {hit.date_created}) "
+                        f"— re-applying tailscale funnel")
+                    _refresh_funnel()
+                    alert_watch.mark_repaired()
             for name, cfg in SERVICES.items():
                 proc = procs[name]
                 exited = proc.poll() is not None
