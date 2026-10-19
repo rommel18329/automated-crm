@@ -62,6 +62,28 @@ def test_never_contacted_and_closed_leads():
     assert reason("warm", [failed])["kind"] == "new"         # a failed send isn't a touch
 
 
+def mark(status, minutes_ago, where="dialer"):
+    return {"type": "note", "direction": "outbound", "content": f"Marked {status.upper()} from {where}",
+            "timestamp": (NOW - timedelta(minutes=minutes_ago)).isoformat()}
+
+
+def test_just_marked_lead_goes_straight_into_the_queue():
+    # marked WARM from the softphone right after a call: not due for 7 days by cadence, but queued now
+    call = ix(0, type_="call", hours=1)          # the call happened an hour ago, the mark just now
+    r = reason("warm", [call, mark("warm", 3)])
+    assert r["kind"] == "marked" and r["label"] == "📌 Marked WARM 3m ago · plan the next touch"
+    assert reason("hot", [call, mark("hot", 3)])["label"].startswith("🔥 Hot · 📌 Marked HOT")
+    assert reason("cold", [call, mark("cold", 3)])["kind"] == "marked"     # cold too, not just after 180 days
+    # marked from lead edit with no calls or texts on file (cold used to be invisible here)
+    assert reason("cold", [mark("cold", 10, "lead edit")])["kind"] == "marked"
+
+
+def test_marked_lead_leaves_the_queue_after_your_next_touch_and_old_marks_dont_count():
+    assert reason("warm", [mark("warm", 120), ix(0, type_="call")]) is None       # called them since the mark
+    assert reason("warm", [mark("cold", 3), ix(1)]) is None                        # mark was for a different status
+    assert reason("dead", [mark("dead", 3)]) is None
+
+
 def test_hot_sorts_first_whatever_the_reason():
     hot = reason("hot", [ix(2)])
     reply = reason("warm", [ix(3), ix(0, "inbound")])

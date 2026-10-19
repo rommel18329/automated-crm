@@ -17,7 +17,7 @@ CADENCE_DAYS = {"hot": 1, "warm": 7, "cold": 180}
 PARKED = "2999-01-01"        # dialer imports are parked far in the future
 
 # Lower sorts first: hot, then waiting on you, then callbacks, then quiet leads.
-RANK = {"hot": 0, "reply": 1, "callback": 2, "cadence": 3, "new": 3}
+RANK = {"hot": 0, "reply": 1, "marked": 2, "callback": 2, "cadence": 3, "new": 3}
 
 
 def _ts(item: dict) -> datetime | None:
@@ -69,6 +69,17 @@ def followup_reason(lead: dict, interactions: list[dict], today: date | None = N
     # Scheduled follow-up: a date booked after our last touch. Hot leads are due
     # daily anyway. For cold leads only a real callback request counts: the
     # dialer's voicemail / no-answer redial dates belong to the dial list.
+    # Just marked hot/warm/cold (softphone disposition or lead edit): it goes
+    # straight into the queue and stays until your next call or text after the
+    # mark. Marks are logged as "Marked WARM from dialer / lead edit" notes.
+    mark_word = f"marked {status}"
+    marks = [_ts(i) for i in interactions if i.get("type") == "note" and _ts(i)
+             and (i.get("content") or "").lower().startswith(mark_word)]
+    last_mark = max(marks) if marks else None
+    if last_mark and (last_ours is None or last_mark > last_ours):
+        return {"kind": "marked", "rank": RANK["hot" if hot else "marked"], "overdue_days": 0,
+                "label": f"{prefix}📌 Marked {status.upper()} {_ago(last_mark, now)} · plan the next touch"}
+
     nad = lead.get("next_action_date") or ""
     latest_call = max((i for i in touches if i.get("direction") == "outbound" and i.get("type") == "call"),
                       key=_ts, default=None)

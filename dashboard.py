@@ -1172,7 +1172,11 @@ def render_ai_draft_row(lead: dict, stage_key: str, widget_prefix: str) -> None:
 
 
 def update_status(lead_id: int, key: str) -> None:
-    db.set_manual_status(lead_id, st.session_state[key])
+    new_status = st.session_state[key]
+    db.set_manual_status(lead_id, new_status)
+    if new_status in ("hot", "warm", "cold"):
+        # Logged like the softphone's mark so the lead lands in the Follow-ups queue.
+        db.add_interaction(lead_id, "note", f"Marked {new_status.upper()} from lead edit", "outbound")
 
 
 def auto_save_field(lead_id: int, field: str, key: str) -> None:
