@@ -56,8 +56,16 @@ def test_hot_always_shows_days_since_you_reached_out():
 def test_never_contacted_and_closed_leads():
     assert reason("cold", []) is None                       # dial lists handle these
     assert reason("warm", [])["label"] == "👋 Never contacted yet"
-    for status in ("dead", "contract", "investor"):
+    for status in ("dead", "investor"):
         assert reason(status, [ix(400)]) is None
+
+
+def test_contract_is_followed_up_exactly_like_hot():
+    assert reason("contract", [ix(0)]) is None                          # touched today
+    r = reason("contract", [ix(1)])
+    assert r["label"] == "📝 Contract · 1 day since you reached out (daily)" and r["rank"] == 0
+    r = reason("contract", [ix(3), ix(0, "inbound", hours=2)])
+    assert r["kind"] == "reply" and r["rank"] == 0                      # sorted with hot
     failed = ix(10, content="[SEND FAILED] hi | Error: x")
     assert reason("warm", [failed])["kind"] == "new"         # a failed send isn't a touch
 

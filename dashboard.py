@@ -716,7 +716,7 @@ def hot_not_contacted_today(leads: list[dict], interactions: list[dict]) -> list
             continue
         if datetime.fromisoformat(item["timestamp"]).date() == today:
             touched_today.add(item["lead_id"])
-    return [lead for lead in leads if lead["status"] == "hot" and lead["id"] not in touched_today]
+    return [lead for lead in leads if lead["status"] in ("hot", "contract") and lead["id"] not in touched_today]
 
 
 def followups_waiting_approval(queue: list[dict], interactions: list[dict]) -> int:
@@ -1206,8 +1206,8 @@ def _build_display_result(leads: list[dict] | None = None,
         for lead in leads
     ]
 
-    # Call list: DB-hot leads only, priority-sorted
-    hot_pairs = [(l, e) for l, e in leads_with_eval if l["status"] == "hot"]
+    # Call list: DB-hot (and contract) leads only, priority-sorted
+    hot_pairs = [(l, e) for l, e in leads_with_eval if l["status"] in ("hot", "contract")]
     sorted_hot = sorted(hot_pairs, key=lambda t: engine._priority_score(*t), reverse=True)
     call_list = [
         {

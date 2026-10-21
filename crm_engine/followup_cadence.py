@@ -3,7 +3,7 @@
 A lead is due when any of these is true (agreed with the user 2026-10-16):
 1. waiting on you: their last call/text came after ours
 2. scheduled callback: a next-action date set after our last touch has arrived
-3. cadence: hot every day, warm every 7 days, cold every 180 days since our
+3. cadence: hot and contract every day, warm every 7 days, cold every 180 days since our
    last call or text (cold leads we've never contacted belong to dial lists)
 
 Display-only: reads leads and interactions, writes nothing. engine.py's
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-CADENCE_DAYS = {"hot": 1, "warm": 7, "cold": 180}
+CADENCE_DAYS = {"hot": 1, "contract": 1, "warm": 7, "cold": 180}   # contract = same as hot
 PARKED = "2999-01-01"        # dialer imports are parked far in the future
 
 # Lower sorts first: hot, then waiting on you, then callbacks, then quiet leads.
@@ -58,8 +58,8 @@ def followup_reason(lead: dict, interactions: list[dict], today: date | None = N
     theirs = [(_ts(i), i) for i in touches if i.get("direction") == "inbound"]
     last_ours = max(ours) if ours else None
     last_theirs, last_theirs_item = max(theirs, key=lambda t: t[0]) if theirs else (None, None)
-    hot = status == "hot"
-    prefix = "🔥 Hot · " if hot else ""
+    hot = status in ("hot", "contract")   # contract leads are worked exactly like hot
+    prefix = "📝 Contract · " if status == "contract" else "🔥 Hot · " if hot else ""
 
     if last_theirs and (last_ours is None or last_theirs > last_ours):
         how = "called" if last_theirs_item.get("type") == "call" else "texted"
@@ -102,6 +102,7 @@ def followup_reason(lead: dict, interactions: list[dict], today: date | None = N
     if days < CADENCE_DAYS[status]:
         return None
     label = {"hot": f"🔥 Hot · {_quiet(days)} since you reached out (daily)",
+             "contract": f"📝 Contract · {_quiet(days)} since you reached out (daily)",
              "warm": f"🌤 Warm · {_quiet(days)} quiet (weekly)",
              "cold": f"❄️ Cold · {_quiet(days)} quiet (every 6 months)"}[status]
     return {"kind": "cadence", "rank": RANK["hot" if hot else "cadence"],
