@@ -1698,10 +1698,51 @@ def attach_status_to_disposition(lead_id: int, status: str, db_path: Path = DB_P
     log_disposition(lead_id, "(status only)", "popup", status_set=status, db_path=db_path)
 
 
+# Cold-dial cadence: a cold lead is called at most DIAL_MAX_TRIES times in total
+# (attempts 3 and 6 are the voicemail rounds) and never closer together than
+# DIAL_MIN_GAP_DAYS Chicago calendar days, so a number isn't hammered.
+DIAL_MAX_TRIES = 6
+DIAL_MIN_GAP_DAYS = 2
+
+
+def leads_resting(lead_ids: list[int], db_path: Path = DB_PATH) -> set[int]:
+    """Cold leads among `lead_ids` the dialer should skip today: they've used
+    up DIAL_MAX_TRIES, or their last real try was under DIAL_MIN_GAP_DAYS ago.
+    Warm/hot/other leads are never rested here (they're worked on purpose)."""
+    if not lead_ids:
+        return set()
+    chi, utc = ZoneInfo("America/Chicago"), ZoneInfo("UTC")
+    today = datetime.now(chi).date()
+    marks = ",".join("?" * len(NOT_A_TRY))
+    resting: set[int] = set()
+    with get_conn(db_path) as conn:
+        for i in range(0, len(lead_ids), 500):
+            chunk = lead_ids[i:i + 500]
+            qs = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"""SELECT d.lead_id, COUNT(*) AS tries, MAX(d.created_at) AS last_try
+                    FROM dispositions d JOIN leads l ON l.id = d.lead_id
+                    WHERE l.status = 'cold' AND d.lead_id IN ({qs})
+                      AND d.disposition NOT IN ({marks})
+                    GROUP BY d.lead_id""",
+                (*chunk, *NOT_A_TRY),
+            ).fetchall()
+            for r in rows:
+                last_day = (datetime.fromisoformat(r["last_try"]).replace(tzinfo=utc)
+                            .astimezone(chi).date())
+                if r["tries"] >= DIAL_MAX_TRIES or (today - last_day).days < DIAL_MIN_GAP_DAYS:
+                    resting.add(r["lead_id"])
+    return resting
+
+
 def leads_dialed_today(db_path: Path = DB_PATH) -> set[int]:
     """Lead ids already dialed today by ANY agent — disposition rows plus
     outbound call interactions. Drives the two-agent no-double-dial guard."""
-    today = date.today().isoformat()
+    # Rows are stamped in UTC, so "today" must be the CRM's (Chicago) day
+    # expressed in UTC — a bare local date wrongly marks anything dialed after
+    # ~7pm Central as dialed again the next morning.
+    start = datetime.now(ZoneInfo("America/Chicago")).replace(hour=0, minute=0, second=0, microsecond=0)
+    today = start.astimezone(ZoneInfo("UTC")).replace(tzinfo=None).isoformat(timespec="seconds")
     with get_conn(db_path) as conn:
         # A line cut off because another line won is re-queued, not "dialed".
         d = conn.execute(
