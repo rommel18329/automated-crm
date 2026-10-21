@@ -66,6 +66,23 @@ def test_unanswered_lines_are_recorded_and_block_same_day_redials(path):
     assert d not in today                  # cut-off lines are re-queued, not "dialed"
 
 
+def test_evening_dials_do_not_block_the_next_chicago_day(path):
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    chi = ZoneInfo("America/Chicago")
+    list_id, (late, now_lead) = _make_list(path, 2)
+    last_night = (datetime.now(chi).replace(hour=20, minute=0, second=0, microsecond=0)
+                  - timedelta(days=1)).astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    with db.get_conn(path) as conn:        # 8pm Chicago yesterday, stamped in UTC
+        conn.execute("INSERT INTO dispositions (lead_id, disposition, source, created_at) "
+                     "VALUES (?,?,?,?)", (late, "No Answer", "popup",
+                                          last_night.isoformat(timespec="seconds")))
+    db.log_disposition(now_lead, "No Answer", "popup", db_path=path)
+    today = db.leads_dialed_today(path)
+    assert now_lead in today
+    assert late not in today
+
+
 def test_list_counts_are_honest_and_never_dialed_go_first(path):
     list_id, ids = _make_list(path, 5)
     db.log_disposition(ids[0], "No Answer (auto)", "auto", db_path=path)

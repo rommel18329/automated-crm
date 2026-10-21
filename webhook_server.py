@@ -36,6 +36,7 @@ load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 from crm_engine import db
 from crm_engine import caller_id_pool
+from crm_engine import call_hours
 from crm_engine.messaging_gateway import place_call_number
 
 app = Flask(__name__)
@@ -1185,6 +1186,15 @@ def _start_multi_batch(agent: str, lead_ids: list[int], amd: bool = True) -> str
             if not lead:
                 with _batch_lock:
                     _mark_resolved(batch, lid)
+                continue
+            # Legal calling window (8am-9pm lead-local): skip, don't count a try,
+            # and release the claim so the lead is dialable at a legal hour.
+            hours_ok, hours_why = call_hours.can_call_now(lead["phone"])
+            if not hours_ok:
+                log.warning(f"Multi [{batch_id}] lead {lid} NOT dialed: {hours_why}")
+                with _batch_lock:
+                    _mark_resolved(batch, lid)
+                    _lead_claims.pop(lid, None)
                 continue
             # Atomic pick + reserve: the daily counter is incremented the
             # moment the number is chosen, inside the lock, so a second

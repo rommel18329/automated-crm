@@ -1701,7 +1701,11 @@ def attach_status_to_disposition(lead_id: int, status: str, db_path: Path = DB_P
 def leads_dialed_today(db_path: Path = DB_PATH) -> set[int]:
     """Lead ids already dialed today by ANY agent — disposition rows plus
     outbound call interactions. Drives the two-agent no-double-dial guard."""
-    today = date.today().isoformat()
+    # Rows are stamped in UTC, so "today" must be the CRM's (Chicago) day
+    # expressed in UTC — a bare local date wrongly marks anything dialed after
+    # ~7pm Central as dialed again the next morning.
+    start = datetime.now(ZoneInfo("America/Chicago")).replace(hour=0, minute=0, second=0, microsecond=0)
+    today = start.astimezone(ZoneInfo("UTC")).replace(tzinfo=None).isoformat(timespec="seconds")
     with get_conn(db_path) as conn:
         # A line cut off because another line won is re-queued, not "dialed".
         d = conn.execute(
