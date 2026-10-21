@@ -12,7 +12,7 @@ from pathlib import Path
 from . import db
 
 LOW_NEVER_DIALED = 100
-MAX_TRIES = 3
+MAX_TRIES = db.DIAL_MAX_TRIES    # same limit the dialer enforces
 BAD_SHARE = 0.40
 BAD_WINDOW = 100
 BAD_MIN_SAMPLE = 30          # don't call a list bad off a handful of dials

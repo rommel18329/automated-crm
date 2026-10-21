@@ -1907,7 +1907,7 @@ def _claim_leads(agent: str, candidates: list[int], count: int) -> tuple[list[in
     """Core claim logic shared by /dialer/claim and the server-side queue.
     Returns (to_dial, skipped): skipped leads are claimed by the other agent
     or already dialed today by anyone."""
-    dialed_today = db.leads_dialed_today(DB_PATH)
+    dialed_today = db.leads_dialed_today(DB_PATH) | db.leads_resting(candidates, DB_PATH)
     to_dial: list[int] = []
     skipped: list[int] = []
     now = time.time()

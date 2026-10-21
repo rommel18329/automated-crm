@@ -83,6 +83,25 @@ def test_evening_dials_do_not_block_the_next_chicago_day(path):
     assert late not in today
 
 
+def test_cold_leads_rest_between_tries_and_after_the_max(path):
+    from datetime import datetime, timedelta
+    list_id, (fresh, yday, old, maxed, warm) = _make_list(path, 5)
+    db.update_lead(warm, {"status": "warm"}, path)
+
+    def dial(lid, days_ago, n=1):
+        stamp = (datetime.utcnow() - timedelta(days=days_ago)).isoformat(timespec="seconds")
+        with db.get_conn(path) as conn:
+            for _ in range(n):
+                conn.execute("INSERT INTO dispositions (lead_id, disposition, source, created_at) "
+                             "VALUES (?,?,?,?)", (lid, "No Answer", "popup", stamp))
+    dial(yday, 1)
+    dial(old, 3)
+    dial(maxed, 10, db.DIAL_MAX_TRIES)
+    dial(warm, 0)
+    assert db.leads_resting([fresh, yday, old, maxed, warm], path) == {yday, maxed}
+    assert db.leads_resting([], path) == set()
+
+
 def test_list_counts_are_honest_and_never_dialed_go_first(path):
     list_id, ids = _make_list(path, 5)
     db.log_disposition(ids[0], "No Answer (auto)", "auto", db_path=path)
@@ -120,8 +139,8 @@ def test_list_health_low_dry_and_bad(path, monkeypatch):
     assert [a["level"] for a in health["alerts"]] == ["low", "bad"]   # 2 of 4 failed/wrong
     assert "'IA Stacked' looks bad: 50%" in health["alerts"][1]["message"]
 
-    for lid in ids[:3]:                    # everyone else gets to 3 tries
-        for _ in range(3):
+    for lid in ids[:3]:                    # everyone else uses up their tries
+        for _ in range(list_health.MAX_TRIES):
             db.log_disposition(lid, "No Answer (auto)", "auto", db_path=path)
     levels = [a["level"] for a in list_health.list_health(list_id, "IA Stacked", path)["alerts"]]
     assert levels[0] == "dry"
