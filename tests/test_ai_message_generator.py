@@ -113,3 +113,68 @@ render_ai_draft_row({'id': 1}, 'staged', 'test_ai')
     app.button[0].click().run()
     assert not app.exception
     assert not any("because you requested it" in item.value for item in app.markdown)
+
+
+def _dondra_convo():
+    now = datetime.now(timezone.utc)
+    return [{"type": "text", "direction": "outbound", "timestamp": (now - timedelta(days=2)).isoformat(),
+             "content": "Hi Dondra, it's Rommel, the investor who reached out a while back about your Sycamore St property. "
+                        "This is my new office number. Wanted to check in and see if your plans for the house have changed?"}]
+
+
+def test_prompt_lists_recent_texts_and_unanswered_count(monkeypatch):
+    monkeypatch.setattr(ai, "load_email_context", lambda lead: {
+        'messages': [], 'status': '', 'complete': True})
+    request = ai.prepare_message_request({"name": "Dondra"}, _dondra_convo(), "obj", "strat")
+    prompt = request["messages"][0]["content"]
+    assert "YOUR RECENT TEXTS" in prompt and "new office number" in prompt
+    assert "UNANSWERED TEXTS: 1" in prompt
+    assert "FOLLOW-UP RULES" in request["system"]
+
+
+def test_similarity_guard_flags_repeat_but_not_new_angle():
+    recent = [m["content"] for m in ai._recent_outbound_texts(_dondra_convo())]
+    repeat = ("Hi Dondra, it's Rommel, the investor who reached out about your Sycamore St property. "
+              "Wanted to check in and see if anything has changed with your plans for the house.")
+    fresh = "Dondra, would a quick cash close with no repairs on your end be worth a 5 minute call this week?"
+    assert ai.similar_to_recent_text(repeat, recent)
+    assert not ai.similar_to_recent_text(fresh, recent)
+    assert not ai.similar_to_recent_text(repeat, [])
+
+
+def test_guard_fires_through_prepared_request_without_conversation(monkeypatch):
+    """The dashboard runs drafts from a prepared request and passes no conversation."""
+    monkeypatch.setattr(ai, "load_email_context", lambda lead: {
+        'messages': [], 'status': '', 'complete': True})
+    prepared = ai.prepare_message_request({"name": "Dondra"}, _dondra_convo(), "obj", "strat")
+    repeat = ("Hi Dondra, it's Rommel, the investor who reached out about your Sycamore St property. "
+              "Wanted to check in and see if anything has changed with your plans for the house.")
+    monkeypatch.setattr(ai, "run_request", lambda approval, request: SimpleNamespace(
+        content=[SimpleNamespace(type="text", text=json.dumps({"message": repeat, "coaching": "x"}))],
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1)))
+    result = ai.generate_message({"name": "Dondra"}, [], "obj", "strat", approval="ok", prepared=prepared)
+    assert any("very similar" in f for f in result.flags)
+
+
+def test_full_thread_and_notes_are_untruncated_and_separate(monkeypatch):
+    monkeypatch.setattr(ai, "load_email_context", lambda lead: {
+        'messages': [], 'status': '', 'complete': True})
+    now = datetime.now(timezone.utc)
+    long_text = "needs a new roof " + "x" * 600 + " END_OF_TEXT"
+    convo = [{"type": "text", "direction": "inbound", "content": long_text,
+              "timestamp": (now - timedelta(days=90 - i)).isoformat()} for i in range(40)]
+    convo.append({"type": "note", "direction": "outbound", "content": "price near 50k " + "y" * 400 + " END_OF_NOTE",
+                  "timestamp": (now - timedelta(days=100)).isoformat()})
+    prompt = ai.prepare_message_request({"name": "D"}, convo, "o", "s")["messages"][0]["content"]
+    assert prompt.count("END_OF_TEXT") == 40          # no 20-item cap, no 300-char cut
+    assert "END_OF_NOTE" in prompt.split("SAVED NOTES ABOUT THIS SELLER")[1]
+    assert "END_OF_NOTE" not in prompt.split("SAVED NOTES ABOUT THIS SELLER")[0]
+
+
+def test_thread_cap_drops_oldest_first_and_keeps_notes():
+    now = datetime.now(timezone.utc)
+    convo = [{"type": "text", "direction": "inbound", "content": f"msg{i} " + "z" * 1000,
+              "timestamp": (now - timedelta(days=200 - i)).isoformat()} for i in range(100)]
+    text = ai._build_full_thread_text(convo)
+    assert "earlier messages omitted" in text and "msg99" in text and "msg0 " not in text
+    assert len(text) < ai.THREAD_CHAR_CAP + 200
