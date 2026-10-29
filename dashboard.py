@@ -20,6 +20,7 @@ from crm_engine.ai_ui import priced_action, budget_panel, autonotes_control
 from crm_engine.list_health import list_health
 from crm_engine import caller_id_pool
 from crm_engine import buyer_match
+from crm_engine import lead_analysis
 from crm_engine.email_ui import render_email_review, catch_up_if_due
 from crm_engine.gmail_client import MAILBOX as EMAIL_MAILBOX
 
@@ -1475,6 +1476,49 @@ def render_lead_detail(lead_id: int, lead_lookup: dict[int, dict]) -> None:
         on_change=save_address,
         args=(lead_id, f"address_{lead_id}"),
     )
+
+    # 🔎 AI lead analysis — advisory only: never changes the status.
+    if lead["status"] != "investor":
+        with st.expander("🔎 AI lead analysis — is this lead marked right?", expanded=False):
+            _la_key = f"lead_analysis_{lead_id}"
+            _la_res = priced_action(
+                f"la_run_{lead_id}", "🔎 Analyze this lead",
+                lambda: lead_analysis.prepare_analysis_request(lead, interactions),
+                lambda approval, prepared: lead_analysis.analyze_lead(
+                    lead, interactions, approval=approval, prepared=prepared))
+            if _la_res is not None:
+                st.session_state[_la_key] = _la_res
+                st.session_state["ai_cost_session_total"] = (
+                    st.session_state.get("ai_cost_session_total", 0.0)
+                    + _la_res.get("cost_usd", 0.0))
+                st.rerun()
+            _la_res = st.session_state.get(_la_key)
+            if _la_res:
+                if _la_res.get("error"):
+                    st.error(_la_res["error"])
+                else:
+                    _la_sug, _la_cur = _la_res["suggested_status"], _la_res["current_status"]
+                    _la_head = {
+                        "correct": f"✅ Correctly marked **{_la_cur}**",
+                        "upgrade": f"⬆️ Looks **{_la_sug}**, currently marked {_la_cur}",
+                        "downgrade": f"⬇️ Looks **{_la_sug}**, currently marked {_la_cur}",
+                        "n/a": f"Reads as **{_la_sug}** (lead is marked {_la_cur})",
+                    }[_la_res["verdict"]]
+                    (st.warning if _la_res["verdict"] in ("upgrade", "downgrade") else st.success)(
+                        f"{_la_head} · {_la_res['confidence']} confidence")
+                    st.write(_la_res["summary"])
+                    _la_icon = {"up": "🟢", "down": "🔴", "neutral": "⚪"}
+                    for _sig in _la_res["signals"]:
+                        st.markdown(f"{_la_icon[_sig['direction']]} **{_sig['signal']}** · "
+                                    f"{_sig['evidence']}")
+                    for _risk in _la_res["risks"]:
+                        st.markdown(f"⚠️ {_risk}")
+                    if _la_res["next_move"]:
+                        st.info(f"**Next move:** {_la_res['next_move']}")
+                    with st.expander("Engagement metrics used", expanded=False):
+                        st.text(lead_analysis.format_metrics(_la_res["metrics"]))
+                    st.caption(f"Advisory only, status not changed · "
+                               f"{_la_res.get('email_status', '')} · ${_la_res.get('cost_usd', 0):.4f}")
 
     # Buy Box — only shown for investor leads
     if lead["status"] == "investor":
